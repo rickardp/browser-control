@@ -1,3 +1,7 @@
+> **Note:** This document describes the legacy TypeScript implementation. The
+> current Rust CLI is described in the project README and ADR-001. See
+> `docs/adrs/archive/` for the original ADRs.
+
 # Feature: VS Code Integration
 
 ## Overview

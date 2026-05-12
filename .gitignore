@@ -1,4 +1,7 @@
-node_modules/
-dist/
-*.tsbuildinfo
+/target
+**/*.rs.bk
+Cargo.lock.bak
 .DS_Store
+extension/node_modules
+extension/out
+extension/*.vsix

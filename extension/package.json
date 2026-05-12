@@ -1,0 +1,55 @@
+{
+  "name": "browser-control-vscode",
+  "displayName": "Browser Control",
+  "description": "Detects VS Code Simple Browser CDP endpoint and injects BROWSER_CONTROL into integrated terminals.",
+  "publisher": "anthropic-community",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "browser-control.copyEndpoint",
+        "title": "Browser Control: Copy CDP Endpoint"
+      },
+      {
+        "command": "browser-control.refresh",
+        "title": "Browser Control: Refresh CDP Endpoint"
+      }
+    ],
+    "configuration": {
+      "title": "Browser Control",
+      "properties": {
+        "browserControl.endpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit CDP endpoint URL. If set, overrides auto-discovery."
+        },
+        "browserControl.probePorts": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "default": [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229],
+          "description": "Ports to probe for the embedded browser's CDP endpoint."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build": "tsc -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20",
+    "typescript": "^5.3"
+  }
+}

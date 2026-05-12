@@ -1,32 +1,201 @@
-name: Release
+name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 permissions:
-  contents: read
-  packages: write
+  contents: write
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64.tar.gz
+            archive: tar
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-aarch64.tar.gz
+            archive: tar
+            linker: aarch64-linux-gnu-gcc
+          - os: macos-14
+            target: x86_64-apple-darwin
+            suffix: macos-x86_64.tar.gz
+            archive: tar
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: macos-aarch64.tar.gz
+            archive: tar
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64.zip
+            archive: zip
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-
-      - uses: actions/setup-node@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 22
-          registry-url: https://npm.pkg.github.com
+          targets: ${{ matrix.target }}
 
-      - run: bun install --frozen-lockfile
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - run: bun run build
+      - name: Install aarch64 cross linker (Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - run: bun test
-
-      - run: npm publish
+      - name: Build
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/browser-control"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip "$BIN" || true
+          else
+            strip "$BIN" || true
+          fi
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p staging
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/browser-control.exe" staging/
+          else
+            cp "target/${{ matrix.target }}/release/browser-control" staging/
+          fi
+          cp README.md staging/ 2>/dev/null || true
+          cp LICENSE staging/ 2>/dev/null || true
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          cd staging
+          tar -czf "../browser-control-${{ matrix.suffix }}" -- *
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging\* -DestinationPath "browser-control-${{ matrix.suffix }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-control-${{ matrix.suffix }}
+          path: browser-control-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    env:
+      CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute sha256 sums
+        id: sha
+        shell: bash
+        run: |
+          cd dist
+          {
+            echo "## Release artifacts"
+            echo ""
+            echo "| Archive | SHA256 |"
+            echo "|---------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          declare -A SUMS
+          for f in browser-control-*; do
+            sum=$(sha256sum "$f" | awk '{print $1}')
+            SUMS[$f]=$sum
+            echo "| $f | \`$sum\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "${f}=${sum}" >> sums.txt
+          done
+          echo "computed sums for ${#SUMS[@]} archive(s)"
+          {
+            echo "SHA_MACOS_AARCH64=$(grep '^browser-control-macos-aarch64.tar.gz=' sums.txt | cut -d= -f2)"
+            echo "SHA_MACOS_X86_64=$(grep '^browser-control-macos-x86_64.tar.gz=' sums.txt | cut -d= -f2)"
+            echo "SHA_LINUX_AARCH64=$(grep '^browser-control-linux-aarch64.tar.gz=' sums.txt | cut -d= -f2)"
+            echo "SHA_LINUX_X86_64=$(grep '^browser-control-linux-x86_64.tar.gz=' sums.txt | cut -d= -f2)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/browser-control-*
+          body: See CHANGELOG.md
+          tag_name: ${{ github.ref_name }}
+
+      - name: Publish to crates.io
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --no-verify
+
+      - name: Render and push Homebrew formula
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          SHA_MACOS_AARCH64: ${{ steps.sha.outputs.SHA_MACOS_AARCH64 }}
+          SHA_MACOS_X86_64: ${{ steps.sha.outputs.SHA_MACOS_X86_64 }}
+          SHA_LINUX_AARCH64: ${{ steps.sha.outputs.SHA_LINUX_AARCH64 }}
+          SHA_LINUX_X86_64: ${{ steps.sha.outputs.SHA_LINUX_X86_64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          rendered=$(sed \
+            -e "s|__VERSION__|${VERSION}|g" \
+            -e "s|__SHA_MACOS_AARCH64__|${SHA_MACOS_AARCH64}|g" \
+            -e "s|__SHA_MACOS_X86_64__|${SHA_MACOS_X86_64}|g" \
+            -e "s|__SHA_LINUX_AARCH64__|${SHA_LINUX_AARCH64}|g" \
+            -e "s|__SHA_LINUX_X86_64__|${SHA_LINUX_X86_64}|g" \
+            homebrew/browser-control.rb.tmpl)
+          tapdir=$(mktemp -d)
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/rickardp/homebrew-browser-control.git" "$tapdir"
+          mkdir -p "$tapdir/Formula"
+          echo "$rendered" > "$tapdir/Formula/browser-control.rb"
+          cd "$tapdir"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/browser-control.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes"
+          else
+            git commit -m "browser-control ${VERSION}"
+            git push origin HEAD
+          fi

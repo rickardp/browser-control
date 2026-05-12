@@ -1,3 +1,7 @@
+> **Note:** This document describes the legacy TypeScript implementation. The
+> current Rust CLI is described in the project README and ADR-001. See
+> `docs/adrs/archive/` for the original ADRs.
+
 # Agent Boundaries
 
 Rules and constraints for AI agents working in this codebase.
