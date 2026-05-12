@@ -10,13 +10,11 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn dummy_state() -> ServerState {
-    ServerState {
-        browser: ResolvedBrowser {
-            endpoint: "ws://x".into(),
-            engine: Engine::Cdp,
-            source: Source::External,
-        },
-    }
+    ServerState::new(ResolvedBrowser {
+        endpoint: "ws://x".into(),
+        engine: Engine::Cdp,
+        source: Source::External,
+    })
 }
 
 #[tokio::test]

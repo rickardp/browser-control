@@ -29,6 +29,10 @@ fn main() {
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind fake-browser TCP listener");
 
+    // Emit the Firefox-style readiness banner on stderr so the firefox launcher
+    // (which parses stderr instead of polling /json/version) sees us as ready.
+    eprintln!("WebDriver BiDi listening on ws://127.0.0.1:{port}");
+
     let body = format!(
         "{{\"Browser\":\"FakeBrowser/1.0\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:{port}/devtools/browser/fake\"}}"
     );

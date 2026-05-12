@@ -14,7 +14,7 @@ pub async fn run_cli(browser_arg: Option<String>, playwright: bool) -> Result<()
         std::process::exit(code);
     }
     let resolved = resolve_browser(browser_arg).await?;
-    let state = ServerState { browser: resolved };
+    let state = ServerState::new(resolved);
     let tools = ToolRegistry::new();
     crate::mcp::tools::register_all(&tools);
     run(state, tools).await

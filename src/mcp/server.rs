@@ -10,11 +10,35 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::cli::env_resolver::ResolvedBrowser;
 
-/// State carried by the server. Tools task will reach into this for the
-/// resolved browser endpoint.
-#[derive(Debug, Clone)]
+/// Persistent BiDi session, opened lazily on first use. Reused across all
+/// tool calls because Firefox limits concurrent BiDi sessions per browser
+/// to one.
+pub type BidiCache =
+    std::sync::Arc<tokio::sync::Mutex<Option<(std::sync::Arc<crate::bidi::BidiClient>, String)>>>;
+
+/// State carried by the server. Tools reach into this for the resolved
+/// browser endpoint and any cached engine clients.
+#[derive(Clone)]
 pub struct ServerState {
     pub browser: ResolvedBrowser,
+    pub bidi: BidiCache,
+}
+
+impl ServerState {
+    pub fn new(browser: ResolvedBrowser) -> Self {
+        Self {
+            browser,
+            bidi: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerState")
+            .field("browser", &self.browser)
+            .finish()
+    }
 }
 
 /// Handler signature: takes `(state, params)` and returns a tool result.
@@ -199,9 +223,7 @@ mod tests {
     }
 
     fn dummy_state() -> ServerState {
-        ServerState {
-            browser: dummy_resolved(),
-        }
+        ServerState::new(dummy_resolved())
     }
 
     async fn send_recv(tools: ToolRegistry, requests: &[Value]) -> Vec<Value> {

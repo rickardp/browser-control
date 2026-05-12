@@ -143,6 +143,12 @@ impl BidiClient {
         Ok(sid)
     }
 
+    pub async fn session_end(&self) -> Result<()> {
+        // Best effort: ignore errors if no session is active.
+        let _ = self.send("session.end", json!({})).await;
+        Ok(())
+    }
+
     pub async fn browsing_context_navigate(&self, context: &str, url: &str) -> Result<Value> {
         self.send(
             "browsingContext.navigate",

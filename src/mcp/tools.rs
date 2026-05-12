@@ -66,16 +66,27 @@ async fn cdp_attach_first_page(endpoint: &str) -> Result<(crate::cdp::CdpClient,
     Ok((client, session_id))
 }
 
-/// Start a BiDi session and return `(client, top_level_context)`.
-async fn bidi_top_context(endpoint: &str) -> Result<(crate::bidi::BidiClient, String)> {
-    let client = open_bidi(endpoint).await?;
-    let _sid = client.session_new().await?;
+/// Open or return the cached BiDi session and top-level browsing context.
+///
+/// Firefox limits a browser instance to one active BiDi session at a time,
+/// so we open the WebSocket once and reuse it for every tool call.
+async fn bidi_top_context(
+    state: &ServerState,
+) -> Result<(std::sync::Arc<crate::bidi::BidiClient>, String)> {
+    let mut guard = state.bidi.lock().await;
+    if let Some((c, ctx)) = guard.as_ref() {
+        return Ok((c.clone(), ctx.clone()));
+    }
+    let client = open_bidi(&state.browser.endpoint).await?;
+    client.session_new().await?;
     let tree = client.send("browsingContext.getTree", json!({})).await?;
     let ctx = tree["contexts"][0]["context"]
         .as_str()
         .ok_or_else(|| anyhow!("no top-level browsing context"))?
         .to_string();
-    Ok((client, ctx))
+    let arc = std::sync::Arc::new(client);
+    *guard = Some((arc.clone(), ctx.clone()));
+    Ok((arc, ctx))
 }
 
 fn text_content(text: impl Into<String>) -> Value {
@@ -132,9 +143,8 @@ fn make_navigate() -> RegisteredTool {
                         client.close().await;
                     }
                     Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state.browser.endpoint).await?;
+                        let (client, ctx) = bidi_top_context(&state).await?;
                         client.browsing_context_navigate(&ctx, &url).await?;
-                        drop(client);
                     }
                 }
                 Ok(text_content(format!("Navigated to {url}")))
@@ -188,9 +198,8 @@ fn make_get_dom() -> RegisteredTool {
                         v["result"]["value"].as_str().unwrap_or("").to_string()
                     }
                     Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state.browser.endpoint).await?;
+                        let (client, ctx) = bidi_top_context(&state).await?;
                         let v = client.script_evaluate(&ctx, &expr).await?;
-                        drop(client);
                         v["result"]["value"].as_str().unwrap_or("").to_string()
                     }
                 };
@@ -242,9 +251,8 @@ fn make_screenshot() -> RegisteredTool {
                             .to_string()
                     }
                     Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state.browser.endpoint).await?;
+                        let (client, ctx) = bidi_top_context(&state).await?;
                         let data = client.browsing_context_capture_screenshot(&ctx).await?;
-                        drop(client);
                         data
                     }
                 };
@@ -301,9 +309,8 @@ fn make_fetch() -> RegisteredTool {
                         v["result"]["value"].as_str().unwrap_or("").to_string()
                     }
                     Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state.browser.endpoint).await?;
+                        let (client, ctx) = bidi_top_context(&state).await?;
                         let v = client.script_evaluate(&ctx, &expr).await?;
-                        drop(client);
                         v["result"]["value"].as_str().unwrap_or("").to_string()
                     }
                 };
@@ -352,9 +359,8 @@ fn make_select_element() -> RegisteredTool {
                         v["result"]["value"].as_str().unwrap_or("").to_string()
                     }
                     Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state.browser.endpoint).await?;
+                        let (client, ctx) = bidi_top_context(&state).await?;
                         let v = client.script_evaluate(&ctx, &expr).await?;
-                        drop(client);
                         v["result"]["value"].as_str().unwrap_or("").to_string()
                     }
                 };
