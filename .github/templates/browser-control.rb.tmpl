@@ -8,16 +8,18 @@
 #   brew tap rickardp/browser-control https://github.com/rickardp/browser-control.git
 #   brew install browser-control
 #
-# Placeholders rendered by the workflow:
-#   @@VERSION@@           the released version (no leading `v`)
-#   @@URL_DARWIN_ARM@@    full GH Releases URL for aarch64-apple-darwin tarball
-#   @@SHA_DARWIN_ARM@@    sha256 of that tarball
-#   @@URL_DARWIN_X86@@    full GH Releases URL for x86_64-apple-darwin tarball
-#   @@SHA_DARWIN_X86@@    sha256 of that tarball
-#   @@URL_LINUX_X86@@     full GH Releases URL for x86_64-unknown-linux-gnu tarball
-#   @@SHA_LINUX_X86@@     sha256 of that tarball
-#   @@URL_LINUX_ARM@@     full GH Releases URL for aarch64-unknown-linux-gnu tarball
-#   @@SHA_LINUX_ARM@@     sha256 of that tarball
+# Placeholders rendered by the workflow (each surrounded by the literal
+# at-sign markers shown below; this comment uses different delimiters so
+# `sed` doesn't rewrite the documentation block):
+#   {VERSION}           the released version (no leading `v`)
+#   {URL_DARWIN_ARM}    full GH Releases URL for aarch64-apple-darwin tarball
+#   {SHA_DARWIN_ARM}    sha256 of that tarball
+#   {URL_DARWIN_X86}    full GH Releases URL for x86_64-apple-darwin tarball
+#   {SHA_DARWIN_X86}    sha256 of that tarball
+#   {URL_LINUX_X86}     full GH Releases URL for x86_64-unknown-linux-gnu tarball
+#   {SHA_LINUX_X86}     sha256 of that tarball
+#   {URL_LINUX_ARM}     full GH Releases URL for aarch64-unknown-linux-gnu tarball
+#   {SHA_LINUX_ARM}     sha256 of that tarball
 
 class BrowserControl < Formula
   desc "CLI for browser lifecycle and CDP/BiDi access for agent-driven dev"
