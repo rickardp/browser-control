@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-05-13
+
+First Rust release. Establishes the crate on crates.io and seeds the
+in-repo Homebrew tap. CI handles all subsequent releases end-to-end.
 
 ### Breaking
 
