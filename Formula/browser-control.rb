@@ -8,42 +8,44 @@
 #   brew tap rickardp/browser-control https://github.com/rickardp/browser-control.git
 #   brew install browser-control
 #
-# Placeholders rendered by the workflow:
-#   0.2.0           the released version (no leading `v`)
-#   https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-aarch64-apple-darwin.tar.gz    full GH Releases URL for aarch64-apple-darwin tarball
-#   f453ba31a3e9db8c1b20ef21ac6fa65b6275a236e2e2645c60e0ac898b26aa82    sha256 of that tarball
-#   https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-x86_64-apple-darwin.tar.gz    full GH Releases URL for x86_64-apple-darwin tarball
-#   90a4cc3e6db5afd3f959e0a249e5095e4c787ecb634bb6decf919a28c9cf8ac8    sha256 of that tarball
-#   https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-x86_64-unknown-linux-gnu.tar.gz     full GH Releases URL for x86_64-unknown-linux-gnu tarball
-#   9bd033abfbf2c9a355315400a827952ac3fa1aab3273bbaeea4b62c252b4fd08     sha256 of that tarball
-#   https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-aarch64-unknown-linux-gnu.tar.gz     full GH Releases URL for aarch64-unknown-linux-gnu tarball
-#   a01e7e19d3ca0787232e2f5d5c65c7029b9e53a68d9ed51a96165f30f0ded1b2     sha256 of that tarball
+# Placeholders rendered by the workflow (each surrounded by the literal
+# at-sign markers shown below; this comment uses different delimiters so
+# `sed` doesn't rewrite the documentation block):
+#   {VERSION}           the released version (no leading `v`)
+#   {URL_DARWIN_ARM}    full GH Releases URL for aarch64-apple-darwin tarball
+#   {SHA_DARWIN_ARM}    sha256 of that tarball
+#   {URL_DARWIN_X86}    full GH Releases URL for x86_64-apple-darwin tarball
+#   {SHA_DARWIN_X86}    sha256 of that tarball
+#   {URL_LINUX_X86}     full GH Releases URL for x86_64-unknown-linux-gnu tarball
+#   {SHA_LINUX_X86}     sha256 of that tarball
+#   {URL_LINUX_ARM}     full GH Releases URL for aarch64-unknown-linux-gnu tarball
+#   {SHA_LINUX_ARM}     sha256 of that tarball
 
 class BrowserControl < Formula
   desc "CLI for browser lifecycle and CDP/BiDi access for agent-driven dev"
   homepage "https://github.com/rickardp/browser-control"
-  version "0.2.0"
+  version "0.2.1"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-aarch64-apple-darwin.tar.gz"
-      sha256 "f453ba31a3e9db8c1b20ef21ac6fa65b6275a236e2e2645c60e0ac898b26aa82"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.2.1/browser-control-aarch64-apple-darwin.tar.gz"
+      sha256 "59b1fd51130cf5603ea405a4e01cc774bf92f4eba3b90f61739e3f9122b489b8"
     end
     on_intel do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-x86_64-apple-darwin.tar.gz"
-      sha256 "90a4cc3e6db5afd3f959e0a249e5095e4c787ecb634bb6decf919a28c9cf8ac8"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.2.1/browser-control-x86_64-apple-darwin.tar.gz"
+      sha256 "0576109beb231356317c47d852d5adb203ce6fe4c325ea6ec37d4deb0b07cc7b"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "9bd033abfbf2c9a355315400a827952ac3fa1aab3273bbaeea4b62c252b4fd08"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.2.1/browser-control-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "c5f59a2129b6c6a807e7f85f1c8e727a411977c0dbcb8439af69a03524c8120d"
     end
     on_arm do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.2.0/browser-control-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "a01e7e19d3ca0787232e2f5d5c65c7029b9e53a68d9ed51a96165f30f0ded1b2"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.2.1/browser-control-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "a64a433123703c560a48fb594d6ab73508dce166b7929ccd508398dc738485e0"
     end
   end
 
