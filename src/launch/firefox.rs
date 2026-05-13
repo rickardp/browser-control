@@ -1,15 +1,15 @@
 //! Firefox launcher (WebDriver BiDi via `--remote-debugging-port`, Firefox 129+).
 
+use std::fs::File;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::detect::{Engine, Installed};
 
-use super::{allocate_free_port, LaunchOpts, LaunchedHandle};
+use super::{allocate_free_port, configure_session_detachment, LaunchOpts, LaunchedHandle};
 
 pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedHandle> {
     let port = allocate_free_port().context("allocating BiDi port")?;
@@ -18,6 +18,13 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
         std::fs::create_dir_all(&opts.profile_dir)
             .with_context(|| format!("creating profile dir {}", opts.profile_dir.display()))?;
     }
+
+    let log_path = opts.profile_dir.join("browser.log");
+    let log_file =
+        File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
+    let log_clone = log_file
+        .try_clone()
+        .context("cloning log file handle for stderr")?;
 
     let mut cmd = Command::new(&installed.executable);
     cmd.arg("-profile").arg(&opts.profile_dir).arg("-no-remote");
@@ -29,16 +36,17 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
         .arg("about:blank");
 
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_clone))
         .kill_on_drop(false);
+    configure_session_detachment(&mut cmd);
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", installed.executable.display()))?;
     let pid = child.id().context("child has no pid")?;
 
-    let endpoint = wait_for_firefox_endpoint(port, &mut child).await?;
+    let endpoint = wait_for_firefox_endpoint(port, &mut child, &log_path).await?;
 
     Ok(LaunchedHandle {
         pid,
@@ -50,48 +58,48 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
     })
 }
 
-/// Wait for Firefox to print "WebDriver BiDi listening on ws://..." on stderr.
-///
-/// Firefox does not expose a `/json/version` HTTP endpoint, and its BiDi WS
-/// path is `/session`. We could synthesize `ws://127.0.0.1:<port>/session`
-/// directly, but reading the stderr line gives us the exact URL Firefox
-/// chose (and confirms readiness).
-async fn wait_for_firefox_endpoint(port: u16, child: &mut tokio::process::Child) -> Result<String> {
-    let stderr = child
-        .stderr
-        .take()
-        .context("firefox child has no captured stderr")?;
-    let mut reader = BufReader::new(stderr).lines();
-
+/// Wait for Firefox to print "WebDriver BiDi listening on ws://..." to its
+/// log file (we redirect stderr there because Firefox does not expose a
+/// `/json/version` HTTP endpoint).
+async fn wait_for_firefox_endpoint(
+    port: u16,
+    child: &mut tokio::process::Child,
+    log_path: &std::path::Path,
+) -> Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seen = 0usize;
 
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            let _ = child.start_kill();
-            bail!("timed out waiting for Firefox WebDriver BiDi endpoint on port {port}");
+        if let Some(status) = child.try_wait().context("polling child status")? {
+            let log = std::fs::read_to_string(log_path).unwrap_or_default();
+            bail!(
+                "firefox exited before BiDi endpoint was advertised (status: {status}); \
+                 log ({}):\n{}",
+                log_path.display(),
+                log
+            );
         }
 
-        tokio::select! {
-            line = tokio::time::timeout(remaining, reader.next_line()) => {
-                let line = line.map_err(|_| anyhow::anyhow!("timeout reading firefox stderr"))?;
-                match line {
-                    Ok(Some(l)) => {
-                        if let Some(url) = parse_bidi_url(&l) {
-                            return Ok(url);
-                        }
+        if let Ok(s) = std::fs::read_to_string(log_path) {
+            if s.len() > seen {
+                for line in s[seen..].lines() {
+                    if let Some(url) = parse_bidi_url(line) {
+                        return Ok(url);
                     }
-                    Ok(None) => {
-                        bail!("firefox stderr closed before BiDi endpoint was advertised");
-                    }
-                    Err(e) => bail!("reading firefox stderr: {e}"),
                 }
-            }
-            status = child.wait() => {
-                let status = status.context("waiting on firefox child")?;
-                bail!("firefox exited before BiDi endpoint was advertised (status: {status})");
+                seen = s.len();
             }
         }
+
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.start_kill();
+            bail!(
+                "timed out waiting for Firefox WebDriver BiDi endpoint on port {port}; \
+                 see log at {}",
+                log_path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 - 2026-05-13
+
+### Fixed
+
+- `browser-control start` now fully detaches the spawned browser from the
+  parent shell. Previously the child inherited piped stdout/stderr; once
+  the CLI exited, the read-ends closed and the next stderr write from the
+  browser produced `SIGPIPE` and killed it. Symptom: `start` printed the
+  PID, then `list-running` immediately showed nothing.
+  - Stdout/stderr are now redirected to `<profile>/browser.log` instead
+    of being piped to the parent.
+  - On Unix the child calls `setsid(2)` in a `pre_exec` hook so it
+    becomes its own session leader (PPID=1, own PGID). Terminal signals
+    sent to the parent's process group no longer reach the browser.
+
 ## 0.2.0 - 2026-05-13
 
 First Rust release. Establishes the crate on crates.io and seeds the

@@ -68,18 +68,59 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
     }
 }
 
+/// Detach the child from the parent's controlling terminal and process group
+/// so that:
+///
+///   * SIGHUP/SIGINT/SIGQUIT sent to the parent's process group (e.g. when
+///     the terminal closes) do not reach the browser.
+///   * `browser-control` can exit immediately after the browser is up
+///     without leaving the child wedged on inherited stdio.
+///
+/// On Unix this calls `setsid(2)` in the child between fork and exec so the
+/// child becomes its own session leader. We deliberately do not call
+/// `daemon(3)`: we still want the spawn `pid` reported by tokio to be the
+/// browser itself, not an intermediate. Stdio is already redirected to a
+/// log file by the per-engine launcher.
+///
+/// On Windows the child detaches naturally from the parent's console once
+/// its handles are closed; nothing to do here today (CREATE_NEW_PROCESS_GROUP
+/// can be revisited if we observe terminal-signal propagation issues).
+pub(crate) fn configure_session_detachment(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        // tokio::process::Command::pre_exec is an inherent method on Unix —
+        // no trait import needed.
+        // SAFETY: setsid is async-signal-safe and has no preconditions
+        // beyond "not currently a process-group leader", which is
+        // guaranteed by the fact that we are running in a fresh fork.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Poll `http://127.0.0.1:<port>/json/version` at 50ms cadence for up to 15s.
 /// Returns the `webSocketDebuggerUrl` once available.
 ///
-/// On each iteration, also checks whether the child process has already exited;
-/// if so, returns an error including any captured stderr/stdout.
+/// On each iteration, also checks whether the child process has already
+/// exited; if so, returns an error including the tail of the browser log
+/// file (since stdio is redirected there, not piped to us).
 pub(crate) async fn wait_for_endpoint(
     port: u16,
     child: &mut tokio::process::Child,
+    log_path: &std::path::Path,
 ) -> Result<String> {
     use anyhow::{bail, Context};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -90,17 +131,12 @@ pub(crate) async fn wait_for_endpoint(
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = child.try_wait().context("polling child status")? {
-            let mut stderr_buf = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_string(&mut stderr_buf).await;
-            }
-            let mut stdout_buf = String::new();
-            if let Some(mut s) = child.stdout.take() {
-                let _ = s.read_to_string(&mut stdout_buf).await;
-            }
+            let log = std::fs::read_to_string(log_path).unwrap_or_default();
             bail!(
                 "browser process exited before endpoint came up (status: {status}); \
-                 stderr: {stderr_buf}; stdout: {stdout_buf}"
+                 log ({}):\n{}",
+                log_path.display(),
+                log
             );
         }
 
@@ -115,9 +151,11 @@ pub(crate) async fn wait_for_endpoint(
         }
 
         if std::time::Instant::now() >= deadline {
-            // Best-effort kill; bubble up timeout.
             let _ = child.start_kill();
-            bail!("timed out waiting for browser endpoint on port {port}");
+            bail!(
+                "timed out waiting for browser endpoint on port {port}; see log at {}",
+                log_path.display()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
