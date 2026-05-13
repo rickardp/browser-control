@@ -1,0 +1,37 @@
+# cargo-release configuration for `browser-control`.
+# Reference: https://github.com/crate-ci/cargo-release/blob/HEAD/docs/reference.md
+#
+# What `cargo release <level> --execute` does in this repo:
+#   1. Bump the version in Cargo.toml.
+#   2. Update Cargo.lock.
+#   3. Run `cargo publish --dry-run` to verify packaging.
+#   4. Create a single commit.
+#   5. Create an annotated `v{version}` tag.
+#   6. Push the commit and tag to origin, which triggers
+#      .github/workflows/release.yml.
+#
+# `cargo release` itself never publishes — CI is the sole publisher, so a
+# laptop cannot accidentally upload a crate or trigger a Homebrew bump.
+#
+# Usage:
+#   cargo release patch --execute   # 0.1.0 -> 0.1.1
+#   cargo release minor --execute   # 0.1.0 -> 0.2.0
+#   cargo release major --execute   # 0.1.0 -> 1.0.0
+#   cargo release <X.Y.Z> --execute # explicit version
+
+# Never publish from a workstation. CI is the sole publisher.
+publish = false
+
+# Push the bump commit and tag so the release workflow fires.
+push = true
+tag = true
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+pre-release-commit-message = "chore: release v{{version}}"
+
+# Guardrail: releases must originate from main.
+allow-branch = ["main"]
+
+# Run `cargo publish --dry-run` locally before tagging so packaging
+# regressions fail on the laptop, not after the tag lands on GitHub.
+verify = true

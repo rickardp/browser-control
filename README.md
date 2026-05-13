@@ -8,17 +8,22 @@ optional MCP server is available as a subcommand.
 
 ## Install
 
-Homebrew (recommended):
+Homebrew (recommended) — tap this repo, then install:
 
 ```sh
-brew install rickardp/browser-control/browser-control
+brew tap rickardp/browser-control https://github.com/rickardp/browser-control.git
+brew install browser-control
 ```
 
-From source:
+The formula is rendered into [`Formula/browser-control.rb`](Formula/browser-control.rb) by CI on every release, so the tap URL above is all you need.
+
+From crates.io:
 
 ```sh
 cargo install browser-control
 ```
+
+Prebuilt binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64) and Windows (x86_64) are attached to every [GitHub Release](https://github.com/rickardp/browser-control/releases).
 
 Requires Rust 1.80 or newer when building from source. Node.js (for `npx`) is
 only required if you intend to use `mcp --playwright`.

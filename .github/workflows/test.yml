@@ -1,0 +1,77 @@
+# CI on every PR and push to main.
+#
+# Native runners per target — no cross-compilation. Mirrors the topology of
+# the release workflow so a green CI run on a given OS implies the release
+# build will succeed there too.
+#
+# We deliberately exercise both Apple Silicon and Intel macOS so any
+# platform-specific assumption (e.g. browser executable paths) is caught.
+
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: aarch64-apple-darwin
+          - os: macos-15-intel
+            label: x86_64-apple-darwin
+          - os: ubuntu-latest
+            label: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            label: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            label: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: Print binary size
+        shell: bash
+        run: |
+          cargo build --release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN=target/release/browser-control.exe
+          else
+            BIN=target/release/browser-control
+          fi
+          ls -lh "$BIN"
+          SIZE=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")
+          echo "Binary size on ${{ matrix.label }}: $SIZE bytes" >> "$GITHUB_STEP_SUMMARY"

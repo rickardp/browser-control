@@ -1,201 +1,264 @@
-name: release
+# Release workflow.
+#
+# Triggered by pushing a `v*` tag. The tag IS the gate — no workflow_dispatch,
+# no production environment, no manual approval. Whoever pushes the tag is
+# the gatekeeper. Use `cargo release patch --execute` (driven by `release.toml`
+# at the repo root) to bump + commit + tag + push from a workstation; CI does
+# the rest.
+#
+# Pipeline:
+#   1. verify           — tag must match Cargo.toml version.
+#   2. create-release   — draft GitHub Release.
+#   3. publish-crate    — idempotent `cargo publish`; append crates.io link.
+#   4. build-binaries   — matrix per target; upload tarball/zip to draft release.
+#   5. homebrew-bump    — render Formula/browser-control.rb from template,
+#                         commit to main (Pattern A, in-repo tap).
+#   6. finalize-release — un-draft the release once everything succeeded.
+#
+# Idempotency:
+#   * Re-running on the same tag is safe. cargo publish treats "already
+#     uploaded" as success. Archive uploads use --clobber. Homebrew commit
+#     is a no-op if SHAs haven't changed. The release stays a draft until
+#     finalize succeeds, so partial failures don't ship a half-baked release.
+
+name: Release
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
+  verify:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+            | grep -m1 '^version' \
+            | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          echo "Tag:        $TAG"
+          echo "Cargo.toml: $CARGO_VERSION"
+          if [ -z "$CARGO_VERSION" ] || [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag ($TAG) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+  create-release:
+    name: Create draft release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-crate
+      - name: Publish browser-control
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # crates.io rejects duplicate versions; treat that as success.
+        # Useful for partial-failure reruns.
+        shell: bash
+        run: |
+          set +e
+          output=$(cargo publish --locked 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          if printf '%s' "$output" | grep -qE "already (exists|uploaded)"; then
+            exit 0
+          fi
+          exit "$rc"
+      - name: Add crates.io link to release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release edit "${GITHUB_REF_NAME}" \
+            --notes "$(gh release view "${GITHUB_REF_NAME}" --json body -q .body)
+
+          crates.io: https://crates.io/crates/browser-control/${VERSION}"
+
+  build-binaries:
+    name: Build CLI (${{ matrix.target }})
+    needs: create-release
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            suffix: linux-x86_64.tar.gz
-            archive: tar
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            suffix: linux-aarch64.tar.gz
-            archive: tar
-            linker: aarch64-linux-gnu-gcc
-          - os: macos-14
-            target: x86_64-apple-darwin
-            suffix: macos-x86_64.tar.gz
-            archive: tar
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
-            suffix: macos-aarch64.tar.gz
-            archive: tar
-          - os: windows-2022
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
-            suffix: windows-x86_64.zip
-            archive: zip
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Install aarch64 cross linker (Linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
-        run: cargo build --release --target ${{ matrix.target }}
-
+          cache-targets: false
+      - name: Build binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} --locked
       - name: Strip binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/browser-control"
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            aarch64-linux-gnu-strip "$BIN" || true
-          else
-            strip "$BIN" || true
-          fi
-
-      - name: Stage artifacts
+          strip "$BIN" || true
+      - name: Package archive
         shell: bash
         run: |
-          mkdir -p staging
+          set -euo pipefail
+          NAME="browser-control-${{ matrix.target }}"
+          STAGE="staging/$NAME"
+          mkdir -p "$STAGE" dist
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/browser-control.exe" staging/
+            cp "target/${{ matrix.target }}/release/browser-control.exe" "$STAGE/"
           else
-            cp "target/${{ matrix.target }}/release/browser-control" staging/
+            cp "target/${{ matrix.target }}/release/browser-control" "$STAGE/"
           fi
-          cp README.md staging/ 2>/dev/null || true
-          cp LICENSE staging/ 2>/dev/null || true
-
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar'
-        shell: bash
-        run: |
+          cp README.md LICENSE "$STAGE/"
           cd staging
-          tar -czf "../browser-control-${{ matrix.suffix }}" -- *
-
-      - name: Package (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "../dist/${NAME}.zip" "$NAME" >/dev/null
+          else
+            tar -czf "../dist/${NAME}.tar.gz" "$NAME"
+          fi
+      - name: Upload archive to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          Compress-Archive -Path staging\* -DestinationPath "browser-control-${{ matrix.suffix }}"
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::No release archives found under dist/"
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: browser-control-${{ matrix.suffix }}
-          path: browser-control-${{ matrix.suffix }}
-          if-no-files-found: error
-
-  publish:
-    name: publish
-    needs: build
-    runs-on: ubuntu-22.04
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    env:
-      CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+  homebrew-bump:
+    name: Bump in-repo Homebrew formula
+    # Needs build-binaries so the tarballs exist on the draft release; we
+    # download them and compute SHA-256s. Pattern A: in-repo tap.
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          path: dist
-          merge-multiple: true
-
-      - name: Compute sha256 sums
-        id: sha
+          ref: main
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p tarballs
+          gh release download "${GITHUB_REF_NAME}" -p "*.tar.gz" -D tarballs
+      - name: Compute SHAs
+        id: shas
         shell: bash
         run: |
-          cd dist
+          set -euo pipefail
+          read_sha() {
+            shasum -a 256 "tarballs/browser-control-$1.tar.gz" | awk '{print $1}'
+          }
           {
-            echo "## Release artifacts"
-            echo ""
-            echo "| Archive | SHA256 |"
-            echo "|---------|--------|"
-          } >> "$GITHUB_STEP_SUMMARY"
-          declare -A SUMS
-          for f in browser-control-*; do
-            sum=$(sha256sum "$f" | awk '{print $1}')
-            SUMS[$f]=$sum
-            echo "| $f | \`$sum\` |" >> "$GITHUB_STEP_SUMMARY"
-            echo "${f}=${sum}" >> sums.txt
-          done
-          echo "computed sums for ${#SUMS[@]} archive(s)"
-          {
-            echo "SHA_MACOS_AARCH64=$(grep '^browser-control-macos-aarch64.tar.gz=' sums.txt | cut -d= -f2)"
-            echo "SHA_MACOS_X86_64=$(grep '^browser-control-macos-x86_64.tar.gz=' sums.txt | cut -d= -f2)"
-            echo "SHA_LINUX_AARCH64=$(grep '^browser-control-linux-aarch64.tar.gz=' sums.txt | cut -d= -f2)"
-            echo "SHA_LINUX_X86_64=$(grep '^browser-control-linux-x86_64.tar.gz=' sums.txt | cut -d= -f2)"
+            echo "darwin_arm=$(read_sha aarch64-apple-darwin)"
+            echo "darwin_x86=$(read_sha x86_64-apple-darwin)"
+            echo "linux_x86=$(read_sha x86_64-unknown-linux-gnu)"
+            echo "linux_arm=$(read_sha aarch64-unknown-linux-gnu)"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/browser-control-*
-          body: See CHANGELOG.md
-          tag_name: ${{ github.ref_name }}
-
-      - name: Publish to crates.io
-        if: ${{ env.CRATES_IO_TOKEN != '' }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --no-verify
-
-      - name: Render and push Homebrew formula
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          SHA_MACOS_AARCH64: ${{ steps.sha.outputs.SHA_MACOS_AARCH64 }}
-          SHA_MACOS_X86_64: ${{ steps.sha.outputs.SHA_MACOS_X86_64 }}
-          SHA_LINUX_AARCH64: ${{ steps.sha.outputs.SHA_LINUX_AARCH64 }}
-          SHA_LINUX_X86_64: ${{ steps.sha.outputs.SHA_LINUX_X86_64 }}
+      - name: Render formula
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          rendered=$(sed \
-            -e "s|__VERSION__|${VERSION}|g" \
-            -e "s|__SHA_MACOS_AARCH64__|${SHA_MACOS_AARCH64}|g" \
-            -e "s|__SHA_MACOS_X86_64__|${SHA_MACOS_X86_64}|g" \
-            -e "s|__SHA_LINUX_AARCH64__|${SHA_LINUX_AARCH64}|g" \
-            -e "s|__SHA_LINUX_X86_64__|${SHA_LINUX_X86_64}|g" \
-            homebrew/browser-control.rb.tmpl)
-          tapdir=$(mktemp -d)
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/rickardp/homebrew-browser-control.git" "$tapdir"
-          mkdir -p "$tapdir/Formula"
-          echo "$rendered" > "$tapdir/Formula/browser-control.rb"
-          cd "$tapdir"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+          mkdir -p Formula
+          sed \
+            -e "s|@@VERSION@@|${VERSION}|g" \
+            -e "s|@@URL_DARWIN_ARM@@|${BASE_URL}/browser-control-aarch64-apple-darwin.tar.gz|g" \
+            -e "s|@@SHA_DARWIN_ARM@@|${{ steps.shas.outputs.darwin_arm }}|g" \
+            -e "s|@@URL_DARWIN_X86@@|${BASE_URL}/browser-control-x86_64-apple-darwin.tar.gz|g" \
+            -e "s|@@SHA_DARWIN_X86@@|${{ steps.shas.outputs.darwin_x86 }}|g" \
+            -e "s|@@URL_LINUX_X86@@|${BASE_URL}/browser-control-x86_64-unknown-linux-gnu.tar.gz|g" \
+            -e "s|@@SHA_LINUX_X86@@|${{ steps.shas.outputs.linux_x86 }}|g" \
+            -e "s|@@URL_LINUX_ARM@@|${BASE_URL}/browser-control-aarch64-unknown-linux-gnu.tar.gz|g" \
+            -e "s|@@SHA_LINUX_ARM@@|${{ steps.shas.outputs.linux_arm }}|g" \
+            .github/templates/browser-control.rb.tmpl \
+            > Formula/browser-control.rb
+          echo "Rendered formula:"
+          cat Formula/browser-control.rb
+      - name: Commit and push to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          git config --global user.email "actions@github.com"
+          git config --global user.name  "github-actions[bot]"
           git add Formula/browser-control.rb
-          if git diff --cached --quiet; then
-            echo "No formula changes"
-          else
-            git commit -m "browser-control ${VERSION}"
-            git push origin HEAD
+          if git diff --staged --quiet; then
+            echo "::notice::Formula already up to date — no commit needed"
+            exit 0
           fi
+          git commit -m "release: bump Homebrew formula to ${VERSION} [skip ci]"
+          git push origin main
+
+  finalize-release:
+    name: Publish GitHub release
+    needs: [publish-crate, build-binaries, homebrew-bump]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
