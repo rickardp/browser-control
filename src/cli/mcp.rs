@@ -20,17 +20,17 @@ pub async fn run_cli(browser_arg: Option<String>, playwright: bool) -> Result<()
     run(state, tools).await
 }
 
-/// Resolution order: `BROWSER_CONTROL` env > positional arg > most-recent-alive > error.
+/// Resolution order: positional arg / `BROWSER_CONTROL` env (arg wins, env is
+/// the fallback — both are merged by clap into `browser_arg`) > persisted
+/// default (`browser-control set default ...`) > most-recent-alive > error.
 pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrowser> {
     let registry = Registry::open()?;
-    if let Ok(val) = std::env::var("BROWSER_CONTROL") {
-        if !val.is_empty() {
-            let sel = env_resolver::parse(&val)?;
-            return env_resolver::resolve(sel, &registry).await;
-        }
-    }
-    if let Some(arg) = browser_arg.as_deref() {
+    if let Some(arg) = browser_arg.as_deref().filter(|s| !s.is_empty()) {
         let sel = env_resolver::parse(arg)?;
+        return env_resolver::resolve(sel, &registry).await;
+    }
+    if let Some(value) = crate::config::load()?.default {
+        let sel = env_resolver::parse(&value)?;
         return env_resolver::resolve(sel, &registry).await;
     }
     if let Some(row) = registry.most_recent_alive()? {
@@ -41,6 +41,6 @@ pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrow
         });
     }
     Err(anyhow!(
-        "no browser selected: set BROWSER_CONTROL, pass a browser argument, or run `browser-control start`"
+        "no browser selected: pass a browser argument, set BROWSER_CONTROL, run `browser-control set default <value>`, or run `browser-control start`"
     ))
 }

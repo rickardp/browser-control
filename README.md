@@ -84,8 +84,8 @@ browser-control mcp --playwright        # passthrough to @playwright/mcp
 
 Browser resolution order:
 
-1. `BROWSER_CONTROL` environment variable
-2. The positional `BROWSER` argument
+1. The positional `BROWSER` argument (or `BROWSER_CONTROL` env, merged by clap; the argument wins when both are present)
+2. The persisted default from `browser-control set default <value>`
 3. The most-recently-started running browser in the registry
 4. Otherwise, exit with an error suggesting `browser-control start`
 
@@ -93,6 +93,28 @@ With `--playwright`, the CLI spawns the official `@playwright/mcp` via `npx`,
 hands it the resolved CDP endpoint, and forwards stdio bidirectionally. The
 host sees only Playwright MCP's tools; `browser-control`'s own MCP tools are
 not exposed in that mode.
+
+### `set | get | unset <KEY> [VALUE]`
+
+Manage persistent settings. The only key today is `default`, which selects the
+browser used by `mcp` when no positional argument and no `BROWSER_CONTROL` env
+var is present. Values accept the full `BROWSER_CONTROL` grammar (URL / kind /
+friendly name / absolute path) and are validated at set-time.
+
+```sh
+browser-control set default firefox
+browser-control set default ws://127.0.0.1:9222/devtools/browser/abc
+browser-control get default
+browser-control unset default
+```
+
+The setting is stored as TOML at:
+
+- macOS: `~/Library/Application Support/browser-control/config.toml`
+- Linux: `~/.config/browser-control/config.toml`
+- Windows: `%APPDATA%\browser-control\config.toml`
+
+Override the directory with `BROWSER_CONTROL_CONFIG_DIR`.
 
 ## The `BROWSER_CONTROL` environment variable
 

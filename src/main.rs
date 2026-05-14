@@ -1,5 +1,5 @@
 use anyhow::Result;
-use browser_control::cli::list;
+use browser_control::cli::{list, set};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -34,11 +34,35 @@ enum Command {
     },
     /// Start the MCP server on stdio.
     Mcp {
-        /// Browser to target (env BROWSER_CONTROL takes precedence).
+        /// Browser to target. Overrides $BROWSER_CONTROL.
+        #[arg(env = "BROWSER_CONTROL")]
         browser: Option<String>,
         /// Stdio-forward to the official Playwright MCP instead of exposing our tools.
         #[arg(long)]
         playwright: bool,
+    },
+    /// Set a persistent setting (e.g. `set default firefox`).
+    Set {
+        #[arg(value_enum)]
+        key: set::Key,
+        /// Value to assign. Omit and use `unset` instead to clear.
+        value: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a persistent setting.
+    Get {
+        #[arg(value_enum)]
+        key: set::Key,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear a persistent setting.
+    Unset {
+        #[arg(value_enum)]
+        key: set::Key,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -68,5 +92,8 @@ async fn main() -> Result<()> {
             browser,
             playwright,
         } => browser_control::cli::mcp::run_cli(browser, playwright).await,
+        Command::Set { key, value, json } => set::run_set(key, value, json),
+        Command::Get { key, json } => set::run_get(key, json),
+        Command::Unset { key, json } => set::run_unset(key, json),
     }
 }

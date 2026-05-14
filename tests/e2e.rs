@@ -70,9 +70,11 @@ fn mcp_tools_list_returns_five_tools() {
 #[test]
 fn mcp_with_no_browser_errors_helpfully() {
     let tmp = TempDir::new().unwrap();
+    let cfg = TempDir::new().unwrap();
     let out = Command::new(assert_cmd::cargo::cargo_bin("browser-control"))
         .args(["mcp"])
         .env("BROWSER_CONTROL_DATA_DIR", tmp.path())
+        .env("BROWSER_CONTROL_CONFIG_DIR", cfg.path())
         .env_remove("BROWSER_CONTROL")
         .output()
         .unwrap();
@@ -122,9 +124,70 @@ fn help_lists_all_subcommands() {
         .unwrap();
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["list-installed", "list-running", "start", "mcp"] {
+    for cmd in [
+        "list-installed",
+        "list-running",
+        "start",
+        "mcp",
+        "set",
+        "get",
+        "unset",
+    ] {
         assert!(s.contains(cmd), "missing subcommand {cmd} in:\n{s}");
     }
+}
+
+#[test]
+fn mcp_help_mentions_browser_control_env() {
+    let out = Command::new(assert_cmd::cargo::cargo_bin("browser-control"))
+        .args(["mcp", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("BROWSER_CONTROL"),
+        "mcp --help should mention BROWSER_CONTROL, got:\n{s}"
+    );
+}
+
+#[test]
+fn set_get_unset_default_round_trip() {
+    let bin = assert_cmd::cargo::cargo_bin("browser-control");
+    let cfg = TempDir::new().unwrap();
+
+    let out = Command::new(&bin)
+        .args(["set", "default", "firefox"])
+        .env("BROWSER_CONTROL_CONFIG_DIR", cfg.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "set failed: {:?}", out);
+
+    let out = Command::new(&bin)
+        .args(["get", "default", "--json"])
+        .env("BROWSER_CONTROL_CONFIG_DIR", cfg.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["key"], "default");
+    assert_eq!(v["value"], "firefox");
+
+    let out = Command::new(&bin)
+        .args(["unset", "default"])
+        .env("BROWSER_CONTROL_CONFIG_DIR", cfg.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = Command::new(&bin)
+        .args(["get", "default", "--json"])
+        .env("BROWSER_CONTROL_CONFIG_DIR", cfg.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["value"].is_null(), "expected null, got {v}");
 }
 
 #[test]

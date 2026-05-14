@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 
 const ENV_OVERRIDE: &str = "BROWSER_CONTROL_DATA_DIR";
+const CONFIG_ENV_OVERRIDE: &str = "BROWSER_CONTROL_CONFIG_DIR";
 
 /// Root data directory for browser-control. Used for the registry DB and profile dirs.
 ///
@@ -34,6 +35,35 @@ pub fn registry_db_path() -> Result<PathBuf> {
     Ok(dir.join("registry.db"))
 }
 
+/// Root config directory for browser-control.
+///
+/// macOS:   `~/Library/Application Support/browser-control` (same as `data_dir`)
+/// Linux:   `$XDG_CONFIG_HOME/browser-control` (or `~/.config/browser-control`)
+/// Windows: `%APPDATA%/browser-control` (same as `data_dir`)
+///
+/// Override with env var `BROWSER_CONTROL_CONFIG_DIR` (absolute path).
+pub fn config_dir() -> Result<PathBuf> {
+    if let Some(v) = std::env::var_os(CONFIG_ENV_OVERRIDE) {
+        let p = PathBuf::from(v);
+        if p.as_os_str().is_empty() {
+            return Err(anyhow!("{} is set but empty", CONFIG_ENV_OVERRIDE));
+        }
+        return Ok(p);
+    }
+
+    let pd = directories::ProjectDirs::from("", "", "browser-control")
+        .ok_or_else(|| anyhow!("could not determine user config directory (no home dir found)"))?;
+    Ok(pd.config_dir().to_path_buf())
+}
+
+/// Returns `<config_dir>/config.toml`. Ensures the parent directory exists.
+pub fn config_file_path() -> Result<PathBuf> {
+    let dir = config_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating config dir {}", dir.display()))?;
+    Ok(dir.join("config.toml"))
+}
+
 /// Returns `<data_dir>/profiles`. Ensures the directory exists.
 pub fn profiles_dir() -> Result<PathBuf> {
     let dir = data_dir()?.join("profiles");
@@ -48,6 +78,9 @@ mod tests {
 
     #[test]
     fn paths_work() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Test 1: override via env var.
         let tmp = tempfile::TempDir::new().unwrap();
         let tmp_path = tmp.path().to_path_buf();
@@ -73,6 +106,31 @@ mod tests {
         assert!(
             d.ends_with("browser-control"),
             "expected default data_dir to end with 'browser-control', got {}",
+            d.display()
+        );
+    }
+
+    #[test]
+    fn config_paths_work() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        std::env::set_var(CONFIG_ENV_OVERRIDE, &tmp_path);
+
+        assert_eq!(config_dir().unwrap(), tmp_path);
+
+        let cfg = config_file_path().unwrap();
+        assert_eq!(cfg, tmp_path.join("config.toml"));
+        assert!(cfg.parent().unwrap().exists());
+        assert_eq!(cfg.file_name().unwrap(), "config.toml");
+
+        std::env::remove_var(CONFIG_ENV_OVERRIDE);
+        let d = config_dir().unwrap();
+        assert!(
+            d.ends_with("browser-control"),
+            "expected default config_dir to end with 'browser-control', got {}",
             d.display()
         );
     }

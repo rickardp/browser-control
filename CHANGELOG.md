@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `browser-control set default <value>` / `get default` / `unset default`:
+  persist a default browser used by `browser-control mcp` when no positional
+  argument and no `BROWSER_CONTROL` env var is present. Values accept the full
+  `BROWSER_CONTROL` grammar (URL, kind, friendly name, absolute path) and are
+  validated at set-time. Stored as TOML in the OS config dir
+  (`BROWSER_CONTROL_CONFIG_DIR` overrides the location).
+
+### Changed
+
+- `browser-control mcp`: the positional `BROWSER` argument now overrides the
+  `BROWSER_CONTROL` environment variable (previously env took precedence).
+  Clap merges them, and `--help` advertises the `BROWSER_CONTROL` env binding.
+
 ## 0.2.1 - 2026-05-13
 
 ### Fixed
