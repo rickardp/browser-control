@@ -24,28 +24,28 @@
 class BrowserControl < Formula
   desc "CLI for browser lifecycle and CDP/BiDi access for agent-driven dev"
   homepage "https://github.com/rickardp/browser-control"
-  version "0.3.2"
+  version "0.3.3"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.3.2/browser-control-aarch64-apple-darwin.tar.gz"
-      sha256 "34a92e330243b916006608b51a1876c20d002ab51c5b529af65ea0bc2b70c8ad"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.3.3/browser-control-aarch64-apple-darwin.tar.gz"
+      sha256 "11d0e9e0a185a566242e1c27292e6372d7ad864c882729eb20a3fab66dec0c43"
     end
     on_intel do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.3.2/browser-control-x86_64-apple-darwin.tar.gz"
-      sha256 "3fd25cf5a6125d7c6d421577c71ba88a944fcd985758371be5a8952000c29002"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.3.3/browser-control-x86_64-apple-darwin.tar.gz"
+      sha256 "b8dd4403aa0abf8b09bdf051d0d91e22c2f2bf6ed2accf7e1c70adec9355da9d"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.3.2/browser-control-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "bd77e8ea45e25bad149d98d53746e1b0330f18ab932f11bb86ca1bfa02d132d4"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.3.3/browser-control-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "f0055fbe9176e4c1a1562fd49161227cf28c40e0fae45eed7aaba373a9e74fab"
     end
     on_arm do
-      url "https://github.com/rickardp/browser-control/releases/download/v0.3.2/browser-control-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "3720b77bc10bd534639fe063fe2251deecea7415c7619fb0742060d7ffda28b3"
+      url "https://github.com/rickardp/browser-control/releases/download/v0.3.3/browser-control-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "38fbeb4f8fc266e49764298eed7cccf632c53b2ab47c537e0eaafb0bef2ece41"
     end
   end
 
