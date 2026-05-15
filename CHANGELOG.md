@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — 2026-05-15
+
+### Fixed
+
+- Removed the `--profile` flag from `browser-control start`. Agents tended
+  to pass a fresh profile path on every invocation, defeating the persisted
+  default profile and forcing repeated re-authentication. The persisted
+  per-kind profile under the OS app-data dir is now the only option,
+  matching the documented intent of 0.3.0.
+
 ## 0.3.0 — 2026-05-15
 
 ### Added

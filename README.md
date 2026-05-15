@@ -69,20 +69,19 @@ requested kind is already alive, it is reused.
 ```sh
 browser-control start                   # first available Chromium-based
 browser-control start firefox
-browser-control start chrome --headless
-browser-control start chromium --profile ./my-profile --json
+browser-control start chrome --headless --json
 ```
 
 `BROWSER` may be a kind (`chrome`, `edge`, `chromium`, `brave`, `firefox`) or a
 friendly instance name printed by a previous `start` (e.g. `firefox-pikachu`).
 When omitted, the first available Chromium-based browser is used.
 
-When `--profile` is omitted, `start` uses a stable per-kind profile directory
-under the OS app-data dir (macOS: `~/Library/Application Support/browser-control/profiles/<kind>/default/`;
+`start` always uses a stable per-kind profile directory under the OS app-data
+dir (macOS: `~/Library/Application Support/browser-control/profiles/<kind>/default/`;
 Linux: `~/.config/browser-control/profiles/<kind>/default/`;
 Windows: `%APPDATA%\browser-control\profiles\<kind>\default\`), so subsequent
-starts of the same kind reuse the same browser state across reboots. Pass
-`--profile <path>` to override.
+starts of the same kind reuse the same browser state across reboots. This is
+intentional: it avoids re-authenticating in every new browser session.
 
 ### `mcp [BROWSER] [--playwright]`
 

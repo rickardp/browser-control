@@ -30,8 +30,6 @@ enum Command {
         #[arg(long)]
         headless: bool,
         #[arg(long)]
-        profile: Option<std::path::PathBuf>,
-        #[arg(long)]
         json: bool,
     },
     /// Start the MCP server on stdio.
@@ -186,9 +184,8 @@ async fn main() -> Result<()> {
         Command::Start {
             browser,
             headless,
-            profile,
             json,
-        } => browser_control::cli::start::run(browser, headless, profile, json).await,
+        } => browser_control::cli::start::run(browser, headless, json).await,
         Command::Mcp {
             browser,
             playwright,
