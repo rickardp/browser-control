@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.2 — 2026-05-15
+
+### Fixed
+
+- `browser-control wait --ready` and `list-running --json` enrichment
+  used the raw `ws://host:port/devtools/browser/<id>` endpoint as the
+  HTTP probe base, so the `/json/version` request never succeeded.
+  `wait --ready` always timed out and `cdp_ws_url` / `bidi_ws_url` were
+  silently `null`. Endpoints are now normalised to `http(s)://host:port`
+  before probing.
+
 ## 0.3.1 — 2026-05-15
 
 ### Fixed

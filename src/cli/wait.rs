@@ -20,8 +20,24 @@ pub async fn run(browser: Option<String>, ready: bool, timeout: u64) -> Result<(
     Ok(())
 }
 
+/// Convert a raw browser endpoint (which may be a `ws://host:port/...` URL or
+/// already an `http://host:port` base) into the HTTP base used for probing.
+pub(crate) fn http_base_from_endpoint(endpoint: &str) -> String {
+    if let Ok(u) = url::Url::parse(endpoint) {
+        let scheme = match u.scheme() {
+            "ws" | "http" => "http",
+            "wss" | "https" => "https",
+            other => other,
+        };
+        if let (Some(host), Some(port)) = (u.host_str(), u.port_or_known_default()) {
+            return format!("{scheme}://{host}:{port}");
+        }
+    }
+    endpoint.trim_end_matches('/').to_string()
+}
+
 async fn probe_once(client: &reqwest::Client, endpoint: &str, engine: Engine) -> bool {
-    let base = endpoint.trim_end_matches('/');
+    let base = http_base_from_endpoint(endpoint);
     let url = format!("{base}/json/version");
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
@@ -67,6 +83,26 @@ async fn wait_until_ready(endpoint: &str, engine: Engine, timeout: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_base_from_ws_endpoint_with_path() {
+        let got = http_base_from_endpoint(
+            "ws://127.0.0.1:52679/devtools/browser/992c1917-9f77-4eee-9bf7-90f400d826b5",
+        );
+        assert_eq!(got, "http://127.0.0.1:52679");
+    }
+
+    #[test]
+    fn http_base_from_wss_endpoint() {
+        let got = http_base_from_endpoint("wss://host.example:9222/session/abc");
+        assert_eq!(got, "https://host.example:9222");
+    }
+
+    #[test]
+    fn http_base_passes_through_http_base() {
+        let got = http_base_from_endpoint("http://127.0.0.1:9222");
+        assert_eq!(got, "http://127.0.0.1:9222");
+    }
 
     #[tokio::test]
     async fn wait_ready_succeeds_when_server_immediately_responds() {

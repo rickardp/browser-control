@@ -25,7 +25,7 @@ struct EnrichedBrowserRow {
 /// Fetch `webSocketDebuggerUrl` from `<endpoint>/json/version` with a short timeout.
 /// Returns `None` if anything fails — callers should treat the probe as optional.
 async fn probe_ws_url(client: &reqwest::Client, endpoint: &str) -> Option<String> {
-    let base = endpoint.trim_end_matches('/');
+    let base = crate::cli::wait::http_base_from_endpoint(endpoint);
     let url = format!("{base}/json/version");
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
