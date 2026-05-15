@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::cli::env_resolver::{self, ResolvedBrowser, Source};
+use crate::cli::env_resolver::{self, ResolvedBrowser};
 use crate::mcp::server::{run, ServerState, ToolRegistry};
 use crate::registry::Registry;
 
@@ -22,7 +22,12 @@ pub async fn run_cli(browser_arg: Option<String>, playwright: bool) -> Result<()
 
 /// Resolution order: positional arg / `BROWSER_CONTROL` env (arg wins, env is
 /// the fallback — both are merged by clap into `browser_arg`) > persisted
-/// default (`browser-control set default ...`) > most-recent-alive > error.
+/// default (`browser-control set default ...`) > error.
+///
+/// We deliberately do NOT fall back to a "most recently alive" registry row:
+/// that hides which browser is being controlled and depends on global state
+/// that other processes can mutate, producing surprising results for agents
+/// that share a host.
 pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrowser> {
     let registry = Registry::open()?;
     if let Some(arg) = browser_arg.as_deref().filter(|s| !s.is_empty()) {
@@ -33,14 +38,7 @@ pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrow
         let sel = env_resolver::parse(&value)?;
         return env_resolver::resolve(sel, &registry).await;
     }
-    if let Some(row) = registry.most_recent_alive()? {
-        return Ok(ResolvedBrowser {
-            endpoint: row.endpoint,
-            engine: row.engine,
-            source: Source::Registered { name: row.name },
-        });
-    }
     Err(anyhow!(
-        "no browser selected: pass a browser argument, set BROWSER_CONTROL, run `browser-control set default <value>`, or run `browser-control start`"
+        "no browser selected: pass a browser argument, set BROWSER_CONTROL, or run `browser-control set default <value>`"
     ))
 }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.4 — 2026-05-15
+
+### Changed
+
+- Browser resolution no longer falls back to "most recently alive in the
+  registry" when no argument, `BROWSER_CONTROL` env, or persisted default
+  is supplied. That fallback depended on global state another process
+  could mutate, producing surprising behaviour on shared hosts. Callers
+  must now be explicit — pass an argument, set `BROWSER_CONTROL`, or run
+  `browser-control set default <value>`.
+
 ## 0.3.3 — 2026-05-15
 
 ### Changed

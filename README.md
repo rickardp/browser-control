@@ -93,7 +93,7 @@ intentional: it avoids re-authenticating in every new browser session.
 Start an MCP server on stdio that targets a running browser.
 
 ```sh
-browser-control mcp                     # use most-recently-started browser
+browser-control mcp                     # use persisted default browser
 browser-control mcp firefox             # target a specific kind
 browser-control mcp --playwright        # passthrough to @playwright/mcp
 ```
@@ -102,8 +102,7 @@ Browser resolution order:
 
 1. The positional `BROWSER` argument (or `BROWSER_CONTROL` env, merged by clap; the argument wins when both are present)
 2. The persisted default from `browser-control set default <value>`
-3. The most-recently-started running browser in the registry
-4. Otherwise, exit with an error suggesting `browser-control start`
+3. Otherwise, exit with an error
 
 With `--playwright`, the CLI spawns the official `@playwright/mcp` via `npx`,
 hands it the resolved CDP endpoint, and forwards stdio bidirectionally. The
