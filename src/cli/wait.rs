@@ -60,7 +60,11 @@ async fn probe_once(client: &reqwest::Client, endpoint: &str, engine: Engine) ->
     }
 }
 
-async fn wait_until_ready(endpoint: &str, engine: Engine, timeout: Duration) -> Result<()> {
+pub(crate) async fn wait_until_ready(
+    endpoint: &str,
+    engine: Engine,
+    timeout: Duration,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()

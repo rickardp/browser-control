@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3 — 2026-05-15
+
+### Changed
+
+- `browser-control start` now waits for the browser's debugging endpoint
+  to be reachable before returning (up to `--wait-timeout` seconds,
+  default 30). This eliminates the most common command chain of
+  `start && wait --ready && ...` and prevents races where agents tried
+  to attach before the endpoint was serving requests. Pass `--no-wait`
+  to opt out and return as soon as the process is spawned.
+
 ## 0.3.2 — 2026-05-15
 
 ### Fixed

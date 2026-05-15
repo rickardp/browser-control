@@ -23,7 +23,13 @@ pub struct StartResult {
     pub reused: bool,
 }
 
-pub async fn run(browser: Option<String>, headless: bool, json: bool) -> Result<()> {
+pub async fn run(
+    browser: Option<String>,
+    headless: bool,
+    no_wait: bool,
+    wait_timeout: u64,
+    json: bool,
+) -> Result<()> {
     let installed = detect::list_installed();
     if installed.is_empty() {
         anyhow::bail!("no supported browsers installed; run `browser-control list-installed`");
@@ -50,6 +56,14 @@ pub async fn run(browser: Option<String>, headless: bool, json: bool) -> Result<
 
     let registry = Registry::open()?;
     if let Some(row) = registry.first_alive_by_kind(resolved_kind)? {
+        if !no_wait {
+            crate::cli::wait::wait_until_ready(
+                &row.endpoint,
+                row.engine,
+                std::time::Duration::from_secs(wait_timeout),
+            )
+            .await?;
+        }
         let res = to_result(&row, true);
         emit(&res, json)?;
         return Ok(());
@@ -80,6 +94,15 @@ pub async fn run(browser: Option<String>, headless: bool, json: bool) -> Result<
     };
     registry.insert(&row)?;
     let _pid = handle.forget();
+
+    if !no_wait {
+        crate::cli::wait::wait_until_ready(
+            &row.endpoint,
+            row.engine,
+            std::time::Duration::from_secs(wait_timeout),
+        )
+        .await?;
+    }
 
     let res = to_result(&row, false);
     emit(&res, json)?;

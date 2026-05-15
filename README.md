@@ -76,6 +76,11 @@ browser-control start chrome --headless --json
 friendly instance name printed by a previous `start` (e.g. `firefox-pikachu`).
 When omitted, the first available Chromium-based browser is used.
 
+`start` blocks until the browser's debugging endpoint is reachable (up to
+`--wait-timeout` seconds, default 30) so the next command in a chain can
+attach immediately. Pass `--no-wait` to return as soon as the process is
+spawned.
+
 `start` always uses a stable per-kind profile directory under the OS app-data
 dir (macOS: `~/Library/Application Support/browser-control/profiles/<kind>/default/`;
 Linux: `~/.config/browser-control/profiles/<kind>/default/`;

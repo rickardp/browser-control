@@ -29,6 +29,12 @@ enum Command {
         browser: Option<String>,
         #[arg(long)]
         headless: bool,
+        /// Do not wait for the browser's debugging endpoint to be reachable.
+        #[arg(long)]
+        no_wait: bool,
+        /// Seconds to wait for the endpoint when not using --no-wait.
+        #[arg(long, default_value_t = 30)]
+        wait_timeout: u64,
         #[arg(long)]
         json: bool,
     },
@@ -184,8 +190,10 @@ async fn main() -> Result<()> {
         Command::Start {
             browser,
             headless,
+            no_wait,
+            wait_timeout,
             json,
-        } => browser_control::cli::start::run(browser, headless, json).await,
+        } => browser_control::cli::start::run(browser, headless, no_wait, wait_timeout, json).await,
         Command::Mcp {
             browser,
             playwright,
