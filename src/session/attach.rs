@@ -76,6 +76,46 @@ impl PageSession {
         Ok(PageSession::Bidi(BidiPage { client, context }))
     }
 
+    /// Attach to (or create) a page whose document origin matches `origin`.
+    ///
+    /// Strategy:
+    /// 1. List existing page targets / browsing contexts.
+    /// 2. If any has the same origin as `origin`, attach to it.
+    /// 3. Otherwise create a new tab navigated to the origin's root and
+    ///    attach to that tab.
+    ///
+    /// `origin` is parsed for its scheme, host, and port; path/query/fragment
+    /// are ignored when comparing existing target URLs.
+    pub async fn attach_for_origin(endpoint: &str, engine: Engine, origin: &str) -> Result<Self> {
+        let want =
+            url::Url::parse(origin).map_err(|e| anyhow!("invalid origin URL `{origin}`: {e}"))?;
+        let origin_root = origin_root_url(&want);
+        match engine {
+            Engine::Cdp => {
+                let client = open_cdp(endpoint).await?;
+                let target_id = match find_cdp_target_for_origin(&client, &want).await? {
+                    Some(id) => id,
+                    None => create_cdp_tab(&client, &origin_root).await?,
+                };
+                let session_id = client.attach_to_target(&target_id).await?;
+                Ok(PageSession::Cdp(CdpPage {
+                    client,
+                    session_id,
+                    target_id,
+                }))
+            }
+            Engine::Bidi => {
+                let client = Arc::new(open_bidi(endpoint).await?);
+                client.session_new().await?;
+                let context = match find_bidi_context_for_origin(&client, &want).await? {
+                    Some(c) => c,
+                    None => create_bidi_tab(&client, &origin_root).await?,
+                };
+                Ok(PageSession::Bidi(BidiPage { client, context }))
+            }
+        }
+    }
+
     /// Evaluate `expression` in the page's main world.
     ///
     /// `await_promise = true` mirrors `Runtime.evaluate({awaitPromise:true})`
@@ -220,6 +260,88 @@ async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Resu
     }
 }
 
+/// True when both URLs share scheme, host, and effective port.
+pub(crate) fn same_origin(a: &url::Url, b: &url::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Strip everything after the origin: e.g. `https://x/y?z` → `https://x/`.
+pub(crate) fn origin_root_url(u: &url::Url) -> String {
+    let scheme = u.scheme();
+    let host = u.host_str().unwrap_or("");
+    match (u.port(), u.port_or_known_default()) {
+        // Only emit a port when it's non-default for the scheme.
+        (Some(p), _) => format!("{scheme}://{host}:{p}/"),
+        (None, _) => format!("{scheme}://{host}/"),
+    }
+}
+
+async fn find_cdp_target_for_origin(client: &CdpClient, want: &url::Url) -> Result<Option<String>> {
+    let targets = client.list_targets().await?;
+    Ok(targets
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+        .find_map(|t| {
+            let u = t.get("url").and_then(|v| v.as_str())?;
+            let parsed = url::Url::parse(u).ok()?;
+            if same_origin(&parsed, want) {
+                t.get("targetId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        }))
+}
+
+async fn create_cdp_tab(client: &CdpClient, url: &str) -> Result<String> {
+    let v = client
+        .send("Target.createTarget", json!({ "url": url }))
+        .await?;
+    v.get("targetId")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))
+}
+
+async fn find_bidi_context_for_origin(
+    client: &BidiClient,
+    want: &url::Url,
+) -> Result<Option<String>> {
+    let tree = client.send("browsingContext.getTree", json!({})).await?;
+    let contexts = tree
+        .get("contexts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(contexts.iter().find_map(|c| {
+        let u = c.get("url").and_then(|v| v.as_str())?;
+        let parsed = url::Url::parse(u).ok()?;
+        if same_origin(&parsed, want) {
+            c.get("context")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        }
+    }))
+}
+
+async fn create_bidi_tab(client: &BidiClient, url: &str) -> Result<String> {
+    let v = client
+        .send("browsingContext.create", json!({ "type": "tab" }))
+        .await?;
+    let ctx = v
+        .get("context")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("browsingContext.create did not return context"))?
+        .to_string();
+    client.browsing_context_navigate(&ctx, url).await?;
+    Ok(ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +361,7 @@ mod tests {
                 let result = match method {
                     "Target.getTargets" => json!({"targetInfos": targets.clone()}),
                     "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                    "Target.createTarget" => json!({"targetId": "NEW"}),
                     "Runtime.evaluate" => json!({"result": {"value": "ok"}}),
                     "Page.navigate" => json!({}),
                     "Page.captureScreenshot" => json!({"data": "PNGDATA"}),
@@ -249,6 +372,56 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    #[test]
+    fn same_origin_basic() {
+        let a = url::Url::parse("https://example.com/path?q=1").unwrap();
+        let b = url::Url::parse("https://example.com/other").unwrap();
+        let c = url::Url::parse("https://other.test/path").unwrap();
+        let d = url::Url::parse("http://example.com/").unwrap();
+        assert!(same_origin(&a, &b));
+        assert!(!same_origin(&a, &c));
+        assert!(!same_origin(&a, &d));
+    }
+
+    #[test]
+    fn origin_root_strips_path_and_default_port() {
+        let u = url::Url::parse("https://example.com/foo/bar?x=1#z").unwrap();
+        assert_eq!(origin_root_url(&u), "https://example.com/");
+        let u2 = url::Url::parse("http://localhost:8080/foo").unwrap();
+        assert_eq!(origin_root_url(&u2), "http://localhost:8080/");
+    }
+
+    #[tokio::test]
+    async fn attach_for_origin_reuses_matching_tab() {
+        let url = spawn_cdp_mock(vec![
+            json!({"targetId":"a","type":"page","url":"https://other.test/x"}),
+            json!({"targetId":"b","type":"page","url":"https://example.com/login"}),
+        ])
+        .await;
+        let s = PageSession::attach_for_origin(&url, Engine::Cdp, "https://example.com/api/v1")
+            .await
+            .unwrap();
+        match s {
+            PageSession::Cdp(p) => assert_eq!(p.target_id, "b"),
+            _ => panic!("expected CDP"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_for_origin_creates_tab_when_no_match() {
+        let url = spawn_cdp_mock(vec![
+            json!({"targetId":"a","type":"page","url":"https://other.test/"}),
+        ])
+        .await;
+        let s = PageSession::attach_for_origin(&url, Engine::Cdp, "https://example.com/api")
+            .await
+            .unwrap();
+        match s {
+            PageSession::Cdp(p) => assert_eq!(p.target_id, "NEW"),
+            _ => panic!("expected CDP"),
+        }
     }
 
     #[tokio::test]

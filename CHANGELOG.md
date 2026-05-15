@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.5 — 2026-05-15
+
+### Fixed
+
+- `browser-control fetch URL` now runs in the context of a tab on the
+  target URL's origin instead of whichever tab happens to be active. If
+  no existing tab matches the origin, a new tab is opened and navigated
+  to the origin root before the fetch is issued. This ensures cookies
+  and CORS behaviour match what the URL expects, regardless of what the
+  user is doing in the browser. The new tab is left open so subsequent
+  fetches against the same origin reuse it. Passing `--target REGEX`
+  still works as an explicit override and skips the origin auto-attach.
+
 ## 0.3.4 — 2026-05-15
 
 ### Changed

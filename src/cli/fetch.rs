@@ -36,8 +36,12 @@ pub async fn run(
     let expr = build_fetch_expr(&url, &method, &header_map, data.as_deref())?;
 
     let resolved = resolve_browser(browser).await?;
-    let session =
-        PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
+    let session = match target.as_deref() {
+        Some(regex) => {
+            PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?
+        }
+        None => PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?,
+    };
     let result = session.evaluate(&expr, true).await;
     session.close().await;
     let result = result?;

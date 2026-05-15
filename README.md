@@ -197,8 +197,15 @@ browser-control fetch --target '^https://app\.example\.com' -i \
 ```
 
 `-i` prepends status line + response headers (like `curl -i`). `-o FILE`
-writes the body to FILE (0600 on Unix). `--target URLREGEX` picks which page
-to evaluate in when several are open.
+writes the body to FILE (0600 on Unix).
+
+By default `fetch` runs in a tab on the URL's origin, reusing an existing
+same-origin tab if one is open and otherwise opening a new tab navigated
+to the origin root. This guarantees the request carries the cookies and
+honours the CORS rules of the target site, regardless of which tab the
+user is currently looking at. The auto-opened tab is left open so
+subsequent fetches against the same origin reuse it. Pass `--target
+URLREGEX` to override and explicitly pick a tab by URL regex.
 
 ### `storage`
 
