@@ -1,15 +1,23 @@
 //! MCP tools exposed by the `browser-control mcp` server.
 //!
-//! Five tools wrap the underlying CDP / BiDi clients:
-//! `navigate`, `get_dom`, `screenshot`, `fetch`, `select_element`.
+//! Ten tools wrap the underlying `session::PageSession` and related helpers:
+//! `navigate`, `get_dom`, `screenshot`, `fetch`, `select_element`,
+//! `list_targets`, `cookies`, `storage_get`, `storage_set`, `wait_for_cookie`.
 
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::cli::cookies::fetch_cookies;
+use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
+use crate::cli::wait_for_cookie::cookie_matches;
 use crate::detect::Engine;
 use crate::dom::scripts::{FETCH_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
 use crate::mcp::server::{RegisteredTool, ServerState, ToolHandler, ToolRegistry};
+use crate::session::attach::PageSession;
+use crate::session::targets::{list as list_targets, open_bidi};
 
 /// Register the standard tool set onto the given registry.
 pub fn register_all(registry: &ToolRegistry) {
@@ -18,75 +26,38 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_screenshot());
     registry.register(make_fetch());
     registry.register(make_select_element());
+    registry.register(make_list_targets());
+    registry.register(make_cookies());
+    registry.register(make_storage_get());
+    registry.register(make_storage_set());
+    registry.register(make_wait_for_cookie());
 }
 
 // ---------------------------------------------------------------------------
 // Engine dispatch helpers.
 // ---------------------------------------------------------------------------
 
-async fn open_cdp(endpoint: &str) -> Result<crate::cdp::CdpClient> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        crate::cdp::CdpClient::connect(endpoint).await
-    } else {
-        crate::cdp::CdpClient::connect_http(endpoint).await
-    }
-}
-
-async fn open_bidi(endpoint: &str) -> Result<crate::bidi::BidiClient> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        crate::bidi::BidiClient::connect(endpoint).await
-    } else {
-        let client = reqwest::Client::new();
-        let v: Value = client
-            .get(format!("{}/json/version", endpoint.trim_end_matches('/')))
-            .send()
-            .await?
-            .json()
-            .await?;
-        let ws = v
-            .get("webSocketDebuggerUrl")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("no webSocketDebuggerUrl"))?
-            .to_string();
-        crate::bidi::BidiClient::connect(&ws).await
-    }
-}
-
-/// Attach to the first `page` target via CDP and return `(client, session_id)`.
-async fn cdp_attach_first_page(endpoint: &str) -> Result<(crate::cdp::CdpClient, String)> {
-    let client = open_cdp(endpoint).await?;
-    let targets = client.list_targets().await?;
-    let target_id = targets
-        .iter()
-        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-        .and_then(|t| t.get("targetId").and_then(|v| v.as_str()))
-        .ok_or_else(|| anyhow!("no page target found"))?
-        .to_string();
-    let session_id = client.attach_to_target(&target_id).await?;
-    Ok((client, session_id))
-}
-
-/// Open or return the cached BiDi session and top-level browsing context.
+/// Open (or return the cached) page session for the configured browser.
 ///
-/// Firefox limits a browser instance to one active BiDi session at a time,
-/// so we open the WebSocket once and reuse it for every tool call.
-async fn bidi_top_context(
-    state: &ServerState,
-) -> Result<(std::sync::Arc<crate::bidi::BidiClient>, String)> {
-    let mut guard = state.bidi.lock().await;
-    if let Some((c, ctx)) = guard.as_ref() {
-        return Ok((c.clone(), ctx.clone()));
+/// CDP sessions are short-lived: we open and close a fresh WebSocket per
+/// call. BiDi sessions reuse one persistent client, because Firefox limits
+/// a browser instance to a single concurrent BiDi session.
+async fn attach_active(state: &ServerState) -> Result<PageSession> {
+    match state.browser.engine {
+        Engine::Cdp => PageSession::attach(&state.browser.endpoint, Engine::Cdp, None).await,
+        Engine::Bidi => {
+            let mut guard = state.bidi.lock().await;
+            let client = if let Some(c) = guard.as_ref() {
+                c.clone()
+            } else {
+                let c = Arc::new(open_bidi(&state.browser.endpoint).await?);
+                c.session_new().await?;
+                *guard = Some(c.clone());
+                c
+            };
+            PageSession::from_bidi_cache(client, None).await
+        }
     }
-    let client = open_bidi(&state.browser.endpoint).await?;
-    client.session_new().await?;
-    let tree = client.send("browsingContext.getTree", json!({})).await?;
-    let ctx = tree["contexts"][0]["context"]
-        .as_str()
-        .ok_or_else(|| anyhow!("no top-level browsing context"))?
-        .to_string();
-    let arc = std::sync::Arc::new(client);
-    *guard = Some((arc.clone(), ctx.clone()));
-    Ok((arc, ctx))
 }
 
 fn text_content(text: impl Into<String>) -> Value {
@@ -129,24 +100,9 @@ fn make_navigate() -> RegisteredTool {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing 'url'"))?
                     .to_string();
-                match state.browser.engine {
-                    Engine::Cdp => {
-                        let (client, session_id) =
-                            cdp_attach_first_page(&state.browser.endpoint).await?;
-                        client
-                            .send_with_session(
-                                "Page.navigate",
-                                json!({ "url": url }),
-                                Some(&session_id),
-                            )
-                            .await?;
-                        client.close().await;
-                    }
-                    Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state).await?;
-                        client.browsing_context_navigate(&ctx, &url).await?;
-                    }
-                }
+                let session = attach_active(&state).await?;
+                session.navigate(&url).await?;
+                session.close().await;
                 Ok(text_content(format!("Navigated to {url}")))
             })
         }),
@@ -179,30 +135,10 @@ fn make_get_dom() -> RegisteredTool {
                     None => "null".to_string(),
                 };
                 let expr = format!("({GET_DOM_JS})({selector_literal})");
-                let html = match state.browser.engine {
-                    Engine::Cdp => {
-                        let (client, session_id) =
-                            cdp_attach_first_page(&state.browser.endpoint).await?;
-                        let v = client
-                            .send_with_session(
-                                "Runtime.evaluate",
-                                json!({
-                                    "expression": expr,
-                                    "returnByValue": true,
-                                    "awaitPromise": false,
-                                }),
-                                Some(&session_id),
-                            )
-                            .await?;
-                        client.close().await;
-                        v["result"]["value"].as_str().unwrap_or("").to_string()
-                    }
-                    Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state).await?;
-                        let v = client.script_evaluate(&ctx, &expr).await?;
-                        v["result"]["value"].as_str().unwrap_or("").to_string()
-                    }
-                };
+                let session = attach_active(&state).await?;
+                let value = session.evaluate(&expr, false).await?;
+                session.close().await;
+                let html = value.as_str().unwrap_or("").to_string();
                 Ok(text_content(html))
             })
         }),
@@ -230,32 +166,9 @@ fn make_screenshot() -> RegisteredTool {
                     .get("full_page")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let b64 = match state.browser.engine {
-                    Engine::Cdp => {
-                        let (client, session_id) =
-                            cdp_attach_first_page(&state.browser.endpoint).await?;
-                        let v = client
-                            .send_with_session(
-                                "Page.captureScreenshot",
-                                json!({
-                                    "format": "png",
-                                    "captureBeyondViewport": full_page,
-                                }),
-                                Some(&session_id),
-                            )
-                            .await?;
-                        client.close().await;
-                        v["data"]
-                            .as_str()
-                            .ok_or_else(|| anyhow!("no screenshot data"))?
-                            .to_string()
-                    }
-                    Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state).await?;
-                        let data = client.browsing_context_capture_screenshot(&ctx).await?;
-                        data
-                    }
-                };
+                let session = attach_active(&state).await?;
+                let b64 = session.screenshot(full_page).await?;
+                session.close().await;
                 Ok(image_content(b64))
             })
         }),
@@ -290,30 +203,10 @@ fn make_fetch() -> RegisteredTool {
                 let args_json = serde_json::to_string(&args)?;
                 let args_literal = serde_json::to_string(&args_json)?;
                 let expr = format!("({FETCH_JS})({args_literal})");
-                let raw = match state.browser.engine {
-                    Engine::Cdp => {
-                        let (client, session_id) =
-                            cdp_attach_first_page(&state.browser.endpoint).await?;
-                        let v = client
-                            .send_with_session(
-                                "Runtime.evaluate",
-                                json!({
-                                    "expression": expr,
-                                    "returnByValue": true,
-                                    "awaitPromise": true,
-                                }),
-                                Some(&session_id),
-                            )
-                            .await?;
-                        client.close().await;
-                        v["result"]["value"].as_str().unwrap_or("").to_string()
-                    }
-                    Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state).await?;
-                        let v = client.script_evaluate(&ctx, &expr).await?;
-                        v["result"]["value"].as_str().unwrap_or("").to_string()
-                    }
-                };
+                let session = attach_active(&state).await?;
+                let value = session.evaluate(&expr, true).await?;
+                session.close().await;
+                let raw = value.as_str().unwrap_or("").to_string();
                 let parsed: Value = serde_json::from_str(&raw)
                     .map_err(|e| anyhow!("invalid fetch response JSON: {e}"))?;
                 let pretty = serde_json::to_string_pretty(&parsed)?;
@@ -340,31 +233,253 @@ fn make_select_element() -> RegisteredTool {
         handler: handler(|state, _args| {
             Box::pin(async move {
                 let expr = SELECT_ELEMENT_JS.to_string();
-                let selector = match state.browser.engine {
-                    Engine::Cdp => {
-                        let (client, session_id) =
-                            cdp_attach_first_page(&state.browser.endpoint).await?;
-                        let v = client
-                            .send_with_session(
-                                "Runtime.evaluate",
-                                json!({
-                                    "expression": expr,
-                                    "returnByValue": true,
-                                    "awaitPromise": true,
-                                }),
-                                Some(&session_id),
-                            )
-                            .await?;
-                        client.close().await;
-                        v["result"]["value"].as_str().unwrap_or("").to_string()
-                    }
-                    Engine::Bidi => {
-                        let (client, ctx) = bidi_top_context(&state).await?;
-                        let v = client.script_evaluate(&ctx, &expr).await?;
-                        v["result"]["value"].as_str().unwrap_or("").to_string()
-                    }
-                };
+                let session = attach_active(&state).await?;
+                let value = session.evaluate(&expr, true).await?;
+                session.close().await;
+                let selector = value.as_str().unwrap_or("").to_string();
                 Ok(text_content(selector))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// list_targets
+// ---------------------------------------------------------------------------
+
+fn make_list_targets() -> RegisteredTool {
+    RegisteredTool {
+        name: "list_targets".into(),
+        description: "List open page targets, optionally filtered by an unanchored URL regex."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": "Optional unanchored URL regex."
+                }
+            },
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let filter = args
+                    .get("filter")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let targets =
+                    list_targets(&state.browser.endpoint, state.browser.engine, filter.as_deref())
+                        .await?;
+                Ok(text_content(serde_json::to_string_pretty(&targets)?))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cookies
+// ---------------------------------------------------------------------------
+
+fn make_cookies() -> RegisteredTool {
+    RegisteredTool {
+        name: "cookies".into(),
+        description: "Fetch cookies from the active browser. Returns full values (MCP is a \
+                      trusted local channel). Optional unanchored regex filters."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "domain": { "type": "string", "description": "Unanchored regex on cookie domain." },
+                "name":   { "type": "string", "description": "Unanchored regex on cookie name." }
+            },
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let domain_re = args
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .map(Regex::new)
+                    .transpose()
+                    .map_err(|e| anyhow!("invalid `domain` regex: {e}"))?;
+                let name_re = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(Regex::new)
+                    .transpose()
+                    .map_err(|e| anyhow!("invalid `name` regex: {e}"))?;
+                let all = fetch_cookies(&state.browser).await?;
+                let filtered: Vec<_> = all
+                    .into_iter()
+                    .filter(|c| {
+                        domain_re.as_ref().map_or(true, |re| re.is_match(&c.domain))
+                            && name_re.as_ref().map_or(true, |re| re.is_match(&c.name))
+                    })
+                    .collect();
+                Ok(text_content(serde_json::to_string_pretty(&filtered)?))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// storage_get / storage_set
+// ---------------------------------------------------------------------------
+
+fn make_storage_get() -> RegisteredTool {
+    RegisteredTool {
+        name: "storage_get".into(),
+        description: "Read a value from localStorage or sessionStorage on the active page.".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "namespace": {
+                    "type": "string",
+                    "enum": ["local", "session"],
+                    "default": "local"
+                }
+            },
+            "required": ["key"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing 'key'"))?
+                    .to_string();
+                let namespace = args
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("local");
+                let ns = ns_global(namespace)?;
+                let expr = build_get_expr(ns, &key);
+                let session = attach_active(&state).await?;
+                let value = session.evaluate(&expr, true).await?;
+                session.close().await;
+                // `build_get_expr` wraps the result in JSON.stringify, so the
+                // evaluator returns a JSON string. Unwrap one layer to surface
+                // the raw value (or `null` when the key is absent).
+                let text = match value {
+                    Value::String(s) => s,
+                    Value::Null => "null".to_string(),
+                    other => other.to_string(),
+                };
+                Ok(text_content(text))
+            })
+        }),
+    }
+}
+
+fn make_storage_set() -> RegisteredTool {
+    RegisteredTool {
+        name: "storage_set".into(),
+        description: "Write a value to localStorage or sessionStorage on the active page.".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "value": { "type": "string" },
+                "namespace": {
+                    "type": "string",
+                    "enum": ["local", "session"],
+                    "default": "local"
+                }
+            },
+            "required": ["key", "value"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing 'key'"))?
+                    .to_string();
+                let value = args
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing 'value'"))?
+                    .to_string();
+                let namespace = args
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("local");
+                let ns = ns_global(namespace)?;
+                let expr = build_set_expr(ns, &key, &value);
+                let session = attach_active(&state).await?;
+                let _ = session.evaluate(&expr, true).await?;
+                session.close().await;
+                Ok(text_content("ok"))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wait_for_cookie
+// ---------------------------------------------------------------------------
+
+fn make_wait_for_cookie() -> RegisteredTool {
+    RegisteredTool {
+        name: "wait_for_cookie".into(),
+        description: "Poll the browser until a cookie matching the regex filters appears, or \
+                      timeout elapses."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "domain": { "type": "string", "description": "Unanchored regex on cookie domain." },
+                "name":   { "type": "string", "description": "Unanchored regex on cookie name." },
+                "timeout_seconds": { "type": "number", "default": 120 },
+                "poll_interval_seconds": { "type": "number", "default": 1 }
+            },
+            "required": ["domain", "name"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let domain = args
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing 'domain'"))?;
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing 'name'"))?;
+                let domain_re =
+                    Regex::new(domain).map_err(|e| anyhow!("invalid `domain` regex: {e}"))?;
+                let name_re =
+                    Regex::new(name).map_err(|e| anyhow!("invalid `name` regex: {e}"))?;
+                let timeout_s = args
+                    .get("timeout_seconds")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(120.0)
+                    .max(0.0);
+                let interval_s = args
+                    .get("poll_interval_seconds")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0)
+                    .max(0.001);
+                let deadline = Instant::now() + Duration::from_secs_f64(timeout_s);
+                let interval = Duration::from_secs_f64(interval_s);
+                loop {
+                    let cookies = fetch_cookies(&state.browser).await?;
+                    if let Some(c) = cookies
+                        .into_iter()
+                        .find(|c| cookie_matches(c, &domain_re, &name_re))
+                    {
+                        return Ok(text_content(c.name));
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(anyhow!("timed out waiting for cookie"));
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    let nap = std::cmp::min(interval, remaining);
+                    if nap.is_zero() {
+                        return Err(anyhow!("timed out waiting for cookie"));
+                    }
+                    tokio::time::sleep(nap).await;
+                }
             })
         }),
     }
@@ -374,20 +489,38 @@ fn make_select_element() -> RegisteredTool {
 mod tests {
     use super::*;
 
+    const EXPECTED_TOOLS: &[&str] = &[
+        "navigate",
+        "get_dom",
+        "screenshot",
+        "fetch",
+        "select_element",
+        "list_targets",
+        "cookies",
+        "storage_get",
+        "storage_set",
+        "wait_for_cookie",
+    ];
+
+    fn schema_for(name: &str) -> Value {
+        let registry = ToolRegistry::new();
+        register_all(&registry);
+        registry
+            .list()
+            .into_iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} not registered"))["inputSchema"]
+            .clone()
+    }
+
     #[test]
-    fn register_all_adds_five_tools() {
+    fn register_all_adds_ten_tools() {
         let registry = ToolRegistry::new();
         register_all(&registry);
         let list = registry.list();
-        assert_eq!(list.len(), 5);
+        assert_eq!(list.len(), 10);
         let names: Vec<&str> = list.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        for expected in &[
-            "navigate",
-            "get_dom",
-            "screenshot",
-            "fetch",
-            "select_element",
-        ] {
+        for expected in EXPECTED_TOOLS {
             assert!(
                 names.contains(expected),
                 "missing tool {expected} in {names:?}"
@@ -408,5 +541,61 @@ mod tests {
                 t["name"]
             );
         }
+    }
+
+    #[test]
+    fn list_targets_schema_has_optional_filter() {
+        let schema = schema_for("list_targets");
+        assert_eq!(schema["properties"]["filter"]["type"], "string");
+        assert!(schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cookies_schema_has_optional_filters() {
+        let schema = schema_for("cookies");
+        assert_eq!(schema["properties"]["domain"]["type"], "string");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        assert!(schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn storage_get_requires_key() {
+        let schema = schema_for("storage_get");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(required.iter().any(|v| v == "key"));
+        assert_eq!(schema["properties"]["key"]["type"], "string");
+        assert_eq!(schema["properties"]["namespace"]["type"], "string");
+    }
+
+    #[test]
+    fn storage_set_requires_key_and_value() {
+        let schema = schema_for("storage_set");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"key"));
+        assert!(required.contains(&"value"));
+        assert_eq!(schema["properties"]["value"]["type"], "string");
+    }
+
+    #[test]
+    fn wait_for_cookie_requires_domain_and_name() {
+        let schema = schema_for("wait_for_cookie");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"domain"));
+        assert!(required.contains(&"name"));
+        assert_eq!(schema["properties"]["timeout_seconds"]["type"], "number");
+        assert_eq!(
+            schema["properties"]["poll_interval_seconds"]["type"],
+            "number"
+        );
     }
 }

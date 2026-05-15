@@ -10,11 +10,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::cli::env_resolver::ResolvedBrowser;
 
-/// Persistent BiDi session, opened lazily on first use. Reused across all
+/// Persistent BiDi client, opened lazily on first use. Reused across all
 /// tool calls because Firefox limits concurrent BiDi sessions per browser
-/// to one.
+/// to one. The browsing-context id is resolved per call so multiple tabs
+/// can be addressed once URL-regex selection is added.
 pub type BidiCache =
-    std::sync::Arc<tokio::sync::Mutex<Option<(std::sync::Arc<crate::bidi::BidiClient>, String)>>>;
+    std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<crate::bidi::BidiClient>>>>;
 
 /// State carried by the server. Tools reach into this for the resolved
 /// browser endpoint and any cached engine clients.

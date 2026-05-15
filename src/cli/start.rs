@@ -63,7 +63,7 @@ pub async fn run(
     let name = registry::naming::generate_default(resolved_kind, &registry)?;
     let profile_dir = match profile {
         Some(p) => p,
-        None => paths::profiles_dir()?.join(&name),
+        None => paths::default_profile_dir(resolved_kind)?,
     };
     std::fs::create_dir_all(&profile_dir).context("creating profile directory")?;
     let opts = LaunchOpts {

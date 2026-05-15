@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.0 — 2026-05-15
+
+### Added
+
+- New session subcommands that attach to a running browser and operate on it
+  over CDP (Chromium-family) or BiDi (Firefox) with a single CLI surface:
+  - `browser-control targets` — list/filter open page targets
+    (`--url REGEX`, `--json`).
+  - `browser-control cookies` — export cookies with `--domain`/`--name`
+    regex filters; formats `json` (default), `netscape`, and `header`.
+    `-o FILE` writes the file `chmod 0600`; `--reveal` opts in to printing
+    full values to stdout. The `netscape` output is byte-compatible with
+    the Mozilla `cookies.txt` format used by `curl` and `yt-dlp`.
+  - `browser-control fetch` — run an HTTP request from inside the page
+    context (cookies, CORS, TLS apply). `-X`, `-H`, `-d`, `--target REGEX`,
+    `-i`, `-o FILE`.
+  - `browser-control storage get|set|list` — read/write `localStorage` or
+    `sessionStorage` (`--namespace session`).
+  - `browser-control eval` — run a JS expression in the active page,
+    optionally with a `--json` envelope and `--target REGEX`.
+  - `browser-control wait --ready` — block until the browser's CDP / BiDi
+    endpoint is reachable.
+  - `browser-control wait-for-cookie` — block until a cookie matching
+    `--domain REGEX --name REGEX` exists; optional `--validate-url URL`
+    requires a 2xx response before exiting.
+- New MCP tools mirroring the above: `list_targets`, `cookies`,
+  `storage_get`, `storage_set`, `wait_for_cookie`.
+- `browser-control list-running --json` is enriched with `cdp_port`,
+  `cdp_ws_url` (CDP), and `bidi_ws_url` (Firefox) for tooling integration.
+  Stale rows are re-probed before WS URLs are emitted; the fields are
+  omitted when the probe fails.
+- New documentation under [docs/session-ops.md](docs/session-ops.md)
+  covering the engine-agnostic `PageSession` model, `TargetInfo` shape, the
+  exact `cookies --format netscape` byte format, and profile semantics.
+
+### Changed
+
+- `browser-control start` without `--profile` now uses a stable persisted
+  profile per browser kind under the OS app-data dir
+  (`profiles/<kind>/default/`) instead of a fresh ad-hoc temp directory on
+  every launch. Browser state (cookies, logins, extensions) is reused
+  across invocations and across MCP agents. `--profile <absolute-path>`
+  continues to override per-invocation. Named profiles are deferred.
+
 ## 0.2.2 - 2026-05-14
 
 ### Added

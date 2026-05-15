@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 #[test]
-fn mcp_tools_list_returns_five_tools() {
+fn mcp_tools_list_returns_ten_tools() {
     let tmp = TempDir::new().unwrap();
     let bin = assert_cmd::cargo::cargo_bin("browser-control");
     let mut child = Command::new(bin)
@@ -44,7 +44,7 @@ fn mcp_tools_list_returns_five_tools() {
     reader.read_line(&mut line).unwrap();
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("tools json");
     let tools = v["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 5, "expected 5 tools, got {tools:?}");
+    assert_eq!(tools.len(), 10, "expected 10 tools, got {tools:?}");
     let names: HashSet<String> = tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
@@ -55,6 +55,11 @@ fn mcp_tools_list_returns_five_tools() {
         "screenshot",
         "fetch",
         "select_element",
+        "list_targets",
+        "cookies",
+        "storage_get",
+        "storage_set",
+        "wait_for_cookie",
     ] {
         assert!(
             names.contains(expected),
