@@ -267,9 +267,12 @@ fn make_list_targets() -> RegisteredTool {
                     .get("filter")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let targets =
-                    list_targets(&state.browser.endpoint, state.browser.engine, filter.as_deref())
-                        .await?;
+                let targets = list_targets(
+                    &state.browser.endpoint,
+                    state.browser.engine,
+                    filter.as_deref(),
+                )
+                .await?;
                 Ok(text_content(serde_json::to_string_pretty(&targets)?))
             })
         }),
@@ -447,8 +450,7 @@ fn make_wait_for_cookie() -> RegisteredTool {
                     .ok_or_else(|| anyhow!("missing 'name'"))?;
                 let domain_re =
                     Regex::new(domain).map_err(|e| anyhow!("invalid `domain` regex: {e}"))?;
-                let name_re =
-                    Regex::new(name).map_err(|e| anyhow!("invalid `name` regex: {e}"))?;
+                let name_re = Regex::new(name).map_err(|e| anyhow!("invalid `name` regex: {e}"))?;
                 let timeout_s = args
                     .get("timeout_seconds")
                     .and_then(|v| v.as_f64())
@@ -547,7 +549,9 @@ mod tests {
     fn list_targets_schema_has_optional_filter() {
         let schema = schema_for("list_targets");
         assert_eq!(schema["properties"]["filter"]["type"], "string");
-        assert!(schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty());
+        assert!(
+            schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty()
+        );
     }
 
     #[test]
@@ -555,7 +559,9 @@ mod tests {
         let schema = schema_for("cookies");
         assert_eq!(schema["properties"]["domain"]["type"], "string");
         assert_eq!(schema["properties"]["name"]["type"], "string");
-        assert!(schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty());
+        assert!(
+            schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty()
+        );
     }
 
     #[test]

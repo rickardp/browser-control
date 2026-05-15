@@ -55,9 +55,7 @@ pub async fn run(
     let effective_format = if json { "json".to_string() } else { format };
     match effective_format.as_str() {
         "json" | "netscape" | "header" => {}
-        other => bail!(
-            "unknown --format `{other}`: expected one of `netscape`, `json`, `header`"
-        ),
+        other => bail!("unknown --format `{other}`: expected one of `netscape`, `json`, `header`"),
     }
 
     let domain_re = domain
@@ -140,13 +138,10 @@ fn bool_field(v: &Value, k: &str) -> bool {
 }
 
 fn normalize_cdp(v: &Value) -> NormalCookie {
-    let expires = v.get("expires").and_then(|x| x.as_i64()).and_then(|n| {
-        if n < 0 {
-            None
-        } else {
-            Some(n)
-        }
-    });
+    let expires =
+        v.get("expires")
+            .and_then(|x| x.as_i64())
+            .and_then(|n| if n < 0 { None } else { Some(n) });
     let same_site = v
         .get("sameSite")
         .and_then(|x| x.as_str())
@@ -187,8 +182,7 @@ fn normalize_bidi(v: &Value) -> NormalCookie {
 }
 
 fn matches_filter(c: &NormalCookie, domain: Option<&Regex>, name: Option<&Regex>) -> bool {
-    domain.map_or(true, |re| re.is_match(&c.domain))
-        && name.map_or(true, |re| re.is_match(&c.name))
+    domain.map_or(true, |re| re.is_match(&c.domain)) && name.map_or(true, |re| re.is_match(&c.name))
 }
 
 fn format_json(cookies: &[NormalCookie]) -> Result<String> {
@@ -217,7 +211,11 @@ fn format_header(cookies: &[NormalCookie], reveal: bool) -> String {
     let parts: Vec<String> = cookies
         .iter()
         .map(|c| {
-            let v = if reveal { c.value.as_str() } else { "<redacted>" };
+            let v = if reveal {
+                c.value.as_str()
+            } else {
+                "<redacted>"
+            };
             format!("{}={}", c.name, v)
         })
         .collect();
@@ -225,8 +223,7 @@ fn format_header(cookies: &[NormalCookie], reveal: bool) -> String {
 }
 
 fn write_file(path: &Path, body: &str) -> Result<()> {
-    std::fs::write(path, body)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

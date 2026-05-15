@@ -10,7 +10,12 @@ pub async fn run(browser: Option<String>, ready: bool, timeout: u64) -> Result<(
         bail!("`wait` requires --ready in this version");
     }
     let resolved = crate::cli::mcp::resolve_browser(browser).await?;
-    wait_until_ready(&resolved.endpoint, resolved.engine, Duration::from_secs(timeout)).await?;
+    wait_until_ready(
+        &resolved.endpoint,
+        resolved.engine,
+        Duration::from_secs(timeout),
+    )
+    .await?;
     println!("ready");
     Ok(())
 }

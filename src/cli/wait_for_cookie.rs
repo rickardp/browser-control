@@ -38,7 +38,10 @@ pub async fn run(
 
     let matched = loop {
         let cookies = fetch_cookies(&resolved).await?;
-        if let Some(c) = cookies.into_iter().find(|c| cookie_matches(c, &domain_re, &name_re)) {
+        if let Some(c) = cookies
+            .into_iter()
+            .find(|c| cookie_matches(c, &domain_re, &name_re))
+        {
             break c;
         }
         if Instant::now() >= deadline {
@@ -75,9 +78,9 @@ async fn validate_via_page(session: &PageSession, url: &str) -> Result<()> {
     let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
     let expr = format!("({})({})", FETCH_JS, serde_json::to_string(&args).unwrap());
     let value = session.evaluate(&expr, true).await?;
-    let json_str = value
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("validate-url: page returned non-string from fetch script"))?;
+    let json_str = value.as_str().ok_or_else(|| {
+        anyhow::anyhow!("validate-url: page returned non-string from fetch script")
+    })?;
     let parsed: Value = serde_json::from_str(json_str)
         .context("validate-url: failed to parse fetch response envelope")?;
     let status = parsed
@@ -117,8 +120,16 @@ mod tests {
     fn cookie_matches_unanchored_domain_and_name() {
         let d = Regex::new(r"example\.com").unwrap();
         let n = Regex::new(r"session").unwrap();
-        assert!(cookie_matches(&cookie("www.example.com", "session_id"), &d, &n));
-        assert!(cookie_matches(&cookie(".example.com", "my_session"), &d, &n));
+        assert!(cookie_matches(
+            &cookie("www.example.com", "session_id"),
+            &d,
+            &n
+        ));
+        assert!(cookie_matches(
+            &cookie(".example.com", "my_session"),
+            &d,
+            &n
+        ));
     }
 
     #[test]
@@ -126,7 +137,11 @@ mod tests {
         let d = Regex::new(r"example\.com").unwrap();
         let n = Regex::new(r"^session$").unwrap();
         // wrong name
-        assert!(!cookie_matches(&cookie("example.com", "session_id"), &d, &n));
+        assert!(!cookie_matches(
+            &cookie("example.com", "session_id"),
+            &d,
+            &n
+        ));
         // wrong domain
         assert!(!cookie_matches(&cookie("other.test", "session"), &d, &n));
         // both ok
@@ -174,7 +189,10 @@ mod tests {
         let deadline = Instant::now() + timeout;
         loop {
             let cookies = fetch();
-            if let Some(c) = cookies.into_iter().find(|c| cookie_matches(c, domain_re, name_re)) {
+            if let Some(c) = cookies
+                .into_iter()
+                .find(|c| cookie_matches(c, domain_re, name_re))
+            {
                 return Ok(c);
             }
             if Instant::now() >= deadline {
@@ -218,9 +236,15 @@ mod tests {
                 vec![cookie("www.example.com", "other")]
             }
         };
-        let got = wait_loop(fetch, &d, &n, Duration::from_secs(10), Duration::from_secs(1))
-            .await
-            .unwrap();
+        let got = wait_loop(
+            fetch,
+            &d,
+            &n,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(got.name, "sid");
         assert_eq!(got.domain, "www.example.com");
     }

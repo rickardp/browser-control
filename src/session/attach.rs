@@ -43,11 +43,7 @@ impl PageSession {
     /// If `url_regex` is `Some`, the first page target whose URL matches is
     /// selected; otherwise the first page (or top-level browsing context) is
     /// used.
-    pub async fn attach(
-        endpoint: &str,
-        engine: Engine,
-        url_regex: Option<&str>,
-    ) -> Result<Self> {
+    pub async fn attach(endpoint: &str, engine: Engine, url_regex: Option<&str>) -> Result<Self> {
         let pattern = url_regex.map(Regex::new).transpose()?;
         match engine {
             Engine::Cdp => {
@@ -74,10 +70,7 @@ impl PageSession {
     /// The MCP server uses this to share one BiDi client across tool calls;
     /// `session.new` is invoked only when the client was freshly opened (the
     /// caller is expected to have done so).
-    pub async fn from_bidi_cache(
-        client: Arc<BidiClient>,
-        url_regex: Option<&str>,
-    ) -> Result<Self> {
+    pub async fn from_bidi_cache(client: Arc<BidiClient>, url_regex: Option<&str>) -> Result<Self> {
         let pattern = url_regex.map(Regex::new).transpose()?;
         let context = pick_bidi_context(&client, pattern.as_ref()).await?;
         Ok(PageSession::Bidi(BidiPage { client, context }))
@@ -118,18 +111,12 @@ impl PageSession {
         match self {
             PageSession::Cdp(p) => {
                 p.client
-                    .send_with_session(
-                        "Page.navigate",
-                        json!({"url": url}),
-                        Some(&p.session_id),
-                    )
+                    .send_with_session("Page.navigate", json!({"url": url}), Some(&p.session_id))
                     .await?;
                 Ok(())
             }
             PageSession::Bidi(p) => {
-                p.client
-                    .browsing_context_navigate(&p.context, url)
-                    .await?;
+                p.client.browsing_context_navigate(&p.context, url).await?;
                 Ok(())
             }
         }
@@ -184,9 +171,9 @@ impl PageSession {
 
 async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<String> {
     let targets = client.list_targets().await?;
-    let mut pages = targets.iter().filter(|t| {
-        t.get("type").and_then(|v| v.as_str()) == Some("page")
-    });
+    let mut pages = targets
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"));
     let pick = if let Some(re) = pattern {
         pages
             .find(|t| {
@@ -206,10 +193,7 @@ async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<St
         .ok_or_else(|| anyhow!("targetId missing from page target"))
 }
 
-async fn pick_bidi_context(
-    client: &BidiClient,
-    pattern: Option<&Regex>,
-) -> Result<String> {
+async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Result<String> {
     let tree = client.send("browsingContext.getTree", json!({})).await?;
     let contexts = tree
         .get("contexts")

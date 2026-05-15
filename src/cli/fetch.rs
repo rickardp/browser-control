@@ -53,7 +53,12 @@ pub async fn run(
     match output {
         Some(path) => {
             write_file(&path, &bytes)?;
-            tracing::info!(target = "fetch", "wrote {} bytes to {}", bytes.len(), path.display());
+            tracing::info!(
+                target = "fetch",
+                "wrote {} bytes to {}",
+                bytes.len(),
+                path.display()
+            );
             eprintln!("wrote {} bytes to {}", bytes.len(), path.display());
         }
         None => {
@@ -164,8 +169,7 @@ fn format_status_and_headers(env: &FetchEnvelope) -> String {
 }
 
 fn write_file(path: &Path, body: &[u8]) -> Result<()> {
-    std::fs::write(path, body)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

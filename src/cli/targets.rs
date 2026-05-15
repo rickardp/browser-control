@@ -23,14 +23,7 @@ pub async fn run(browser: Option<String>, url: Option<String>, json: bool) -> Re
 fn table_rows(targets: &[TargetInfo]) -> Vec<Vec<String>> {
     targets
         .iter()
-        .map(|t| {
-            vec![
-                t.kind.clone(),
-                t.id.clone(),
-                t.url.clone(),
-                t.title.clone(),
-            ]
-        })
+        .map(|t| vec![t.kind.clone(), t.id.clone(), t.url.clone(), t.title.clone()])
         .collect()
 }
 
@@ -74,7 +67,10 @@ mod tests {
         }];
         let rows = table_rows(&t);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], vec!["page", "abc", "https://example.com/", "Example"]);
+        assert_eq!(
+            rows[0],
+            vec!["page", "abc", "https://example.com/", "Example"]
+        );
     }
 
     #[tokio::test]

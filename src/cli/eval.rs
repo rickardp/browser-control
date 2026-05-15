@@ -14,7 +14,8 @@ pub async fn run(
     await_promise: bool,
 ) -> Result<()> {
     let resolved = resolve_browser(browser).await?;
-    let session = PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
+    let session =
+        PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
     let value = session.evaluate(&expression, await_promise).await;
     session.close().await;
     let value = value?;

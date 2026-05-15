@@ -196,11 +196,7 @@ async fn main() -> Result<()> {
         Command::Set { key, value, json } => set::run_set(key, value, json),
         Command::Get { key, json } => set::run_get(key, json),
         Command::Unset { key, json } => set::run_unset(key, json),
-        Command::Targets {
-            browser,
-            url,
-            json,
-        } => cli_targets::run(browser, url, json).await,
+        Command::Targets { browser, url, json } => cli_targets::run(browser, url, json).await,
         Command::Cookies {
             browser,
             domain,
@@ -240,7 +236,8 @@ async fn main() -> Result<()> {
             timeout,
             poll_interval,
             validate_url,
-        } => wait_for_cookie::run(browser, domain, name, timeout, poll_interval, validate_url)
-            .await,
+        } => {
+            wait_for_cookie::run(browser, domain, name, timeout, poll_interval, validate_url).await
+        }
     }
 }
