@@ -83,8 +83,8 @@ written via `-o FILE` are `chmod 0600` on Unix.
 
 ## Profile semantics
 
-When `browser-control start` is invoked without `--profile`, it uses a single
-persisted profile per browser kind, located under the OS app-data dir:
+`browser-control start` always uses a single persisted profile per browser
+kind, located under the OS app-data dir:
 
 - macOS:   `~/Library/Application Support/browser-control/profiles/<kind>/default/`
 - Linux:   `~/.config/browser-control/profiles/<kind>/default/`
@@ -100,7 +100,9 @@ Consequences:
 - Restarting the browser, the user's shell, or the host does not lose state.
 - Per-kind separation exists because Chrome and Firefox profile formats are
   not interchangeable.
-- Pass `--profile <absolute-path>` to opt out per-invocation.
+- There is intentionally no `--profile` flag: agents that pass a custom
+  profile would otherwise create ephemeral sessions and force the user to
+  re-authenticate every time.
 
 Named profiles (`profiles/<kind>/<name>/`) are deferred to a future release;
 the current layout leaves room for them with no migration.

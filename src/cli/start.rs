@@ -23,12 +23,7 @@ pub struct StartResult {
     pub reused: bool,
 }
 
-pub async fn run(
-    browser: Option<String>,
-    headless: bool,
-    profile: Option<PathBuf>,
-    json: bool,
-) -> Result<()> {
+pub async fn run(browser: Option<String>, headless: bool, json: bool) -> Result<()> {
     let installed = detect::list_installed();
     if installed.is_empty() {
         anyhow::bail!("no supported browsers installed; run `browser-control list-installed`");
@@ -61,10 +56,7 @@ pub async fn run(
     }
 
     let name = registry::naming::generate_default(resolved_kind, &registry)?;
-    let profile_dir = match profile {
-        Some(p) => p,
-        None => paths::default_profile_dir(resolved_kind)?,
-    };
+    let profile_dir = paths::default_profile_dir(resolved_kind)?;
     std::fs::create_dir_all(&profile_dir).context("creating profile directory")?;
     let opts = LaunchOpts {
         headless,
