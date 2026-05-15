@@ -3,6 +3,8 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 
+use crate::detect::Kind;
+
 const ENV_OVERRIDE: &str = "BROWSER_CONTROL_DATA_DIR";
 const CONFIG_ENV_OVERRIDE: &str = "BROWSER_CONTROL_CONFIG_DIR";
 
@@ -72,6 +74,31 @@ pub fn profiles_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns the stable per-kind default profile directory used when
+/// `browser-control start` is invoked without `--profile`.
+///
+/// The directory is rooted under [`config_dir`] (so it tracks
+/// `BROWSER_CONTROL_CONFIG_DIR` for tests and user overrides):
+///
+/// * macOS:   `~/Library/Application Support/browser-control/profiles/<kind>/default/`
+/// * Linux:   `~/.config/browser-control/profiles/<kind>/default/`
+/// * Windows: `%APPDATA%/browser-control/profiles/<kind>/default/`
+///
+/// `<kind>` is the lowercase [`Kind`] variant name (`chrome`, `edge`,
+/// `chromium`, `brave`, `firefox`). The split-by-kind is intentional:
+/// Chromium and Firefox profile layouts are not interchangeable.
+///
+/// The directory is created lazily on first call.
+pub fn default_profile_dir(kind: Kind) -> Result<PathBuf> {
+    let dir = config_dir()?
+        .join("profiles")
+        .join(kind.as_str())
+        .join("default");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating default profile dir {}", dir.display()))?;
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +160,32 @@ mod tests {
             "expected default config_dir to end with 'browser-control', got {}",
             d.display()
         );
+    }
+
+    #[test]
+    fn default_profile_dir_honours_config_env_override() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        std::env::set_var(CONFIG_ENV_OVERRIDE, &tmp_path);
+
+        for k in [
+            Kind::Chrome,
+            Kind::Edge,
+            Kind::Chromium,
+            Kind::Brave,
+            Kind::Firefox,
+        ] {
+            let p = default_profile_dir(k).unwrap();
+            assert_eq!(
+                p,
+                tmp_path.join("profiles").join(k.as_str()).join("default")
+            );
+            assert!(p.is_dir(), "expected {} to be created", p.display());
+        }
+
+        std::env::remove_var(CONFIG_ENV_OVERRIDE);
     }
 }
