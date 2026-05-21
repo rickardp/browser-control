@@ -146,7 +146,7 @@ pub fn pid_alive(pid: u32) -> bool {
         };
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h == 0 {
+            if h.is_null() {
                 return false;
             }
             CloseHandle(h);
