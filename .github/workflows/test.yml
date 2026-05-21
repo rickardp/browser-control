@@ -87,6 +87,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
+        timeout-minutes: 20
         run: cargo test --all-targets
 
       - name: Daemon smoke (Unix)

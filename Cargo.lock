@@ -196,6 +196,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wait-timeout",
  "which",
  "windows-sys 0.59.0",
 ]
