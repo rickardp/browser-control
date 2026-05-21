@@ -47,7 +47,7 @@ impl TransportListener for WinL {
         let server = self
             .current
             .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "listener exhausted"))?;
+            .ok_or_else(|| io::Error::other("listener exhausted"))?;
         server.connect().await?;
         // Pre-create the next server instance so a subsequent client can connect.
         let next = ServerOptions::new()
