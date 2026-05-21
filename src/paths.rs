@@ -130,9 +130,14 @@ mod tests {
         // Test 2: default path has the expected suffix.
         std::env::remove_var(ENV_OVERRIDE);
         let d = data_dir().unwrap();
+        let expected_suffix = if cfg!(windows) {
+            "browser-control\\data"
+        } else {
+            "browser-control"
+        };
         assert!(
-            d.ends_with("browser-control"),
-            "expected default data_dir to end with 'browser-control', got {}",
+            d.ends_with(expected_suffix),
+            "expected default data_dir to end with {expected_suffix:?}, got {}",
             d.display()
         );
     }
@@ -155,9 +160,14 @@ mod tests {
 
         std::env::remove_var(CONFIG_ENV_OVERRIDE);
         let d = config_dir().unwrap();
+        let expected_suffix = if cfg!(windows) {
+            "browser-control\\config"
+        } else {
+            "browser-control"
+        };
         assert!(
-            d.ends_with("browser-control"),
-            "expected default config_dir to end with 'browser-control', got {}",
+            d.ends_with(expected_suffix),
+            "expected default config_dir to end with {expected_suffix:?}, got {}",
             d.display()
         );
     }
