@@ -1,4 +1,5 @@
 pub mod cookies;
+pub mod daemon;
 pub mod env_resolver;
 pub mod eval;
 pub mod fetch;

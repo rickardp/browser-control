@@ -54,6 +54,32 @@ jobs:
         with:
           key: ${{ matrix.label }}
 
+      # Cache the workspace-local capnp install across runs so we only pay
+      # the source-build cost once per (OS, capnp-version) combo.
+      - name: Cache capnp toolchain
+        uses: actions/cache@v4
+        with:
+          path: target/tools/capnp
+          key: capnp-1.4.0-${{ matrix.label }}
+
+      - name: Install capnp (xtask)
+        shell: bash
+        run: cargo xtask install-capnp
+
+      - name: Add capnp to PATH (Unix)
+        if: runner.os != 'Windows'
+        run: echo "$PWD/target/tools/capnp/current/bin" >> "$GITHUB_PATH"
+
+      - name: Add capnp to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = Join-Path $PWD "target\tools\capnp\current\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+
+      - name: capnp --version
+        run: capnp --version
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
@@ -62,6 +88,28 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets
+
+      - name: Daemon smoke (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BROWSER_CONTROL_DATA_DIR="$(mktemp -d)"
+          ./target/debug/browser-control daemon status smoke
+          ./target/debug/browser-control daemon run smoke
+          ./target/debug/browser-control daemon status smoke --json | tee /tmp/status.json
+          test "$(cat /tmp/status.json)" = "null"
+          rm -rf "$BROWSER_CONTROL_DATA_DIR"
+
+      - name: Daemon smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:BROWSER_CONTROL_DATA_DIR = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "bcdata-$(Get-Random)") | Select-Object -ExpandProperty FullName
+          .\target\debug\browser-control.exe daemon status smoke
+          .\target\debug\browser-control.exe daemon run smoke
+          $out = & .\target\debug\browser-control.exe daemon status smoke --json
+          if ($out.Trim() -ne "null") { throw "expected cleared state, got $out" }
 
       - name: Print binary size
         shell: bash

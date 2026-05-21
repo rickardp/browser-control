@@ -81,6 +81,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: publish-crate
+      - name: Cache capnp toolchain
+        uses: actions/cache@v4
+        with:
+          path: target/tools/capnp
+          key: capnp-1.4.0-publish-crate
+      - name: Install capnp (xtask)
+        run: cargo xtask install-capnp
+      - name: Add capnp to PATH
+        run: echo "$PWD/target/tools/capnp/current/bin" >> "$GITHUB_PATH"
       - name: Publish browser-control
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -139,6 +148,24 @@ jobs:
         with:
           key: ${{ matrix.target }}
           cache-targets: false
+      - name: Cache capnp toolchain
+        uses: actions/cache@v4
+        with:
+          path: target/tools/capnp
+          key: capnp-1.4.0-${{ matrix.target }}
+      - name: Install capnp (xtask)
+        shell: bash
+        run: cargo xtask install-capnp
+      - name: Add capnp to PATH (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "$PWD/target/tools/capnp/current/bin" >> "$GITHUB_PATH"
+      - name: Add capnp to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = Join-Path $PWD "target\tools\capnp\current\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
       - name: Build binary
         shell: bash
         run: cargo build --release --target ${{ matrix.target }} --locked

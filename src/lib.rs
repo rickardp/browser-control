@@ -1,9 +1,30 @@
 //! Library entry point for `browser-control`.
 
+#[allow(clippy::all)]
+#[allow(non_camel_case_types)]
+#[allow(dead_code)]
+#[allow(unused_imports)]
+#[allow(unused_qualifications)]
+#[allow(unused_parens)]
+pub mod errors_capnp {
+    include!(concat!(env!("OUT_DIR"), "/errors_capnp.rs"));
+}
+
+#[allow(clippy::all)]
+#[allow(non_camel_case_types)]
+#[allow(dead_code)]
+#[allow(unused_imports)]
+#[allow(unused_qualifications)]
+#[allow(unused_parens)]
+pub mod daemon_capnp {
+    include!(concat!(env!("OUT_DIR"), "/daemon_capnp.rs"));
+}
+
 pub mod bidi;
 pub mod cdp;
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod detect;
 pub mod dom;
 pub mod errors;
@@ -18,5 +39,5 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
     /// Global lock for tests that mutate process-wide env vars
     /// (`BROWSER_CONTROL_DATA_DIR`, `BROWSER_CONTROL_CONFIG_DIR`).
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 }
