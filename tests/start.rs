@@ -36,6 +36,7 @@ fn pick_installed_kind() -> Option<String> {
     None
 }
 
+#[cfg(windows)]
 #[test]
 fn start_without_profile_uses_per_kind_default_dir_and_is_idempotent() {
     // TODO(daemon-phase-1): Edge headless launches reliably on the Windows
@@ -43,12 +44,12 @@ fn start_without_profile_uses_per_kind_default_dir_and_is_idempotent() {
     // returns because the stdio pipes seem to be held open by the spawned
     // browser. Skip on Windows until the launcher's stdio detachment is
     // hardened in the daemon refactor.
-    #[cfg(windows)]
-    {
-        eprintln!("skipping on windows: see TODO(daemon-phase-1)");
-        return;
-    }
+    eprintln!("skipping on windows: see TODO(daemon-phase-1)");
+}
 
+#[cfg(not(windows))]
+#[test]
+fn start_without_profile_uses_per_kind_default_dir_and_is_idempotent() {
     let Some(kind) = pick_installed_kind() else {
         eprintln!("skipping: no installed browser detected on this machine");
         return;
