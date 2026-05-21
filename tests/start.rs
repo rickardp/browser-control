@@ -16,6 +16,7 @@ fn start_with_unknown_kind_errors() {
 /// Pick a browser kind that is actually installed on this machine and is
 /// quick/safe to launch headless. Returns `None` to skip the test in
 /// environments with no supported browsers.
+#[cfg(not(windows))]
 fn pick_installed_kind() -> Option<String> {
     let bin = assert_cmd::cargo::cargo_bin("browser-control");
     let out = std::process::Command::new(&bin)
