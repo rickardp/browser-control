@@ -118,7 +118,9 @@ async fn fetch_cdp(endpoint: &str) -> Result<Vec<NormalCookie>> {
 async fn fetch_bidi(endpoint: &str) -> Result<Vec<NormalCookie>> {
     let client = open_bidi(endpoint).await?;
     client.session_new().await?;
-    let result = client.send("storage.getCookies", json!({})).await?;
+    let result = client.send("storage.getCookies", json!({})).await;
+    let _ = client.session_end().await;
+    let result = result?;
     let arr = result
         .get("cookies")
         .and_then(|v| v.as_array())

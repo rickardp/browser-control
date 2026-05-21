@@ -35,6 +35,11 @@ pub struct CdpPage {
 pub struct BidiPage {
     pub client: Arc<BidiClient>,
     pub context: String,
+    /// True when this `PageSession` opened the BiDi session (`session.new`)
+    /// and is therefore responsible for ending it on close. False for
+    /// sessions built from a shared, cached client (e.g. MCP server) where
+    /// the lifetime is managed externally.
+    owns_session: bool,
 }
 
 impl PageSession {
@@ -60,7 +65,11 @@ impl PageSession {
                 let client = Arc::new(open_bidi(endpoint).await?);
                 client.session_new().await?;
                 let context = pick_bidi_context(&client, pattern.as_ref()).await?;
-                Ok(PageSession::Bidi(BidiPage { client, context }))
+                Ok(PageSession::Bidi(BidiPage {
+                    client,
+                    context,
+                    owns_session: true,
+                }))
             }
         }
     }
@@ -73,7 +82,11 @@ impl PageSession {
     pub async fn from_bidi_cache(client: Arc<BidiClient>, url_regex: Option<&str>) -> Result<Self> {
         let pattern = url_regex.map(Regex::new).transpose()?;
         let context = pick_bidi_context(&client, pattern.as_ref()).await?;
-        Ok(PageSession::Bidi(BidiPage { client, context }))
+        Ok(PageSession::Bidi(BidiPage {
+            client,
+            context,
+            owns_session: false,
+        }))
     }
 
     /// Attach to (or create) a page whose document origin matches `origin`.
@@ -111,7 +124,11 @@ impl PageSession {
                     Some(c) => c,
                     None => create_bidi_tab(&client, &origin_root).await?,
                 };
-                Ok(PageSession::Bidi(BidiPage { client, context }))
+                Ok(PageSession::Bidi(BidiPage {
+                    client,
+                    context,
+                    owns_session: true,
+                }))
             }
         }
     }
@@ -199,12 +216,18 @@ impl PageSession {
         }
     }
 
-    /// Release the underlying CDP connection (no-op for BiDi, whose client
-    /// is shared via `Arc`).
+    /// Release the underlying connection. For BiDi sessions that this
+    /// `PageSession` opened, also calls `session.end` so that Firefox (which
+    /// enforces one BiDi session per browser) accepts a fresh `session.new`
+    /// on the next invocation.
     pub async fn close(self) {
         match self {
             PageSession::Cdp(p) => p.client.close().await,
-            PageSession::Bidi(_) => {}
+            PageSession::Bidi(p) => {
+                if p.owns_session {
+                    let _ = p.client.session_end().await;
+                }
+            }
         }
     }
 }

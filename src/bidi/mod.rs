@@ -15,6 +15,19 @@ use tokio_tungstenite::tungstenite::Message;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Recognise the BiDi error returned when a fresh `session.new` is rejected
+/// because a session already exists on the browser. Firefox reports this as
+/// `session not created` with a "Maximum number of active sessions" message.
+fn is_session_already_active(err: &anyhow::Error) -> bool {
+    if let Some(b) = err.downcast_ref::<BidiError>() {
+        let msg = b.message.to_ascii_lowercase();
+        return b.code == "session not created"
+            && (msg.contains("maximum number of active sessions")
+                || msg.contains("session is already created"));
+    }
+    false
+}
+
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, BidiError>>>>>;
 
 #[derive(Debug, Clone)]
@@ -132,9 +145,23 @@ impl BidiClient {
     }
 
     pub async fn session_new(&self) -> Result<String> {
-        let v = self
-            .send("session.new", json!({"capabilities": {}}))
-            .await?;
+        let v = match self.send("session.new", json!({"capabilities": {}})).await {
+            Ok(v) => v,
+            Err(e) if is_session_already_active(&e) => {
+                // A previous BiDi session is still active on this browser
+                // (e.g. a prior CLI run exited without calling session.end).
+                // Firefox limits a browser to one session at a time, so end
+                // the stuck one and retry once before giving up.
+                tracing::warn!(
+                    target = "bidi",
+                    "session.new rejected (active session exists); ending and retrying",
+                );
+                let _ = self.send("session.end", json!({})).await;
+                self.send("session.new", json!({"capabilities": {}}))
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
         let sid = v["sessionId"]
             .as_str()
             .ok_or_else(|| anyhow!("no sessionId"))?
@@ -146,6 +173,7 @@ impl BidiClient {
     pub async fn session_end(&self) -> Result<()> {
         // Best effort: ignore errors if no session is active.
         let _ = self.send("session.end", json!({})).await;
+        *self.session_id.lock().await = None;
         Ok(())
     }
 
@@ -247,5 +275,69 @@ mod tests {
             .unwrap();
         assert_eq!(evt.method, "log.entryAdded");
         assert_eq!(evt.params["text"], "hello");
+    }
+
+    #[test]
+    fn detects_firefox_active_session_error() {
+        let e: anyhow::Error = BidiError {
+            code: "session not created".to_string(),
+            message: "Maximum number of active sessions.".to_string(),
+        }
+        .into();
+        assert!(is_session_already_active(&e));
+
+        let other: anyhow::Error = BidiError {
+            code: "invalid argument".to_string(),
+            message: "Maximum number of active sessions".to_string(),
+        }
+        .into();
+        assert!(!is_session_already_active(&other));
+
+        let unrelated: anyhow::Error = anyhow!("not a bidi error");
+        assert!(!is_session_already_active(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn session_new_retries_after_active_session_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let attempts = AtomicUsize::new(0);
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                let id = v["id"].as_u64().unwrap();
+                let method = v["method"].as_str().unwrap();
+                let reply = match method {
+                    "session.new" => {
+                        let n = attempts.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            json!({
+                                "id": id,
+                                "type": "error",
+                                "error": "session not created",
+                                "message": "Maximum number of active sessions."
+                            })
+                        } else {
+                            json!({
+                                "id": id,
+                                "type": "success",
+                                "result": {"sessionId": "S2"}
+                            })
+                        }
+                    }
+                    "session.end" => json!({"id": id, "type": "success", "result": {}}),
+                    _ => json!({"id": id, "type": "success", "result": {}}),
+                };
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = BidiClient::connect(&format!("ws://{}", addr))
+            .await
+            .unwrap();
+        let sid = client.session_new().await.unwrap();
+        assert_eq!(sid, "S2");
     }
 }

@@ -25,6 +25,34 @@ cargo install browser-control
 
 Prebuilt binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64) and Windows (x86_64) are attached to every [GitHub Release](https://github.com/rickardp/browser-control/releases).
 
+On Windows, install via the PowerShell one-liner:
+
+```powershell
+irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/install.ps1 | iex
+```
+
+It downloads the latest release zip, extracts `browser-control.exe` to `%USERPROFILE%\.browser-control\bin`, and prepends that directory to your user `PATH`. The script is idempotent — re-running it upgrades to the latest release, and is a no-op when the requested version is already installed. To pin a version, force a reinstall, or skip the PATH update:
+
+```powershell
+$script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/install.ps1
+& ([scriptblock]::Create($script)) -Version 0.3.5
+& ([scriptblock]::Create($script)) -Force
+& ([scriptblock]::Create($script)) -NoPathUpdate
+```
+
+To uninstall:
+
+```powershell
+irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/uninstall.ps1 | iex
+```
+
+By default the user data directory (`%APPDATA%\browser-control`, containing the browser registry and config) is preserved. Pass `-Purge` to remove it as well:
+
+```powershell
+$script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/uninstall.ps1
+& ([scriptblock]::Create($script)) -Purge
+```
+
 Requires Rust 1.80 or newer when building from source. Node.js (for `npx`) is
 only required if you intend to use `mcp --playwright`.
 

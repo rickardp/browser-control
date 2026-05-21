@@ -75,7 +75,9 @@ async fn list_cdp(endpoint: &str) -> Result<Vec<TargetInfo>> {
 async fn list_bidi(endpoint: &str) -> Result<Vec<TargetInfo>> {
     let client = open_bidi(endpoint).await?;
     client.session_new().await?;
-    let tree = client.send("browsingContext.getTree", json!({})).await?;
+    let tree = client.send("browsingContext.getTree", json!({})).await;
+    let _ = client.session_end().await;
+    let tree = tree?;
     let contexts = tree
         .get("contexts")
         .and_then(|v| v.as_array())
