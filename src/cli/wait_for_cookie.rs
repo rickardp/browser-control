@@ -77,7 +77,11 @@ pub(crate) fn cookie_matches(c: &NormalCookie, domain_re: &Regex, name_re: &Rege
 async fn validate_via_page(session: &PageSession, url: &str) -> Result<()> {
     let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
     let expr = format!("({})({})", FETCH_JS, serde_json::to_string(&args).unwrap());
-    let value = session.evaluate(&expr, true).await?;
+    // 30 s catches a wedged renderer without cutting off slow HTTP responses
+    // — the outer polling loop in `wait_for_cookie` reruns this periodically.
+    let value = session
+        .evaluate_with_timeout(&expr, true, Some(std::time::Duration::from_secs(30)))
+        .await?;
     let json_str = value.as_str().ok_or_else(|| {
         anyhow::anyhow!("validate-url: page returned non-string from fetch script")
     })?;

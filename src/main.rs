@@ -119,6 +119,12 @@ enum Command {
         /// Treat the expression as a Promise and await it.
         #[arg(long, default_value_t = true)]
         await_promise: bool,
+        /// Per-call timeout in milliseconds. The default catches wedged
+        /// renderers (service-worker-paused tabs, busy event loops, embedded
+        /// admin UIs that ignore Runtime.evaluate) so the CLI fails fast
+        /// instead of dragging through the upstream 30 s protocol timeout.
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
     },
     /// Wait until the browser endpoint is reachable.
     Wait {
@@ -238,7 +244,8 @@ async fn main() -> Result<()> {
             target,
             json,
             await_promise,
-        } => eval::run(browser, expression, target, json, await_promise).await,
+            timeout_ms,
+        } => eval::run(browser, expression, target, json, await_promise, timeout_ms).await,
         Command::Wait {
             browser,
             ready,

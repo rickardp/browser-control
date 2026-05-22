@@ -732,115 +732,90 @@ mod tests {
     }
 
     /// Test #6: `Daemon.eval` (lock-free) routes through a daemon-owned
-    /// scratch tab — never against an arbitrary user tab. We verify by
-    /// inspecting the mock CDP server's recorded method history.
+    /// scratch tab — never against an arbitrary user tab.
     ///
-    /// TODO: this end-to-end test deadlocks under the current_thread +
-    /// LocalSet + capnp_rpc Promise::from_future + nested tokio::spawn tasks
-    /// (mock CDP server) combination. The underlying scratch-routing logic
-    /// is covered by `daemon::tabs::tests::open_with_name_is_idempotent` and
-    /// the direct probe tests; full RPC-level coverage will need a different
-    /// scaffolding approach (likely real UDS + separate process, or
-    /// extracting the eval handler into a sync function the test can call
-    /// directly).
-    #[ignore = "rpc + nested-task scheduling deadlock — see TODO"]
+    /// Uses the in-process `capnp_rpc::new_client` path (no twoparty RPC,
+    /// no duplex stream) — the test exercises the actual `DaemonImpl::eval`
+    /// handler and asserts via the mock CDP server's recorded method
+    /// history that:
+    ///   - the daemon created a tab with `about:blank` (scratch pool)
+    ///   - `Runtime.evaluate` was sent against that scratch tab's session
+    ///
+    /// The twoparty path itself is exercised by
+    /// `version_roundtrip_over_duplex` and
+    /// `pending_call_resolves_when_daemon_drops`. Skipping it here side-steps
+    /// a scheduling deadlock between `Promise::from_future`'s polling and
+    /// nested `tokio::spawn`'d tasks that block on cross-task wakers when
+    /// driven inside a single `LocalSet::run_until` over a duplex pair.
     #[tokio::test(flavor = "current_thread")]
     async fn eval_routes_through_scratch_tab() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let (cdp_url, history, _stop) = spawn_recording_mock().await;
+        let (cdp_url, history, _stop) = spawn_recording_mock().await;
 
-                // Build DaemonState manually so we can keep the mock alive.
-                let cdp_client = std::sync::Arc::new(CdpClient::connect(&cdp_url).await.unwrap());
-                // Skip TargetRegistry::attach (which would call
-                // setDiscoverTargets/setAutoAttach) so the recorded history
-                // stays focused on the eval-related calls.
-                let tab_reg = TabRegistry::new(cdp_client.clone(), TabConfig::default());
-                let state = DaemonState {
-                    browser_kind: "chromium".into(),
-                    browser_version: "138.0.0.0".into(),
-                    upstream: Some(cdp_client),
-                    target_registry: None,
-                    tab_registry: Some(tab_reg.clone()),
-                };
+        let cdp_client = std::sync::Arc::new(CdpClient::connect(&cdp_url).await.unwrap());
+        // Skip TargetRegistry::attach so the recorded history stays focused
+        // on the eval-related calls.
+        let tab_reg = TabRegistry::new(cdp_client.clone(), TabConfig::default());
+        let state = DaemonState {
+            browser_kind: "chromium".into(),
+            browser_version: "138.0.0.0".into(),
+            upstream: Some(cdp_client),
+            target_registry: None,
+            tab_registry: Some(tab_reg.clone()),
+        };
 
-                // Wire client <-> server via duplex.
-                let (c_side, s_side) = tokio::io::duplex(64 * 1024);
-                let (cr, cw) = tokio::io::split(c_side);
-                let (sr, sw) = tokio::io::split(s_side);
-                let server_fut = serve(sr, sw, state);
-                tokio::pin!(server_fut);
-                let (client, rpc) = connect_client(cr, cw);
-                let rpc_task = tokio::task::spawn_local(async move {
-                    let _ = rpc.await;
-                });
+        // In-process client: dispatches directly to the server impl, no
+        // network, no RpcSystem task pump.
+        let daemon_client: daemon_capnp::daemon::Client =
+            capnp_rpc::new_client(DaemonImpl::new(state));
 
-                let mut req = client.eval_request();
-                let mut root = req.get();
-                let mut inner = root.reborrow().init_req();
-                inner.set_target_id("");
-                inner.set_expression("1+1");
-                inner.set_await_promise(false);
-                inner.set_timeout_ms(2000);
-                let resp = {
-                    let mut call = req.send().promise;
-                    let mut server_done = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            res = &mut call => break res.expect("eval call"),
-                            _ = &mut server_fut, if !server_done => {
-                                server_done = true;
-                            }
-                        }
-                    }
-                };
+        let mut req = daemon_client.eval_request();
+        let mut root = req.get();
+        let mut inner = root.reborrow().init_req();
+        inner.set_target_id("");
+        inner.set_expression("1+1");
+        inner.set_await_promise(false);
+        inner.set_timeout_ms(2000);
+        let resp = req.send().promise.await.expect("eval call");
 
-                let result = resp.get().expect("root").get_result().expect("result");
-                match result.which().expect("which") {
-                    daemon_capnp::daemon::eval_result_env::Which::Ok(ok) => {
-                        let json_str = ok
-                            .expect("ok branch")
-                            .get_json()
-                            .expect("json field")
-                            .to_str()
-                            .expect("utf8");
-                        assert_eq!(json_str, "2", "echoed runtime evaluate value");
-                    }
-                    daemon_capnp::daemon::eval_result_env::Which::Err(_) => {
-                        panic!("eval should succeed against responsive mock")
-                    }
-                }
+        let result = resp.get().expect("root").get_result().expect("result");
+        match result.which().expect("which") {
+            daemon_capnp::daemon::eval_result_env::Which::Ok(ok) => {
+                let json_str = ok
+                    .expect("ok branch")
+                    .get_json()
+                    .expect("json field")
+                    .to_str()
+                    .expect("utf8");
+                assert_eq!(json_str, "2", "echoed runtime evaluate value");
+            }
+            daemon_capnp::daemon::eval_result_env::Which::Err(_) => {
+                panic!("eval should succeed against responsive mock")
+            }
+        }
 
-                // Inspect the recorded methods: we must have created at
-                // least one Target with url=about:blank (the scratch tab),
-                // and Runtime.evaluate must have used that target's session.
-                let h = history.lock().await;
-                let created_blanks: Vec<&JsonValue> = h
-                    .iter()
-                    .filter(|(m, _)| m == "Target.createTarget")
-                    .map(|(_, p)| p)
-                    .collect();
-                assert!(
-                    !created_blanks.is_empty(),
-                    "no Target.createTarget recorded; scratch tab not used"
-                );
-                assert!(
-                    created_blanks
-                        .iter()
-                        .any(|p| p.get("url").and_then(|v| v.as_str()) == Some("about:blank")),
-                    "scratch tab was not created with about:blank: {:?}",
-                    created_blanks
-                );
-                assert!(
-                    h.iter().any(|(m, _)| m == "Runtime.evaluate"),
-                    "Runtime.evaluate was not called"
-                );
-
-                drop(client);
-                let _ = rpc_task.await;
-            })
-            .await;
+        // Inspect the recorded methods: we must have created at least one
+        // Target with url=about:blank (the scratch tab) and Runtime.evaluate
+        // must have been routed against the daemon-created tab.
+        let h = history.lock().await;
+        let created_blanks: Vec<&JsonValue> = h
+            .iter()
+            .filter(|(m, _)| m == "Target.createTarget")
+            .map(|(_, p)| p)
+            .collect();
+        assert!(
+            !created_blanks.is_empty(),
+            "no Target.createTarget recorded; scratch tab not used"
+        );
+        assert!(
+            created_blanks
+                .iter()
+                .any(|p| p.get("url").and_then(|v| v.as_str()) == Some("about:blank")),
+            "scratch tab was not created with about:blank: {:?}",
+            created_blanks
+        );
+        assert!(
+            h.iter().any(|(m, _)| m == "Runtime.evaluate"),
+            "Runtime.evaluate was not called"
+        );
     }
 }

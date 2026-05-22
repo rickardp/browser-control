@@ -13,6 +13,7 @@
 //! status is reported verbatim and does not change the exit code.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -20,6 +21,12 @@ use serde_json::{json, Map, Value};
 use crate::cli::mcp::resolve_browser;
 use crate::dom::scripts::FETCH_JS;
 use crate::session::PageSession;
+
+/// Per-call timeout for the JS fetch executed inside the page. Generous —
+/// real HTTP fetches over slow networks legitimately take many seconds —
+/// but bounded so a wedged renderer fails fast instead of dragging out the
+/// upstream protocol timeout.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -42,7 +49,9 @@ pub async fn run(
         }
         None => PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?,
     };
-    let result = session.evaluate(&expr, true).await;
+    let result = session
+        .evaluate_with_timeout(&expr, true, Some(FETCH_TIMEOUT))
+        .await;
     session.close().await;
     let result = result?;
 

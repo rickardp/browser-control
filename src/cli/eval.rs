@@ -1,5 +1,7 @@
 //! `browser-control eval` — evaluate a JS expression in the active page.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use serde_json::Value;
 
@@ -12,11 +14,18 @@ pub async fn run(
     target: Option<String>,
     json: bool,
     await_promise: bool,
+    timeout_ms: u64,
 ) -> Result<()> {
     let resolved = resolve_browser(browser).await?;
     let session =
         PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
-    let value = session.evaluate(&expression, await_promise).await;
+    let value = session
+        .evaluate_with_timeout(
+            &expression,
+            await_promise,
+            Some(Duration::from_millis(timeout_ms)),
+        )
+        .await;
     session.close().await;
     let value = value?;
     println!("{}", format_output(&value, json));

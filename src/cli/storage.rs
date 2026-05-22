@@ -1,11 +1,18 @@
 //! `browser-control storage` — local/sessionStorage get/set/list.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use serde_json::Value;
 
 use crate::cli::mcp::resolve_browser;
 use crate::session::PageSession;
+
+/// Per-call timeout for storage probes. The expressions injected here are
+/// trivial (`localStorage.getItem`, `JSON.stringify(Object.entries(...))`,
+/// etc.); 10 s is generous and bounds wedged renderers.
+const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Subcommand, Debug)]
 pub enum StorageCmd {
@@ -84,7 +91,9 @@ async fn evaluate_in_target(
     let resolved = resolve_browser(browser).await?;
     let session =
         PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
-    let value = session.evaluate(expr, true).await;
+    let value = session
+        .evaluate_with_timeout(expr, true, Some(STORAGE_TIMEOUT))
+        .await;
     session.close().await;
     value
 }
