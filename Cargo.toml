@@ -51,7 +51,16 @@ wait-timeout = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [build-dependencies]
+# Only used when regenerating Cap'n Proto bindings (see `regenerate-schema`
+# feature / BROWSERCTL_REGEN_SCHEMA env var). Generated code is committed,
+# so normal builds and `cargo install` do not invoke capnpc.
 capnpc = "0.20"
+
+[features]
+# Regenerate `src/generated/*_capnp.rs` from `schema/*.capnp` during the
+# build. Requires the `capnp` compiler on PATH (or the CAPNP env var).
+# Off by default — committed bindings are used otherwise.
+regenerate-schema = []
 
 [dev-dependencies]
 assert_cmd = "2"

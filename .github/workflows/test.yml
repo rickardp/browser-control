@@ -6,6 +6,12 @@
 #
 # We deliberately exercise both Apple Silicon and Intel macOS so any
 # platform-specific assumption (e.g. browser executable paths) is caught.
+#
+# Cap'n Proto bindings are committed under `src/generated/`, so the matrix
+# jobs do NOT install the `capnp` compiler — this directly verifies the
+# "cargo install just works" property on every supported platform. A
+# separate `schema-drift` job regenerates and fails if the committed
+# bindings are out of sync with `schema/*.capnp`.
 
 name: test
 
@@ -54,32 +60,6 @@ jobs:
         with:
           key: ${{ matrix.label }}
 
-      # Cache the workspace-local capnp install across runs so we only pay
-      # the source-build cost once per (OS, capnp-version) combo.
-      - name: Cache capnp toolchain
-        uses: actions/cache@v4
-        with:
-          path: target/tools/capnp
-          key: capnp-1.4.0-${{ matrix.label }}
-
-      - name: Install capnp (xtask)
-        shell: bash
-        run: cargo xtask install-capnp
-
-      - name: Add capnp to PATH (Unix)
-        if: runner.os != 'Windows'
-        run: echo "$PWD/target/tools/capnp/current/bin" >> "$GITHUB_PATH"
-
-      - name: Add capnp to PATH (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bin = Join-Path $PWD "target\tools\capnp\current\bin"
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
-
-      - name: capnp --version
-        run: capnp --version
-
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
@@ -124,3 +104,43 @@ jobs:
           ls -lh "$BIN"
           SIZE=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")
           echo "Binary size on ${{ matrix.label }}: $SIZE bytes" >> "$GITHUB_STEP_SUMMARY"
+
+  schema-drift:
+    name: schema-drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: schema-drift
+
+      - name: Cache capnp toolchain
+        uses: actions/cache@v4
+        with:
+          path: target/tools/capnp
+          key: capnp-1.4.0-x86_64-unknown-linux-gnu
+
+      - name: Install capnp (xtask)
+        run: cargo xtask install-capnp
+
+      - name: Add capnp to PATH
+        run: echo "$PWD/target/tools/capnp/current/bin" >> "$GITHUB_PATH"
+
+      - name: capnp --version
+        run: capnp --version
+
+      - name: Regenerate Cap'n Proto bindings
+        env:
+          BROWSERCTL_REGEN_SCHEMA: "1"
+        run: cargo build
+
+      - name: Verify committed bindings are in sync
+        run: |
+          if ! git diff --exit-code -- src/generated; then
+            echo "::error::src/generated/ is out of sync with schema/*.capnp."
+            echo "::error::Run \`BROWSERCTL_REGEN_SCHEMA=1 cargo build\` locally and commit the result."
+            exit 1
+          fi

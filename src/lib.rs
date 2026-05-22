@@ -7,7 +7,7 @@
 #[allow(unused_qualifications)]
 #[allow(unused_parens)]
 pub mod errors_capnp {
-    include!(concat!(env!("OUT_DIR"), "/errors_capnp.rs"));
+    include!("generated/errors_capnp.rs");
 }
 
 #[allow(clippy::all)]
@@ -17,7 +17,7 @@ pub mod errors_capnp {
 #[allow(unused_qualifications)]
 #[allow(unused_parens)]
 pub mod daemon_capnp {
-    include!(concat!(env!("OUT_DIR"), "/daemon_capnp.rs"));
+    include!("generated/daemon_capnp.rs");
 }
 
 pub mod bidi;
