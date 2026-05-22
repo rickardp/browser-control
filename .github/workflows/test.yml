@@ -6,12 +6,6 @@
 #
 # We deliberately exercise both Apple Silicon and Intel macOS so any
 # platform-specific assumption (e.g. browser executable paths) is caught.
-#
-# Cap'n Proto bindings are committed under `src/generated/`, so the matrix
-# jobs do NOT install the `capnp` compiler — this directly verifies the
-# "cargo install just works" property on every supported platform. A
-# separate `schema-drift` job regenerates and fails if the committed
-# bindings are out of sync with `schema/*.capnp`.
 
 name: test
 
@@ -70,28 +64,6 @@ jobs:
         timeout-minutes: 20
         run: cargo test --all-targets
 
-      - name: Daemon smoke (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          export BROWSER_CONTROL_DATA_DIR="$(mktemp -d)"
-          ./target/debug/browser-control daemon status smoke
-          ./target/debug/browser-control daemon run smoke
-          ./target/debug/browser-control daemon status smoke --json | tee /tmp/status.json
-          test "$(cat /tmp/status.json)" = "null"
-          rm -rf "$BROWSER_CONTROL_DATA_DIR"
-
-      - name: Daemon smoke (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $env:BROWSER_CONTROL_DATA_DIR = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "bcdata-$(Get-Random)") | Select-Object -ExpandProperty FullName
-          .\target\debug\browser-control.exe daemon status smoke
-          .\target\debug\browser-control.exe daemon run smoke
-          $out = & .\target\debug\browser-control.exe daemon status smoke --json
-          if ($out.Trim() -ne "null") { throw "expected cleared state, got $out" }
-
       - name: Print binary size
         shell: bash
         run: |
@@ -104,43 +76,3 @@ jobs:
           ls -lh "$BIN"
           SIZE=$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")
           echo "Binary size on ${{ matrix.label }}: $SIZE bytes" >> "$GITHUB_STEP_SUMMARY"
-
-  schema-drift:
-    name: schema-drift
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: schema-drift
-
-      - name: Cache capnp toolchain
-        uses: actions/cache@v4
-        with:
-          path: target/tools/capnp
-          key: capnp-1.4.0-x86_64-unknown-linux-gnu
-
-      - name: Install capnp (xtask)
-        run: cargo xtask install-capnp
-
-      - name: Add capnp to PATH
-        run: echo "$PWD/target/tools/capnp/current/bin" >> "$GITHUB_PATH"
-
-      - name: capnp --version
-        run: capnp --version
-
-      - name: Regenerate Cap'n Proto bindings
-        env:
-          BROWSERCTL_REGEN_SCHEMA: "1"
-        run: cargo build
-
-      - name: Verify committed bindings are in sync
-        run: |
-          if ! git diff --exit-code -- src/generated; then
-            echo "::error::src/generated/ is out of sync with schema/*.capnp."
-            echo "::error::Run \`BROWSERCTL_REGEN_SCHEMA=1 cargo build\` locally and commit the result."
-            exit 1
-          fi

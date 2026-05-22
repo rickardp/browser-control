@@ -11,9 +11,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 pub mod protocol;
-pub mod target_registry;
 use protocol::{CdpError, Request, Response};
-pub use target_registry::{TargetRegistry, TargetStatus};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -43,11 +41,6 @@ pub struct CdpClient {
     write_tx: mpsc::UnboundedSender<String>,
     reader_handle: tokio::task::JoinHandle<()>,
     writer_handle: tokio::task::JoinHandle<()>,
-    /// Flipped to `true` by the reader task when the underlying WebSocket
-    /// closes (peer EOF, IO error, browser death). Daemons watch this to
-    /// shut down promptly when their browser dies instead of waiting on a
-    /// 30 s `REQUEST_TIMEOUT`.
-    closed_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl CdpClient {
@@ -77,11 +70,8 @@ impl CdpClient {
             let _ = ws_sink.close().await;
         });
 
-        let (closed_tx, _closed_rx) = tokio::sync::watch::channel(false);
-
         let pending_r = pending.clone();
         let events_r = events_tx.clone();
-        let closed_for_reader = closed_tx.clone();
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 let text = match msg {
@@ -115,7 +105,7 @@ impl CdpClient {
                     });
                 }
             }
-            // Reader closed: fail all pending requests, then signal listeners.
+            // Reader closed: fail all pending requests.
             let mut p = pending_r.lock().await;
             for (_, tx) in p.drain() {
                 let _ = tx.send(Err(CdpError {
@@ -123,7 +113,6 @@ impl CdpClient {
                     message: "connection closed".into(),
                 }));
             }
-            let _ = closed_for_reader.send(true);
         });
 
         Ok(Self {
@@ -133,14 +122,7 @@ impl CdpClient {
             write_tx,
             reader_handle,
             writer_handle,
-            closed_tx,
         })
-    }
-
-    /// Watch channel that flips to `true` when the underlying WebSocket
-    /// closes for any reason (peer EOF, IO error, explicit `close`).
-    pub fn closed_signal(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.closed_tx.subscribe()
     }
 
     /// Connect by HTTP base URL (e.g. http://127.0.0.1:9222). Fetches /json/version to discover the WS URL.

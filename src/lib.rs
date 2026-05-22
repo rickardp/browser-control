@@ -1,30 +1,9 @@
 //! Library entry point for `browser-control`.
 
-#[allow(clippy::all)]
-#[allow(non_camel_case_types)]
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(unused_qualifications)]
-#[allow(unused_parens)]
-pub mod errors_capnp {
-    include!("generated/errors_capnp.rs");
-}
-
-#[allow(clippy::all)]
-#[allow(non_camel_case_types)]
-#[allow(dead_code)]
-#[allow(unused_imports)]
-#[allow(unused_qualifications)]
-#[allow(unused_parens)]
-pub mod daemon_capnp {
-    include!("generated/daemon_capnp.rs");
-}
-
 pub mod bidi;
 pub mod cdp;
 pub mod cli;
 pub mod config;
-pub mod daemon;
 pub mod detect;
 pub mod dom;
 pub mod errors;

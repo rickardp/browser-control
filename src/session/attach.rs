@@ -169,7 +169,7 @@ impl PageSession {
         timeout: Option<Duration>,
     ) -> Result<Value> {
         let target_id = self.target_id();
-        let url = None; // populated by the daemon's TabRegistry in chunks 6+
+        let url = None;
         let inner = async {
             match self {
                 PageSession::Cdp(p) => {

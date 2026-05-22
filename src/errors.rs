@@ -14,10 +14,10 @@ pub enum BrowserControlError {
     Io(#[from] std::io::Error),
 }
 
-/// Typed errors raised from the page-session layer. These exist so the daemon
-/// (and tests) can pattern-match on the failure category — in particular,
-/// `TabHung` is the catch-all for the alive-but-unresponsive renderer case
-/// that has no protocol event signal.
+/// Typed errors raised from the page-session layer so callers (and tests) can
+/// pattern-match on the failure category — in particular, `TabHung` is the
+/// catch-all for the alive-but-unresponsive renderer case that has no
+/// protocol event signal.
 #[derive(Debug, Error)]
 pub enum SessionError {
     /// Op exceeded its per-call timeout without a reply and without a crash

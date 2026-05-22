@@ -40,28 +40,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 futures-util = "0.3"
 toml = "0.8"
 regex = "1"
-capnp = "0.20"
-capnp-rpc = "0.20"
-capnp-futures = "0.20"
-async-trait = "0.1"
-tempfile = "3"
 wait-timeout = "0.2"
-tokio-util = { version = "0.7", features = ["compat"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
-
-[build-dependencies]
-# Only used when regenerating Cap'n Proto bindings (see `regenerate-schema`
-# feature / BROWSERCTL_REGEN_SCHEMA env var). Generated code is committed,
-# so normal builds and `cargo install` do not invoke capnpc.
-capnpc = "0.20"
-
-[features]
-# Regenerate `src/generated/*_capnp.rs` from `schema/*.capnp` during the
-# build. Requires the `capnp` compiler on PATH (or the CAPNP env var).
-# Off by default — committed bindings are used otherwise.
-regenerate-schema = []
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -74,6 +56,3 @@ tokio = { version = "1", features = ["test-util"] }
 strip = true
 lto = "thin"
 codegen-units = 1
-
-[workspace]
-members = ["xtask"]

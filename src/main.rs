@@ -175,16 +175,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Daemon lifecycle (developer surface; auto-spawn is implicit in production).
-    Daemon {
-        #[command(subcommand)]
-        cmd: browser_control::cli::daemon::DaemonCmd,
-    },
-    /// Named-tab lifecycle through the daemon (`tab open`, `tab list`).
-    Tab {
-        #[command(subcommand)]
-        cmd: browser_control::cli::tab::TabCmd,
-    },
 }
 
 fn init_tracing() {
@@ -261,7 +251,5 @@ async fn main() -> Result<()> {
         } => {
             wait_for_cookie::run(browser, domain, name, timeout, poll_interval, validate_url).await
         }
-        Command::Daemon { cmd } => browser_control::cli::daemon::run(cmd).await,
-        Command::Tab { cmd } => browser_control::cli::tab::run(cmd).await,
     }
 }
