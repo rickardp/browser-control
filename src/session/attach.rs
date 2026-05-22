@@ -6,6 +6,7 @@
 //! by a long-lived BiDi client via [`PageSession::from_bidi_cache`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
@@ -14,6 +15,7 @@ use serde_json::{json, Value};
 use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::detect::Engine;
+use crate::errors::SessionError;
 use crate::session::targets::{open_bidi, open_cdp};
 
 /// A bound page-level session. Variants are not constructed directly outside
@@ -138,28 +140,81 @@ impl PageSession {
     /// `await_promise = true` mirrors `Runtime.evaluate({awaitPromise:true})`
     /// and is appropriate for fetch / promise-returning code. The returned
     /// value is the raw `result.value` from CDP / BiDi after `returnByValue`.
+    ///
+    /// Equivalent to [`evaluate_with_timeout`](Self::evaluate_with_timeout)
+    /// with `timeout = None` (bounded only by the upstream client's protocol
+    /// timeout, currently 30 s). Prefer the bounded form in any path where
+    /// the renderer's responsiveness is uncertain — see the module docs.
     pub async fn evaluate(&self, expression: &str, await_promise: bool) -> Result<Value> {
+        self.evaluate_with_timeout(expression, await_promise, None)
+            .await
+    }
+
+    /// Bounded variant of [`evaluate`](Self::evaluate).
+    ///
+    /// If `timeout` is `Some`, the call races the upstream send against a
+    /// `tokio::time::sleep`. On expiry, returns a typed
+    /// [`SessionError::TabHung`] tagged with the target's id and URL — this
+    /// is the catch-all for the alive-but-unresponsive renderer case that
+    /// has no protocol event signal (service-worker-paused page, JS infinite
+    /// loop, modal dialog, devtools-paused, embedded admin UIs whose
+    /// renderer ignores `Runtime.evaluate`).
+    ///
+    /// If `timeout` is `None`, the call is bounded only by the underlying
+    /// client's protocol timeout (CDP: 30 s, BiDi: 30 s).
+    pub async fn evaluate_with_timeout(
+        &self,
+        expression: &str,
+        await_promise: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let target_id = self.target_id();
+        let url = None; // populated by the daemon's TabRegistry in chunks 6+
+        let inner = async {
+            match self {
+                PageSession::Cdp(p) => {
+                    let v = p
+                        .client
+                        .send_with_session(
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": expression,
+                                "returnByValue": true,
+                                "awaitPromise": await_promise,
+                            }),
+                            Some(&p.session_id),
+                        )
+                        .await?;
+                    Ok(v["result"]["value"].clone())
+                }
+                PageSession::Bidi(p) => {
+                    let _ = await_promise; // BiDi always awaits per script_evaluate
+                    let v = p.client.script_evaluate(&p.context, expression).await?;
+                    Ok(v["result"]["value"].clone())
+                }
+            }
+        };
+        match timeout {
+            None => inner.await,
+            Some(d) => match tokio::time::timeout(d, inner).await {
+                Ok(r) => r,
+                Err(_) => Err(SessionError::TabHung {
+                    target_id,
+                    url,
+                    timeout_ms: d.as_millis() as u64,
+                    hint: "op-timeout",
+                }
+                .into()),
+            },
+        }
+    }
+
+    /// Engine-specific target id for diagnostics (CDP `targetId`, BiDi
+    /// browsing context id).
+    pub fn target_id(&self) -> Option<String> {
         match self {
-            PageSession::Cdp(p) => {
-                let v = p
-                    .client
-                    .send_with_session(
-                        "Runtime.evaluate",
-                        json!({
-                            "expression": expression,
-                            "returnByValue": true,
-                            "awaitPromise": await_promise,
-                        }),
-                        Some(&p.session_id),
-                    )
-                    .await?;
-                Ok(v["result"]["value"].clone())
-            }
-            PageSession::Bidi(p) => {
-                let _ = await_promise; // BiDi always awaits per script_evaluate
-                let v = p.client.script_evaluate(&p.context, expression).await?;
-                Ok(v["result"]["value"].clone())
-            }
+            PageSession::Cdp(p) => Some(p.target_id.clone()),
+            PageSession::Bidi(p) => Some(p.context.clone()),
         }
     }
 
@@ -515,5 +570,102 @@ mod tests {
         let b64 = s.screenshot(false).await.unwrap();
         assert_eq!(b64, "PNGDATA");
         s.close().await;
+    }
+
+    /// Spawn a CDP mock that answers `Target.getTargets` / `attachToTarget`
+    /// normally but **never replies to `Runtime.evaluate`** — simulating the
+    /// iLO-style wedge where the renderer is alive but refuses to service JS.
+    async fn spawn_cdp_mock_eval_hangs(targets: Vec<Value>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap_or("");
+                if method == "Runtime.evaluate" {
+                    // Drop the request on the floor. No response, ever.
+                    continue;
+                }
+                let result = match method {
+                    "Target.getTargets" => json!({"targetInfos": targets.clone()}),
+                    "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                    _ => json!({}),
+                };
+                let resp = json!({"id": id, "result": result});
+                ws.send(Message::Text(resp.to_string())).await.unwrap();
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Test #1: the iLO-style wedge. `evaluate_with_timeout` returns a typed
+    /// `TabHung` within the bound — not the 30 s upstream `REQUEST_TIMEOUT`.
+    #[tokio::test]
+    async fn evaluate_with_timeout_returns_tab_hung_on_no_reply() {
+        let url = spawn_cdp_mock_eval_hangs(vec![
+            json!({"targetId":"iLO","type":"page","url":"https://192.168.2.28/"}),
+        ])
+        .await;
+        let s = PageSession::attach(&url, Engine::Cdp, None).await.unwrap();
+        let start = std::time::Instant::now();
+        let err = s
+            .evaluate_with_timeout("1+1", false, Some(Duration::from_millis(300)))
+            .await
+            .expect_err("must return TabHung");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "did not honour 300ms bound, took {elapsed:?}"
+        );
+        let downcast = err.downcast_ref::<SessionError>().expect("typed error");
+        match downcast {
+            SessionError::TabHung {
+                target_id,
+                timeout_ms,
+                hint,
+                ..
+            } => {
+                assert_eq!(target_id.as_deref(), Some("iLO"));
+                assert_eq!(*timeout_ms, 300);
+                assert_eq!(*hint, "op-timeout");
+            }
+            other => panic!("expected TabHung, got {other:?}"),
+        }
+        s.close().await;
+    }
+
+    /// Test #16 (partial): a stuck eval on one PageSession does not block a
+    /// concurrent eval on a sibling PageSession sharing the same browser. We
+    /// model the "sibling" by opening a second mock — same protocol, two
+    /// CdpClient instances. The point of the test is to verify that the
+    /// timeout/error path on one session is isolated from the other.
+    #[tokio::test]
+    async fn stuck_eval_does_not_block_sibling_session() {
+        let bad = spawn_cdp_mock_eval_hangs(vec![
+            json!({"targetId":"BAD","type":"page","url":"https://192.168.2.28/"}),
+        ])
+        .await;
+        let good = spawn_cdp_mock(vec![
+            json!({"targetId":"GOOD","type":"page","url":"https://example.com/"}),
+        ])
+        .await;
+
+        let s_bad = PageSession::attach(&bad, Engine::Cdp, None).await.unwrap();
+        let s_good = PageSession::attach(&good, Engine::Cdp, None).await.unwrap();
+
+        // Run both concurrently. The bad one should fast-fail; the good one
+        // should succeed independently.
+        let bad_fut = s_bad.evaluate_with_timeout("1+1", false, Some(Duration::from_millis(200)));
+        let good_fut = s_good.evaluate_with_timeout("1+1", false, Some(Duration::from_secs(5)));
+        let (bad_res, good_res) = tokio::join!(bad_fut, good_fut);
+
+        assert!(bad_res.is_err(), "bad session must surface TabHung");
+        assert_eq!(good_res.unwrap(), json!("ok"));
+
+        s_bad.close().await;
+        s_good.close().await;
     }
 }

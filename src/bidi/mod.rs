@@ -15,6 +15,10 @@ use tokio_tungstenite::tungstenite::Message;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Bound on `connect_async` during initial BiDi bringup; see the matching
+/// constant in `crate::cdp` for rationale.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Recognise the BiDi error returned when a fresh `session.new` is rejected
 /// because a session already exists on the browser. Firefox reports this as
 /// `session not created` with a "Maximum number of active sessions" message.
@@ -46,7 +50,15 @@ pub struct BidiClient {
 
 impl BidiClient {
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
+        let (ws, _resp) =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "BiDi WebSocket connect to {ws_url} timed out after {:?}",
+                        CONNECT_TIMEOUT
+                    )
+                })??;
         let (mut sink, mut stream) = ws.split();
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();

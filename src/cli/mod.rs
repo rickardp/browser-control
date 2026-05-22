@@ -9,6 +9,7 @@ pub mod output;
 pub mod set;
 pub mod start;
 pub mod storage;
+pub mod tab;
 pub mod targets;
 pub mod wait;
 pub mod wait_for_cookie;

@@ -11,10 +11,21 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 pub mod protocol;
+pub mod target_registry;
 use protocol::{CdpError, Request, Response};
+pub use target_registry::{TargetRegistry, TargetStatus};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Bound on `connect_async` / HTTP discovery during initial CDP bringup.
+///
+/// A dead browser process or a stale `/devtools/browser/<GUID>` can otherwise
+/// stall the WebSocket upgrade (or the underlying TCP connect) for the OS's
+/// connect timeout — multiple seconds to over a minute on macOS/Linux. Five
+/// seconds matches the `--version` probe in `crate::detect` and is short
+/// enough that agents don't perceive a hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>;
 
@@ -32,12 +43,25 @@ pub struct CdpClient {
     write_tx: mpsc::UnboundedSender<String>,
     reader_handle: tokio::task::JoinHandle<()>,
     writer_handle: tokio::task::JoinHandle<()>,
+    /// Flipped to `true` by the reader task when the underlying WebSocket
+    /// closes (peer EOF, IO error, browser death). Daemons watch this to
+    /// shut down promptly when their browser dies instead of waiting on a
+    /// 30 s `REQUEST_TIMEOUT`.
+    closed_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl CdpClient {
     /// Connect by full WebSocket URL (ws:// or wss://).
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
+        let (ws_stream, _) =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "CDP WebSocket connect to {ws_url} timed out after {:?}",
+                        CONNECT_TIMEOUT
+                    )
+                })??;
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -53,8 +77,11 @@ impl CdpClient {
             let _ = ws_sink.close().await;
         });
 
+        let (closed_tx, _closed_rx) = tokio::sync::watch::channel(false);
+
         let pending_r = pending.clone();
         let events_r = events_tx.clone();
+        let closed_for_reader = closed_tx.clone();
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 let text = match msg {
@@ -88,7 +115,7 @@ impl CdpClient {
                     });
                 }
             }
-            // Reader closed: fail all pending requests.
+            // Reader closed: fail all pending requests, then signal listeners.
             let mut p = pending_r.lock().await;
             for (_, tx) in p.drain() {
                 let _ = tx.send(Err(CdpError {
@@ -96,6 +123,7 @@ impl CdpClient {
                     message: "connection closed".into(),
                 }));
             }
+            let _ = closed_for_reader.send(true);
         });
 
         Ok(Self {
@@ -105,14 +133,25 @@ impl CdpClient {
             write_tx,
             reader_handle,
             writer_handle,
+            closed_tx,
         })
+    }
+
+    /// Watch channel that flips to `true` when the underlying WebSocket
+    /// closes for any reason (peer EOF, IO error, explicit `close`).
+    pub fn closed_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closed_tx.subscribe()
     }
 
     /// Connect by HTTP base URL (e.g. http://127.0.0.1:9222). Fetches /json/version to discover the WS URL.
     pub async fn connect_http(base_url: &str) -> Result<Self> {
         let base = base_url.trim_end_matches('/');
         let url = format!("{base}/json/version");
-        let resp: Value = reqwest::get(&url).await?.json().await?;
+        let client = reqwest::Client::builder()
+            .timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| anyhow!("building reqwest client: {e}"))?;
+        let resp: Value = client.get(&url).send().await?.json().await?;
         let ws_url = resp
             .get("webSocketDebuggerUrl")
             .and_then(|v| v.as_str())
@@ -274,5 +313,40 @@ mod tests {
         assert_eq!(evt.session_id.as_deref(), Some("S1"));
         assert_eq!(evt.params["targetInfo"]["targetId"], "abc");
         client.close().await;
+    }
+
+    /// Test #15: connect-side timeout fires when the WS upgrade hangs.
+    ///
+    /// The TCP listener accepts the connection but never writes the HTTP
+    /// upgrade response, so `tokio_tungstenite::connect_async` would wait
+    /// indefinitely without the bound.
+    #[tokio::test]
+    async fn connect_times_out_when_upgrade_hangs() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hold the accepted connection forever (no HTTP response).
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let url = format!("ws://{addr}");
+        let start = std::time::Instant::now();
+        let err = match CdpClient::connect(&url).await {
+            Ok(_) => panic!("connect must fail when upgrade hangs"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+
+        // Must fail within the bound + a generous slack for CI variance.
+        assert!(
+            elapsed < CONNECT_TIMEOUT + Duration::from_secs(2),
+            "connect did not honour the 5s bound (took {elapsed:?})"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "error should mention timeout, got: {msg}"
+        );
     }
 }

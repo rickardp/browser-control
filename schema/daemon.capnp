@@ -205,4 +205,48 @@ interface Daemon {
 
   # Diagnostic dump of the in-memory TRACE ring buffer.
   diagnose @4 () -> (text :Text);
+
+  # ---------- Named tabs ----------
+  # Get-or-create a named tab. With an empty `name`, the daemon assigns one.
+  # If the named tab exists and is `ready`, returns it (navigating to `url`
+  # first if `url` is non-empty and differs from the current URL). If the
+  # named tab is `stuck` or `closed`, recreates under the same name.
+  #
+  # Agents never close tabs explicitly; the daemon GCs daemon-created tabs
+  # by idle timeout and budget-pressure recycling. User-created (adopted)
+  # tabs are never GC'd.
+  tabOpen @5 (req :TabOpenRequest) -> (result :TabOpenResult);
+  struct TabOpenRequest {
+    name @0 :Text;     # empty → daemon assigns a cute name
+    url  @1 :Text;     # empty → "about:blank"
+  }
+  struct TabOpenResult { union {
+    ok  @0 :TabInfo;
+    err @1 :Errors.Error;
+  } }
+
+  # Snapshot of every tab the daemon currently knows about. Returns in
+  # stable name order. User-created tabs are flagged via `daemonCreated`.
+  tabList @6 () -> (tabs :List(TabInfo));
+
+  # Lock-free `eval` for arbitrary expressions. Always routed through a
+  # daemon-owned scratch tab — never against an arbitrary user tab. This is
+  # the default code path for `browser-control eval brave-twilight '1+1'`.
+  eval @7 (req :EvalRequest) -> (result :EvalResultEnv);
+  struct EvalResultEnv { union {
+    ok  @0 :EvalResponse;
+    err @1 :Errors.Error;
+  } }
+}
+
+# Tab handle returned by `tabOpen` and `tabList`. Daemon-side fields only;
+# the wire never sees the daemon's `last_used_at` Instant directly — only
+# `idleMs` for human-readable rendering.
+struct TabInfo {
+  name @0 :Text;
+  targetId @1 :Text;
+  url @2 :Text;
+  state @3 :Text;              # "ready" | "stuck" | "closed"
+  daemonCreated @4 :Bool;
+  idleMs @5 :UInt64;           # ms since last op against this tab
 }
