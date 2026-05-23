@@ -7,7 +7,11 @@
 //! of duplicating them per consumer.
 
 pub mod attach;
+pub mod scratch;
+pub mod tabs;
 pub mod targets;
 
 pub use attach::PageSession;
+pub use scratch::with_scratch_recovery;
+pub use tabs::{resolve_tab, tab_list, tab_open};
 pub use targets::{list as list_targets, TargetInfo};

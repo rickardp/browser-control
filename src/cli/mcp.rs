@@ -42,3 +42,85 @@ pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrow
         "no browser selected: pass a browser argument, set BROWSER_CONTROL, or run `browser-control set default <value>`"
     ))
 }
+
+/// Resolved positional with optional tab name.
+///
+/// Returned by [`resolve_target`] so every command that takes a
+/// `<browser>` positional can opt into the unified `<browser>/<tab>` path
+/// syntax. The `tab` field is `Some` if the user wrote `<browser>/<tab>`,
+/// `None` if they wrote a bare `<browser>`.
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub resolved: ResolvedBrowser,
+    pub tab: Option<String>,
+}
+
+impl ResolvedTarget {
+    /// The registered browser name suitable for keying SQLite tables
+    /// (`scratches`, `tabs`, `bidi_locks`). `None` for external URL targets
+    /// where there is no registry row.
+    pub fn registered_name(&self) -> Option<&str> {
+        match &self.resolved.source {
+            crate::cli::env_resolver::Source::Registered { name } => Some(name.as_str()),
+            crate::cli::env_resolver::Source::External => None,
+        }
+    }
+}
+
+/// Resolve a `<browser>[/<tab>]` positional. Same defaulting rules as
+/// [`resolve_browser`] for the browser part.
+///
+/// When a tab is present, the browser part MUST resolve to a registered
+/// browser (so the tab row has a stable key); otherwise we error early
+/// with a clear message — external URL endpoints can't carry named tabs.
+pub async fn resolve_target(browser_arg: Option<String>) -> Result<ResolvedTarget> {
+    let registry = Registry::open()?;
+    let raw = match browser_arg.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => match crate::config::load()?.default {
+            Some(v) => v,
+            None => {
+                return Err(anyhow!(
+                    "no browser selected: pass a browser argument, set BROWSER_CONTROL, or run `browser-control set default <value>`"
+                ));
+            }
+        },
+    };
+    let target = env_resolver::parse_target(&raw)?;
+    let resolved = env_resolver::resolve(target.browser, &registry).await?;
+    if target.tab.is_some() {
+        match resolved.source {
+            crate::cli::env_resolver::Source::Registered { .. } => {}
+            _ => {
+                return Err(anyhow!(
+                    "named tabs (`<browser>/<name>`) require a registered browser; \
+                     external URL endpoints cannot carry tab names"
+                ));
+            }
+        }
+    }
+    Ok(ResolvedTarget {
+        resolved,
+        tab: target.tab,
+    })
+}
+
+/// Acquire the Firefox BiDi single-session lock if `resolved` is a
+/// registered browser on the BiDi engine. Returns `None` for external
+/// URL endpoints (the lock is per-registered-name) and for CDP engines.
+/// Wait bound: 30 s; on timeout, returns the typed `BidiLockBusy` error.
+pub fn acquire_bidi_lock_if_needed(
+    registry: &crate::registry::Registry,
+    resolved: &ResolvedBrowser,
+) -> Result<Option<crate::registry::BidiLockGuard>> {
+    use crate::detect::Engine;
+    if resolved.engine != Engine::Bidi {
+        return Ok(None);
+    }
+    let name = match &resolved.source {
+        crate::cli::env_resolver::Source::Registered { name } => name.clone(),
+        crate::cli::env_resolver::Source::External => return Ok(None),
+    };
+    let guard = registry.bidi_lock_acquire(&name, std::time::Duration::from_secs(30))?;
+    Ok(Some(guard))
+}

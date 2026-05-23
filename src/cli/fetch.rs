@@ -18,9 +18,16 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::cli::mcp::resolve_browser;
+use crate::cdp::CdpClient;
+use crate::cli::env_resolver::{self, Source};
+use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::detect::Engine;
 use crate::dom::scripts::FETCH_JS;
-use crate::session::PageSession;
+use crate::errors::SessionError;
+use crate::registry::Registry;
+use crate::session::{tabs as session_tabs, PageSession};
+
+use std::sync::Arc;
 
 /// Per-call timeout for the JS fetch executed inside the page. Generous —
 /// real HTTP fetches over slow networks legitimately take many seconds —
@@ -42,18 +49,86 @@ pub async fn run(
     let header_map = parse_headers(&headers)?;
     let expr = build_fetch_expr(&url, &method, &header_map, data.as_deref())?;
 
-    let resolved = resolve_browser(browser).await?;
-    let session = match target.as_deref() {
-        Some(regex) => {
-            PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?
-        }
-        None => PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?,
+    // Path-syntax parsing: `<browser>` or `<browser>/<tab>` in the
+    // positional. `--target <regex>` and `/<tab>` are mutually exclusive.
+    let raw = browser.unwrap_or_default();
+    let parsed = if raw.is_empty() {
+        None
+    } else {
+        Some(env_resolver::parse_target(&raw)?)
     };
-    let result = session
-        .evaluate_with_timeout(&expr, true, Some(FETCH_TIMEOUT))
-        .await;
-    session.close().await;
-    let result = result?;
+    let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
+    if tab_name.is_some() && target.is_some() {
+        bail!("specify the tab via either `<browser>/<name>` or `--target <regex>`, not both");
+    }
+    let browser_only = parsed
+        .as_ref()
+        .map(|p| strip_tab(&raw, p.tab.as_deref()))
+        .unwrap_or_default();
+    let resolved = resolve_browser(if browser_only.is_empty() {
+        None
+    } else {
+        Some(browser_only.clone())
+    })
+    .await?;
+
+    // Single Registry handle for the function lifetime: BiDi lock,
+    // named-tab resolution, scratch fallback all share it.
+    let registry = Registry::open()?;
+    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+
+    let result = match (tab_name, target.as_deref()) {
+        // Path 1: <browser>/<tab> — fetch against the named tab.
+        (Some(name), None) => {
+            let browser_name = match &resolved.source {
+                Source::Registered { name } => name.clone(),
+                _ => bail!("named tabs (`<browser>/<name>`) require a registered browser"),
+            };
+            if resolved.engine == Engine::Bidi {
+                bail!(
+                    "named tabs are not yet supported for BiDi (Firefox); \
+                     use `--target <url-regex>` to select a context"
+                );
+            }
+            let client = Arc::new(open_cdp(&resolved.endpoint).await?);
+            let row = session_tabs::resolve_tab(&client, &registry, &browser_name, &name)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "TabNotFound: no live tab `{name}` for `{browser_name}` \
+                         — run `browser-control tab open {browser_name}/{name}` first"
+                    )
+                })?;
+            let value = eval_in_target(&client, &row.target_id, &expr, FETCH_TIMEOUT).await;
+            drop(client);
+            value?
+        }
+        // Path 2: --target regex (legacy).
+        (None, Some(regex)) => {
+            let session =
+                PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?;
+            let value = session
+                .evaluate_with_timeout(&expr, true, Some(FETCH_TIMEOUT))
+                .await;
+            session.close().await;
+            value?
+        }
+        // Path 3: bare browser → attach_for_origin (current default).
+        // Auth-inheritance: the request runs from the URL's origin, so
+        // cookies/credentials propagate. Scratch routing (which would use
+        // about:blank) would lose this; we deliberately keep
+        // attach_for_origin here instead.
+        (None, None) => {
+            let session =
+                PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?;
+            let value = session
+                .evaluate_with_timeout(&expr, true, Some(FETCH_TIMEOUT))
+                .await;
+            session.close().await;
+            value?
+        }
+        _ => unreachable!("mutex was checked above"),
+    };
 
     let envelope = parse_envelope(&result)?;
 
@@ -190,6 +265,74 @@ fn write_file(path: &Path, body: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to chmod 600 {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
+fn strip_tab(raw: &str, tab: Option<&str>) -> String {
+    match tab {
+        Some(name) => raw
+            .strip_suffix(&format!("/{name}"))
+            .unwrap_or(raw)
+            .to_string(),
+        None => raw.to_string(),
+    }
+}
+
+/// Attach a transient CDP session to `target_id`, run `Runtime.evaluate`,
+/// detach. Used by the `<browser>/<tab>` fetch path. Returns the raw
+/// `result.value` (the FETCH_JS envelope as a JSON string).
+async fn eval_in_target(
+    client: &CdpClient,
+    target_id: &str,
+    expression: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let attach = client
+        .send(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await?;
+    let session_id = attach
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Target.attachToTarget returned no sessionId"))?
+        .to_string();
+    let inner = client.send_with_session(
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true,
+        }),
+        Some(&session_id),
+    );
+    let value = match tokio::time::timeout(timeout, inner).await {
+        Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(SessionError::TabHung {
+            target_id: Some(target_id.to_string()),
+            url: None,
+            timeout_ms: timeout.as_millis() as u64,
+            hint: "op-timeout",
+        }
+        .into()),
+    };
+    let _ = client
+        .send(
+            "Target.detachFromTarget",
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+    value
+}
+
+async fn open_cdp(endpoint: &str) -> Result<CdpClient> {
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        CdpClient::connect(endpoint).await
+    } else {
+        CdpClient::connect_http(endpoint).await
+    }
 }
 
 #[cfg(test)]

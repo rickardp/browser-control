@@ -1,8 +1,15 @@
 //! SQLite-backed registry of running browser instances.
 
+pub mod bidi_lock;
 pub mod naming;
 pub mod schema;
+pub mod scratches;
+pub mod tabs;
 pub mod words;
+
+pub use bidi_lock::{BidiLockBusy, BidiLockGuard, BidiLockRow};
+pub use scratches::ScratchRow;
+pub use tabs::TabRow;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
@@ -288,6 +295,23 @@ pub fn is_alive(row: &BrowserRow) -> bool {
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], row.port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// Cheap check: is process `pid` still running on this machine? Used by
+/// stale-row eviction in `scratches`, `tabs`, and `bidi_locks` to avoid
+/// keeping rows registered to a crashed CLI process.
+pub fn pid_alive(pid: u32) -> bool {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+/// Current Unix epoch seconds.
+pub fn now_epoch_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 // -- ISO-8601 helpers --------------------------------------------------------

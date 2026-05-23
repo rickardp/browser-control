@@ -206,12 +206,30 @@ bundled with the architectural decision.
 - **Scratch-tab recover-once wrapper** around the default agent ops
   (`fetch`, `eval` against a daemon-style scratch tab). Implements the
   "always proceed" rule on the direct path.
+  **Status:** landed. `src/session/scratch.rs` +
+  `src/registry/scratches.rs`. The default `eval <browser>` (no
+  `--target`) routes through the scratch tab with one-shot recovery
+  on `TabHung` / `TabCrashed` / "no target" protocol errors.
 - **`tab` CLI subcommand** backed by a SQLite `tabs` table with
   sweep-on-read for stale rows (`name`, `target_id`, `last_url`,
   `last_used_at`, `daemon_created`). Stable tab identity across CLI
   invocations.
+  **Status:** landed. `src/cli/tab.rs` exposes `tab open` and
+  `tab list`; every other command's `<browser>` positional accepts the
+  unified `<browser>/<name>` path syntax (via `parse_target` in
+  `env_resolver.rs`). Soft cap deferred; hard cap 50 with LRU close on
+  budget pressure.
 - **SQLite `bidi_lock` row**, acquired on first BiDi op, released on
   `Drop` of a lock guard at process exit. `pid_alive` check on acquire
   handles the crashed-CLI case. Closes the Firefox BiDi race window.
+  **Status:** landed. `src/registry/bidi_lock.rs`. CLI commands that
+  resolve a registered BiDi browser acquire via
+  `acquire_bidi_lock_if_needed` (30 s default wait, typed
+  `BidiLockBusy` on timeout). Wired into `eval` and `fetch`; other
+  BiDi-capable commands inherit the existing
+  `session.end`-on-close + retry-on-collision mitigation and gain the
+  lock in a follow-up.
 - **SQLite `browser_cache` row** with TTL for `Browser.getVersion`,
   engine, and WS endpoint — eliminates per-invocation probes.
+  **Status:** still deferred. Revisit when profiling shows per-invocation
+  probe cost matters.
