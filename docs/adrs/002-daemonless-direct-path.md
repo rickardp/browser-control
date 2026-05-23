@@ -1,208 +1,217 @@
-# ADR 002: Daemonless — keep the direct-CLI path, drop the daemon
+---
+status: Active
+date: 2026-05-22
+---
 
-## Status
-
-Accepted (2026-05-22). Supersedes the unreleased Phase 0 / Phase 1 daemon
-work on the `daemon-phase-0` branch.
+# ADR-002: Stay daemonless — bound the direct CLI path instead
 
 ## Context
 
-Phase 0 / Phase 1 (commits `510eac5`, `10404de`, `70e1427`) introduced a
-long-lived daemon process to:
+Three failure modes pushed us to ask whether `browser-control` needs a
+long-lived daemon between the CLI and the browser:
 
-1. Arbitrate the Firefox BiDi single-session limit ("Maximum number of
-   active sessions") across concurrent callers.
-2. Hide stuck / wedged renderers behind a daemon-owned scratch-tab pool,
-   so agents never see `TabHung`.
-3. Provide a named-tab abstraction (`tab open --name X`) with idle GC.
-4. Offer an exclusive lock capability (`LockedSession`) for stateful
-   work.
+1. **Wedged renderers.** A live tab that doesn't service `Runtime.evaluate`
+   (service-worker-paused page, busy event loop, modal dialog, embedded
+   admin UIs like iLO) emits no protocol event. The default CLI selector
+   could land on such a tab and the call would block until the upstream
+   30 s `REQUEST_TIMEOUT`. Agents going down this rabbit hole was a
+   recurring real-world bug.
+2. **Firefox BiDi single-session limit.** Firefox allows one WebDriver-BiDi
+   session per browser at a time. Two concurrent CLI invocations against
+   the same Firefox instance race on `session.new` and one gets "Maximum
+   number of active sessions".
+3. **Stable tab identity across CLI invocations.** Each CLI process is
+   short-lived and stateless; agents that want to drive the same tab across
+   calls have nothing to address it by except a regex over the URL, which
+   re-resolves to a different `targetId` after a navigation cross-process.
 
-The implementation cost was substantial:
+We also accumulated two product constraints during the design discussion:
 
-- Cap'n Proto schemas (`schema/*.capnp`) and ~17 000 LOC of generated
-  bindings under `src/generated/`.
-- A custom cross-platform IPC transport (Unix domain sockets + Windows
-  named pipes) under `src/daemon/transport/`.
-- Daemon bringup with a state file, `flock`-based spawn-race
-  serialization, and `pid_alive` probing.
-- A capnp toolchain dependency installed by a workspace `xtask`,
-  plumbed through `build.rs` and every CI matrix cell.
-- A `Daemon` and `Tab` CLI subcommand surface aimed at developers.
-- A `current_thread` runtime + `LocalSet` shape for `capnp-rpc`, which
-  is already biting an integration test (`#[ignore]`'d due to a
-  `Promise::from_future + nested tokio::spawn` deadlock).
-- An "upgrade" problem the tool didn't have before: `brew upgrade`
-  replaces the binary, but a running daemon keeps the old version
-  until something restarts it.
-
-Reviewing the four motivations against the actual workloads
-`browser-control` sees (one human or one agent per terminal, rarely two
-clients hammering a single browser in parallel) makes most of the
-daemon's complexity speculative:
-
-- **(1) Firefox BiDi**: real, but solvable without a daemon. Phase 1's
-  retry-on-collision in `session.new` plus `session.end` on close
-  (commit `1826fd3`) already handles the common case. The Firefox limit
-  is "one BiDi session at a time" — a long-lived daemon-owned session
-  amortizes setup latency, but does not enable parallelism that doesn't
-  otherwise exist.
-- **(2) Stuck renderers**: the actual fix is bounded ops with typed
-  errors. Phase 1's connect-side timeouts on `CdpClient` / `BidiClient`
-  and `PageSession::evaluate_with_timeout` already cover this on the
-  direct path. The daemon adds *recovery* (retry on a fresh tab), but
-  recovery can live in the CLI's session layer just as well.
-- **(3) Named tabs**: useful, but a SQLite-backed name → target_id
-  mapping plus get-or-create-on-invocation gives the same agent contract
-  without a daemon owning in-memory state.
-- **(4) Exclusive lock**: most realistic workloads are already serial
-  per process. Where coordination is needed, the SQLite registry is
-  multiprocess-friendly and can hold a process-lifetime advisory lock.
-
-Two product constraints sharpened the decision:
-
-- **Always proceed** (durable feedback rule): agent-facing tab/session
-  ops must not surface `TabHung` / `TargetCrashed` / `Closed` to the
-  caller. Detect, recreate, retry once, only then escalate. This is a
-  design requirement *independent of* whether a daemon exists — the
-  recovery loop can sit in the CLI as well as in a daemon.
-- **No idle work** (durable feedback rule): the tool must not do work
-  while the user is idle. A daemon by definition holds an upstream CDP
-  WebSocket open, runs an idle-sweep timer, and may keep the browser
-  from entering tab-discard / sleep states. This makes a daemon a
-  *negative* for product behavior, not just an implementation choice.
+- **Always proceed.** Agent-facing tab/session ops must not surface
+  `TabHung` / `TargetCrashed` / `Closed` to the caller — detect, recreate,
+  retry once, only then escalate.
+- **No idle work.** The tool must not do work while the user is idle.
+  Nothing should hold an upstream CDP WebSocket, run sweep timers, or keep
+  the browser from entering tab-discard / sleep states between
+  invocations.
 
 ## Options Considered
 
-### Option A — Ship the daemon as designed
+### Option A — Long-lived daemon with named tabs and a scratch pool
 
-Keep Phase 0 / Phase 1. Accept the capnp toolchain, IPC transport,
-bringup state machine, and forever-cross-platform-daemon-lifecycle
-costs. Take the "no idle work" guarantee off the table.
+Run a per-browser daemon process that owns the upstream CDP/BiDi
+WebSocket for the browser's lifetime. The daemon would:
 
-Rejected: the speculative wins do not pay for the certain costs, and
-the "no idle work" rule rules out the daemon-owned upstream socket and
-idle sweep on product grounds.
+- Subscribe to `Target.*` and `Inspector.targetCrashed` and maintain a
+  per-target liveness map, so a crashed tab fast-fails in-flight ops.
+- Own a pool of `about:blank` scratch tabs and route lock-free ops
+  (`eval`, `fetch`, cookie reads) through them, so user tabs (and
+  therefore iLO-style wedges) are off the default code path entirely.
+- Provide named tabs (`tab open --name X`) with idle GC and LRU recycling
+  on a bounded budget.
+- Hold the single Firefox BiDi session for its lifetime, arbitrating
+  concurrent CLI calls behind it.
+- Expose `LockedSession` for stateful work that needs exclusive access.
+
+CLI ↔ daemon wire over UDS (mac/linux) and Windows Named Pipes, framed
+by Cap'n Proto RPC.
+
+We took this option seriously and prototyped it end-to-end on the
+`daemon-phase-0` branch to measure the actual implementation cost, not
+guess at it. The prototype confirmed the design works and the wins are
+real for the workloads it targets. It also surfaced costs that are
+permanent, not introductory:
+
+- Cap'n Proto schemas plus ~17 000 LOC of generated bindings under
+  `src/generated/`. Schema drift becomes a CI concern; `cargo install`
+  needs the schema compiler unless bindings are committed (which means a
+  contributor regen workflow).
+- A custom cross-platform IPC transport (UDS, Windows Named Pipes) plus
+  a bringup state machine (atomic state file, `flock`-based spawn-race
+  serialization, `pid_alive` probe, stale-socket cleanup).
+- A capnp toolchain dependency installed per-CI-matrix-cell via an
+  `xtask`, plumbed through `build.rs`.
+- A `current_thread` runtime + `LocalSet` shape forced by `capnp-rpc`'s
+  `!Send` types — the prototype already deadlocked one integration test
+  under nested `tokio::spawn` + `Promise::from_future`.
+- A daemon-upgrade problem the tool doesn't have today: `brew upgrade`
+  replaces the binary, but a running daemon keeps the old version until
+  something restarts it. Either every CLI invocation negotiates a version
+  handshake and respawns on mismatch, or the user is told to `daemon
+  stop` after upgrades. Neither is free.
+- A new `Daemon` and `Tab` CLI surface (developer + agent-facing
+  subcommands) with its own permissions, error taxonomy, and docs.
+
+The product constraint that flipped the decision was **No idle work**. A
+daemon by definition holds an upstream CDP WebSocket open, runs an
+idle-sweep timer, and may keep the browser from entering tab-discard /
+sleep states. We could mitigate (`daemon stop --on-idle 5m`, no idle
+sweep, lazy upstream open), but each mitigation walks back one of the
+daemon's wins. At that point we'd be carrying the costs of a daemon for
+diminishing returns.
+
+Re-examining the three motivating failure modes with that constraint:
+
+- **(1) Wedged renderers.** The actual fix is bounded ops with typed
+  errors; a daemon adds *recovery* (retry on a fresh tab), but recovery
+  can live in the CLI's session layer just as well.
+- **(2) Firefox BiDi.** A daemon-owned long-lived session is the most
+  elegant arbitration, but a SQLite advisory lock with `pid_alive` on
+  acquire gives the same correctness without a long-lived process.
+- **(3) Named tabs.** Useful, but a SQLite-backed `name → target_id`
+  mapping plus get-or-create-on-invocation gives the same agent contract
+  without a daemon owning in-memory state.
+
+Rejected: the wins are real but recoverable via direct-path mechanisms,
+and the costs (IPC, capnp toolchain, bringup state machine, upgrade
+dance, lifetime-cross-platform-daemon-care) plus the "no idle work"
+product rule rule it out.
 
 ### Option B — Daemonless direct-CLI path
 
-Keep the Phase 1 robustness primitives that benefit the direct path
-(`evaluate_with_timeout`, connect-side timeouts, `SessionError::TabHung`
-/ `TargetCrashed`). Remove the daemon module, the capnp schemas and
-generated bindings, the IPC transport, the daemon and tab CLI
-subcommands, and the capnp toolchain install. Defer scratch-tab
-recovery and named tabs to follow-up PRs that live in the CLI's session
-layer, backed by the existing SQLite registry.
+No long-lived process. Every CLI invocation opens a fresh upstream
+connection, does its work, and exits. Address the three motivating
+failure modes individually on the direct path:
+
+- **(1) Wedged renderers**: 5 s connect-side timeouts on
+  `CdpClient::connect` / `connect_http` / `BidiClient::connect` so the
+  initial handshake can't hang on a dying browser process or a stale
+  `/devtools/browser/<GUID>`. `PageSession::evaluate_with_timeout` with a
+  typed `SessionError::TabHung { target_id, url, timeout_ms, hint }` so
+  every locked op has a bounded ceiling and the caller sees a structured
+  error instead of a multi-second stall. CLI defaults: `eval` 10 s
+  (override with `--timeout-ms`), `fetch` 60 s, `storage` 10 s,
+  `wait-for-cookie --validate-url` 30 s per iteration.
+- **(2) Firefox BiDi**: `session.end` on close plus retry-on-collision in
+  `session.new` handles the common case today. The remaining race window
+  closes with a SQLite advisory lock (`pid_alive` on acquire), held for
+  the CLI process's lifetime — filed as a follow-up.
+- **(3) Named tabs**: SQLite `tabs` table with sweep-on-read for stale
+  rows, addressable as `<browser>/<name>` — filed as a follow-up.
+
+The recover-once wrapper around scratch-tab ops — the operational
+implementation of the "always proceed" rule — also moves to the CLI's
+session layer as a follow-up.
 
 Accepted.
 
-### Option C — Daemonless, plus the scratch-tab recovery wrapper in this PR
-
-Same as B, but also add the recover-once wrapper around scratch-tab
-ops in this PR so the "always proceed" rule is enforceable today.
-
-Rejected for *this* PR on scope grounds (the user asked for the
-smallest PR that drops the daemon). The recover-once wrapper is a
-real feature, not a side effect of deletion, and it deserves its own
-review. Filed as follow-up below.
-
 ## Decision
 
-Adopt **Option B**. Concretely:
+Adopt **Option B**.
 
-1. **Delete** `src/daemon/`, `src/cli/daemon.rs`, `src/cli/tab.rs`,
-   `schema/*.capnp`, `src/generated/`, the `xtask` workspace member,
-   and the daemon-related CI steps (capnp install, daemon-smoke,
-   schema-drift job).
+Concretely, this ADR captures three things that ship together:
 
-2. **Keep** the Phase 1 robustness work that lives outside the daemon
-   module and benefits the direct path:
+1. **Connection-side timeouts.** 5 s on `CdpClient::connect`,
+   `CdpClient::connect_http`, and `BidiClient::connect`. No CLI codepath
+   can block indefinitely on a dying browser or stale endpoint.
+2. **Bounded ops via `PageSession::evaluate_with_timeout`.** Returns
+   typed `SessionError::TabHung` / `TabCrashed` on expiry. Existing
+   `PageSession::evaluate(...)` remains as a `timeout = None` delegate
+   for back-compat; new callers should bound explicitly.
+3. **Bounded defaults in every direct CLI caller.** `eval` (`--timeout-ms`
+   default 10 000), `fetch` (60 s), `storage` (10 s),
+   `wait-for-cookie --validate-url` (30 s per iteration).
 
-   - 5 s connect timeouts on `CdpClient::connect`, `connect_http`,
-     `BidiClient::connect`.
-   - `PageSession::evaluate_with_timeout` with typed
-     `SessionError::TabHung`.
-   - The bounded CLI eval default (`--timeout-ms 10000`).
-
-3. **Drop** primitives that exist only to feed the daemon:
-
-   - `CdpClient::closed_signal()` (only the daemon watches for
-     upstream-WS close).
-   - `src/cdp/target_registry.rs` (only the daemon attached one).
-
-4. **Defer** the following to follow-up PRs, captured under
-   `## Related → Follow-ups` below:
-
-   - Scratch-tab recover-once wrapper (the operational implementation
-     of the "always proceed" rule).
-   - SQLite-backed named-tab table + the agent-facing `tab` verbs.
-   - SQLite advisory lock for Firefox BiDi single-session arbitration,
-     held for the CLI process's lifetime (no leases, no renewal).
-   - SQLite "on start" cache for `Browser.getVersion` / engine /
-     endpoint, with TTL.
-
-   These are deliberate additive work, not cleanups, and are easier to
-   review in isolation than bundled with the daemon revert.
+The remaining design work — the recover-once wrapper, named-tab table,
+BiDi SQLite lock, and `Browser.getVersion` cache — is deliberate
+additive product work and is filed as follow-ups under
+`Related → Follow-ups` below, each easier to review in isolation than
+bundled with the architectural decision.
 
 ## Consequences
 
 **Wins**
 
-- ~2 000 LOC of hand-written daemon code + ~17 000 LOC of generated
-  capnp bindings removed. No capnp toolchain, no IPC transport, no
-  bringup state machine, no daemon-upgrade dance.
-- "No idle work" becomes a structural property of the tool. Every CLI
-  invocation opens a fresh upstream connection, does its work, and
-  exits. Nothing is running while the user is idle.
-- The CI matrix simplifies (no per-cell capnp install, no
+- "No idle work" is a structural property of the tool. Between CLI
+  invocations there is nothing running — no upstream WebSocket, no
+  sweep timers, no daemon process.
+- `cargo install browser-control` and `brew install` work without a
+  schema compiler, an IPC transport bringup state machine, or a daemon
+  upgrade story.
+- The CI matrix stays narrow (no per-cell capnp install, no
   schema-drift job, no daemon-smoke step).
-- `cargo install browser-control` works on any platform without
-  pre-installing a schema compiler.
+- The 5 s connect timeout and `evaluate_with_timeout` defaults
+  immediately bound the original rabbit-hole bug (wedged renderer →
+  30 s `REQUEST_TIMEOUT`) on every direct-path caller.
 
 **Losses**
 
-- The Phase 1 robustness work that lives *inside* the daemon module is
-  reverted along with the daemon itself: `TabRegistry` (named-tab
-  state machine), the scratch-tab pool, `probe_target`, and the
-  daemon's RPC-layer `eval`. These are explicitly re-introduced in
-  the follow-up PRs above, where they belong to the CLI's session
-  layer instead of an RPC server.
-- The Firefox BiDi "Maximum number of active sessions" failure mode
-  is mitigated, but not yet eliminated by an explicit lock — the
-  Phase 1 retry-on-collision in `session.new` plus `session.end` on
-  close (commit `1826fd3`) is the current defence. The SQLite lock
-  follow-up closes the remaining race window.
 - Until the scratch-tab recover-once wrapper lands, the CLI can still
-  surface `TabHung` to the caller. This is a regression against the
-  "always proceed" rule and is the highest-priority follow-up.
+  surface `TabHung` to the caller. This is a known regression against
+  the "always proceed" rule and is the highest-priority follow-up.
+- The Firefox BiDi "Maximum number of active sessions" failure mode is
+  mitigated (`session.end` on close + retry-on-collision) but not yet
+  eliminated by an explicit lock. The SQLite lock follow-up closes the
+  remaining race window.
+- Agents cannot yet address a tab by stable name across CLI
+  invocations. Until the named-tab table lands, the only addressing
+  mechanisms are `--target <url-regex>` and the most-recently-used
+  tab.
 
 **Non-impact**
 
-- The user-facing CLI surface for shipped subcommands
-  (`list-installed`, `list-running`, `start`, `targets`, `cookies`,
-  `fetch`, `storage`, `eval`, `wait`, `wait-for-cookie`, `set` /
-  `get` / `unset`, `mcp`) is unchanged.
-- The SQLite registry under the OS app-data dir is unchanged. ADR-001
-  remains in force.
+- The shipped CLI surface (`list-installed`, `list-running`, `start`,
+  `targets`, `cookies`, `fetch`, `storage`, `eval`, `wait`,
+  `wait-for-cookie`, `set` / `get` / `unset`, `mcp`) is unchanged
+  except for the new `eval --timeout-ms` flag.
+- The SQLite registry under the OS app-data dir is unchanged.
+  ADR-001 remains in force.
 
 ## Related
 
 - ADR-001 — Rust CLI rewrite (registry shape, lifecycle ownership).
-- Commit `1826fd3` — BiDi: end sessions on close to avoid Firefox
-  "Maximum number of active sessions" (the existing mitigation).
-- Commits `510eac5`, `10404de`, `70e1427` — the Phase 0 / Phase 1
-  daemon work being reverted by this ADR.
 
 ### Follow-ups
 
-- Scratch-tab recover-once wrapper around the default agent ops
-  (`fetch`, `eval` against a daemon-style scratch tab). Implements
-  the "always proceed" rule on the direct path.
-- `tab` CLI subcommand backed by a SQLite `tabs` table with
-  sweep-on-read for stale daemon-created rows (`name`, `target_id`,
-  `last_url`, `last_used_at`, `daemon_created`).
-- SQLite `bidi_lock` row, acquired on first BiDi op, released on
-  `Drop` of a lock guard at process exit. `pid_alive` check on
-  acquire handles the crashed-CLI case.
-- SQLite `browser_cache` row with TTL for `Browser.getVersion`,
+- **Scratch-tab recover-once wrapper** around the default agent ops
+  (`fetch`, `eval` against a daemon-style scratch tab). Implements the
+  "always proceed" rule on the direct path.
+- **`tab` CLI subcommand** backed by a SQLite `tabs` table with
+  sweep-on-read for stale rows (`name`, `target_id`, `last_url`,
+  `last_used_at`, `daemon_created`). Stable tab identity across CLI
+  invocations.
+- **SQLite `bidi_lock` row**, acquired on first BiDi op, released on
+  `Drop` of a lock guard at process exit. `pid_alive` check on acquire
+  handles the crashed-CLI case. Closes the Firefox BiDi race window.
+- **SQLite `browser_cache` row** with TTL for `Browser.getVersion`,
   engine, and WS endpoint — eliminates per-invocation probes.
