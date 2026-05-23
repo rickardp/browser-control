@@ -18,16 +18,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::cdp::CdpClient;
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
-use crate::detect::Engine;
 use crate::dom::scripts::FETCH_JS;
-use crate::errors::SessionError;
 use crate::registry::Registry;
+use crate::session::backend::open_backend;
 use crate::session::{tabs as session_tabs, PageSession};
-
-use std::sync::Arc;
 
 /// Per-call timeout for the JS fetch executed inside the page. Generous —
 /// real HTTP fetches over slow networks legitimately take many seconds —
@@ -79,19 +75,14 @@ pub async fn run(
 
     let result = match (tab_name, target.as_deref()) {
         // Path 1: <browser>/<tab> — fetch against the named tab.
+        // Engine-agnostic via TabBackend.
         (Some(name), None) => {
             let browser_name = match &resolved.source {
                 Source::Registered { name } => name.clone(),
                 _ => bail!("named tabs (`<browser>/<name>`) require a registered browser"),
             };
-            if resolved.engine == Engine::Bidi {
-                bail!(
-                    "named tabs are not yet supported for BiDi (Firefox); \
-                     use `--target <url-regex>` to select a context"
-                );
-            }
-            let client = Arc::new(open_cdp(&resolved.endpoint).await?);
-            let row = session_tabs::resolve_tab(&client, &registry, &browser_name, &name)
+            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+            let row = session_tabs::resolve_tab(&backend, &registry, &browser_name, &name)
                 .await?
                 .ok_or_else(|| {
                     anyhow!(
@@ -99,9 +90,9 @@ pub async fn run(
                          — run `browser-control tab open {browser_name}/{name}` first"
                     )
                 })?;
-            let value = eval_in_target(&client, &row.target_id, &expr, FETCH_TIMEOUT).await;
-            drop(client);
-            value?
+            backend
+                .evaluate(&row.target_id, &expr, true, FETCH_TIMEOUT)
+                .await?
         }
         // Path 2: --target regex (legacy).
         (None, Some(regex)) => {
@@ -275,63 +266,6 @@ fn strip_tab(raw: &str, tab: Option<&str>) -> String {
             .unwrap_or(raw)
             .to_string(),
         None => raw.to_string(),
-    }
-}
-
-/// Attach a transient CDP session to `target_id`, run `Runtime.evaluate`,
-/// detach. Used by the `<browser>/<tab>` fetch path. Returns the raw
-/// `result.value` (the FETCH_JS envelope as a JSON string).
-async fn eval_in_target(
-    client: &CdpClient,
-    target_id: &str,
-    expression: &str,
-    timeout: Duration,
-) -> Result<Value> {
-    let attach = client
-        .send(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-        )
-        .await?;
-    let session_id = attach
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Target.attachToTarget returned no sessionId"))?
-        .to_string();
-    let inner = client.send_with_session(
-        "Runtime.evaluate",
-        json!({
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": true,
-        }),
-        Some(&session_id),
-    );
-    let value = match tokio::time::timeout(timeout, inner).await {
-        Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(SessionError::TabHung {
-            target_id: Some(target_id.to_string()),
-            url: None,
-            timeout_ms: timeout.as_millis() as u64,
-            hint: "op-timeout",
-        }
-        .into()),
-    };
-    let _ = client
-        .send(
-            "Target.detachFromTarget",
-            json!({ "sessionId": session_id }),
-        )
-        .await;
-    value
-}
-
-async fn open_cdp(endpoint: &str) -> Result<CdpClient> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        CdpClient::connect(endpoint).await
-    } else {
-        CdpClient::connect_http(endpoint).await
     }
 }
 

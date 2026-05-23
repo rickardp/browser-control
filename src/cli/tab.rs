@@ -12,10 +12,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use serde_json::json;
 
-use crate::cdp::CdpClient;
 use crate::cli::env_resolver;
-use crate::cli::mcp::resolve_browser;
+use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
 use crate::registry::{Registry, TabRow};
+use crate::session::backend::open_backend;
 use crate::session::tabs as session_tabs;
 
 #[derive(Subcommand, Debug)]
@@ -85,9 +85,9 @@ async fn open(positional: &str, url: &str, fallback_name: Option<&str>, json: bo
         }
     };
 
-    let client = open_cdp(&resolved.endpoint).await?;
-    let row = session_tabs::tab_open(&client, &registry, &browser_name, name, url_opt).await?;
-    client.close().await;
+    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+    let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+    let row = session_tabs::tab_open(&backend, &registry, &browser_name, name, url_opt).await?;
     print_summary(&row, json);
     Ok(())
 }
@@ -111,9 +111,9 @@ async fn list(positional: &str, json: bool) -> Result<()> {
             ));
         }
     };
-    let client = open_cdp(&resolved.endpoint).await?;
-    let rows = session_tabs::tab_list(&client, &registry, &browser_name).await?;
-    client.close().await;
+    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+    let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+    let rows = session_tabs::tab_list(&backend, &registry, &browser_name).await?;
 
     if json {
         let arr: Vec<_> = rows.iter().map(tab_to_json).collect();
@@ -164,14 +164,4 @@ fn reassemble_browser_only(positional: &str) -> Result<String> {
         }
     }
     Ok(positional.to_string())
-}
-
-/// Open a CDP browser-level client for tab orchestration. Tries `ws://`
-/// directly, then falls back to HTTP discovery via `/json/version`.
-async fn open_cdp(endpoint: &str) -> Result<CdpClient> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        CdpClient::connect(endpoint).await
-    } else {
-        CdpClient::connect_http(endpoint).await
-    }
 }

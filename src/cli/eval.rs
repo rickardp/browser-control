@@ -3,29 +3,30 @@
 //! Three routing paths, picked by what the caller supplies:
 //!
 //! 1. **`eval <browser>/<tab>`** — named-tab path. Resolves `<tab>` in the
-//!    `tabs` SQLite table; if missing, returns `TabNotFound` so the agent
-//!    can `tab open <browser>/<tab>` first. Mutually exclusive with
-//!    `--target`.
+//!    `tabs` SQLite table via the engine-agnostic [`TabBackend`]; if
+//!    missing, returns `TabNotFound` so the agent can
+//!    `tab open <browser>/<tab>` first. Mutually exclusive with
+//!    `--target`. Works for both CDP and BiDi browsers.
 //! 2. **`eval <browser>` with no `--target`** — routes through the
 //!    daemon-style scratch tab with recover-once. The default, and the
 //!    architectural fix for the iLO failure mode: lock-free `eval`
-//!    never silently lands on a user's admin tab.
+//!    never silently lands on a user's admin tab. Engine-agnostic.
 //! 3. **`eval <browser> --target <regex>`** — explicit selector against
 //!    a user tab matching the URL regex. The original behaviour, kept
 //!    for ad-hoc targeted use.
+//!
+//! All three paths share the BiDi single-session lock when the resolved
+//! browser is on the BiDi engine.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use crate::cdp::CdpClient;
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
-use crate::detect::Engine;
-use crate::errors::SessionError;
 use crate::registry::Registry;
+use crate::session::backend::open_backend;
 use crate::session::{tabs as session_tabs, with_scratch_recovery, PageSession};
 
 pub async fn run(
@@ -67,7 +68,7 @@ pub async fn run(
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
 
     let value = match (tab_name, target) {
-        // Path 1: <browser>/<tab> — named tab via SQLite resolver.
+        // Path 1: <browser>/<tab> — named tab, engine-agnostic.
         (Some(name), None) => {
             let browser_name = match &resolved.source {
                 Source::Registered { name } => name.clone(),
@@ -76,18 +77,8 @@ pub async fn run(
                      external endpoints can't carry tab names"
                 ),
             };
-            // Named-tab routing is CDP-only in this PR. BiDi callers that
-            // want a named tab should use the legacy `--target` regex for
-            // now; a BiDi-flavoured equivalent (resolving via
-            // `browsingContext`) is a future addition.
-            if resolved.engine == Engine::Bidi {
-                bail!(
-                    "named tabs are not yet supported for BiDi (Firefox); \
-                     use `--target <url-regex>` to select a context"
-                );
-            }
-            let client = Arc::new(open_cdp(&resolved.endpoint).await?);
-            let row = session_tabs::resolve_tab(&client, &registry, &browser_name, &name)
+            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+            let row = session_tabs::resolve_tab(&backend, &registry, &browser_name, &name)
                 .await?
                 .ok_or_else(|| {
                     anyhow!(
@@ -95,17 +86,17 @@ pub async fn run(
                          — run `browser-control tab open {browser_name}/{name}` first"
                     )
                 })?;
-            let value =
-                eval_in_target(&client, &row.target_id, &expression, await_promise, timeout).await;
-            drop(client);
-            value?
+            backend
+                .evaluate(&row.target_id, &expression, await_promise, timeout)
+                .await?
         }
-        // Path 2: bare browser, no `--target` → scratch (CDP) or legacy
-        // (BiDi / external endpoints).
+        // Path 2: bare browser, no `--target` → scratch tab with
+        // recover-once. Engine-agnostic via TabBackend.
         (None, None) => {
-            // BiDi or external: scratch tab plumbing is CDP-only. Fall
-            // back to the existing direct attach.
-            if resolved.engine == Engine::Bidi || matches!(resolved.source, Source::External) {
+            if matches!(resolved.source, Source::External) {
+                // External URL endpoints don't have a registered name to
+                // key the scratch row by. Fall back to the legacy direct
+                // attach so `eval ws://...` still works.
                 let session =
                     PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
                 let value = session
@@ -114,46 +105,17 @@ pub async fn run(
                 session.close().await;
                 value?
             } else {
-                // CDP registered: scratch tab with recover-once.
                 let browser_name = match &resolved.source {
                     Source::Registered { name } => name.clone(),
                     _ => unreachable!("Source::External branch handled above"),
                 };
-                let client = Arc::new(open_cdp(&resolved.endpoint).await?);
+                let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
                 let expr = expression.clone();
-                let value = with_scratch_recovery(
-                    client.clone(),
-                    &registry,
-                    &browser_name,
-                    move |c, session_id, _target_id| {
-                        let expr = expr.clone();
-                        async move {
-                            let inner = c.send_with_session(
-                                "Runtime.evaluate",
-                                json!({
-                                    "expression": expr,
-                                    "returnByValue": true,
-                                    "awaitPromise": await_promise,
-                                }),
-                                Some(&session_id),
-                            );
-                            match tokio::time::timeout(timeout, inner).await {
-                                Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
-                                Ok(Err(e)) => Err(e),
-                                Err(_) => Err(SessionError::TabHung {
-                                    target_id: None,
-                                    url: None,
-                                    timeout_ms: timeout.as_millis() as u64,
-                                    hint: "op-timeout",
-                                }
-                                .into()),
-                            }
-                        }
-                    },
-                )
-                .await;
-                drop(client);
-                value?
+                with_scratch_recovery(&backend, &registry, &browser_name, move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, await_promise, timeout).await }
+                })
+                .await?
             }
         }
         // Path 3: bare browser, --target regex → legacy selector.
@@ -173,77 +135,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Run `Runtime.evaluate` against a known `target_id` (after attaching a
-/// transient session). Used by the `<browser>/<tab>` path.
-async fn eval_in_target(
-    client: &CdpClient,
-    target_id: &str,
-    expression: &str,
-    await_promise: bool,
-    timeout: Duration,
-) -> Result<Value> {
-    let attach = client
-        .send(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-        )
-        .await?;
-    let session_id = attach
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Target.attachToTarget returned no sessionId"))?
-        .to_string();
-    let inner = client.send_with_session(
-        "Runtime.evaluate",
-        json!({
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": await_promise,
-        }),
-        Some(&session_id),
-    );
-    let value = match tokio::time::timeout(timeout, inner).await {
-        Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(SessionError::TabHung {
-            target_id: Some(target_id.to_string()),
-            url: None,
-            timeout_ms: timeout.as_millis() as u64,
-            hint: "op-timeout",
-        }
-        .into()),
-    };
-    let _ = client
-        .send(
-            "Target.detachFromTarget",
-            json!({ "sessionId": session_id }),
-        )
-        .await;
-    value
-}
-
-async fn open_cdp(endpoint: &str) -> Result<CdpClient> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        CdpClient::connect(endpoint).await
-    } else {
-        CdpClient::connect_http(endpoint).await
-    }
-}
-
-/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
-fn strip_tab(raw: &str, tab: Option<&str>) -> String {
-    match tab {
-        Some(name) => {
-            // The tab is everything after the first `/`. Slice off
-            // `/<name>` to recover the original browser part. We don't
-            // re-parse to avoid the cost.
-            let suffix = format!("/{name}");
-            raw.strip_suffix(&suffix).unwrap_or(raw).to_string()
-        }
-        None => raw.to_string(),
-    }
-}
-
 fn format_output(v: &Value, json: bool) -> String {
     if json {
         serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
@@ -251,6 +142,17 @@ fn format_output(v: &Value, json: bool) -> String {
         s.to_string()
     } else {
         serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+    }
+}
+
+/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
+fn strip_tab(raw: &str, tab: Option<&str>) -> String {
+    match tab {
+        Some(name) => raw
+            .strip_suffix(&format!("/{name}"))
+            .unwrap_or(raw)
+            .to_string(),
+        None => raw.to_string(),
     }
 }
 
@@ -291,7 +193,6 @@ mod tests {
         assert_eq!(format_output(&json!(true), false), "true");
     }
 
-    // Mock CDP round-trip test mirroring src/session/attach.rs tests.
     use crate::detect::Engine;
     use crate::session::PageSession;
     use futures_util::{SinkExt, StreamExt};

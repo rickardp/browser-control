@@ -214,11 +214,16 @@ bundled with the architectural decision.
   sweep-on-read for stale rows (`name`, `target_id`, `last_url`,
   `last_used_at`, `daemon_created`). Stable tab identity across CLI
   invocations.
-  **Status:** landed. `src/cli/tab.rs` exposes `tab open` and
-  `tab list`; every other command's `<browser>` positional accepts the
-  unified `<browser>/<name>` path syntax (via `parse_target` in
-  `env_resolver.rs`). Soft cap deferred; hard cap 50 with LRU close on
-  budget pressure.
+  **Status:** landed, engine-agnostic. `src/cli/tab.rs` exposes
+  `tab open` and `tab list`; every other command's `<browser>` positional
+  accepts the unified `<browser>/<name>` path syntax (via `parse_target`
+  in `env_resolver.rs`). Soft cap deferred; hard cap 50 with LRU close on
+  budget pressure. The `tabs` table and the named-tab/scratch
+  orchestration store engine-opaque ids: CDP `targetId` and BiDi
+  `context` use the same column, dispatched by the [`TabBackend`] enum in
+  `src/session/backend.rs` (`Target.*` vs `browsingContext.*`). Chromium
+  and Firefox share the same SQL, the same CLI surface, and the same
+  agent contract.
 - **SQLite `bidi_lock` row**, acquired on first BiDi op, released on
   `Drop` of a lock guard at process exit. `pid_alive` check on acquire
   handles the crashed-CLI case. Closes the Firefox BiDi race window.

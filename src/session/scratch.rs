@@ -15,28 +15,25 @@
 //!    scratch and retries the op once before escalating typed errors.
 //!    This implements the "always proceed" rule on the direct path.
 
-use std::sync::Arc;
-
 use anyhow::Result;
-use serde_json::json;
 
-use crate::cdp::CdpClient;
 use crate::errors::SessionError;
 use crate::registry::Registry;
+use crate::session::backend::TabBackend;
 
 /// Run `op` against the daemon-style scratch tab for `browser_name`, with
 /// one round of recover-and-retry on tab failures.
 ///
-/// The op receives an active `(session_id, target_id)` pair and is
-/// expected to return whatever the caller cares about. On a structured
-/// failure that suggests the scratch tab is dead (`TabHung`,
-/// `TabCrashed`, or a CDP "No target with given id" / "Session is gone"
-/// protocol error), the wrapper:
+/// The op receives the [`TabBackend`] and the live scratch `target_id`
+/// and is expected to drive whatever protocol calls it needs. On a
+/// structured failure that suggests the scratch tab is dead (`TabHung`,
+/// `TabCrashed`, or a CDP/BiDi "no target / no context" protocol error),
+/// the wrapper:
 ///
-/// 1. Best-effort closes the dead target via `Target.closeTarget`.
+/// 1. Best-effort closes the dead tab (`Target.closeTarget` on CDP,
+///    `browsingContext.close` on BiDi — handled by [`TabBackend`]).
 /// 2. Deletes the SQLite scratch row.
-/// 3. Creates a fresh `about:blank` via `Target.createTarget` and
-///    upserts the new row.
+/// 3. Creates a fresh tab via the backend and upserts the new row.
 /// 4. Retries `op` once. If the retry also fails, escalates the typed
 ///    error to the caller.
 ///
@@ -44,13 +41,13 @@ use crate::registry::Registry;
 /// then `TabHung`") — a second failure usually means the browser itself
 /// is sick, and unbounded retries would mask that.
 pub async fn with_scratch_recovery<F, T, Fut>(
-    client: Arc<CdpClient>,
+    backend: &TabBackend,
     registry: &Registry,
     browser_name: &str,
     mut op: F,
 ) -> Result<T>
 where
-    F: FnMut(Arc<CdpClient>, String, String) -> Fut,
+    F: FnMut(TabBackend, String) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     // Resolve the scratch target id to use for attempt 1: reuse the existing
@@ -58,13 +55,13 @@ where
     let attempt_one_target = match registry.scratch_get(browser_name)? {
         Some(row) => row.target_id,
         None => {
-            let new_target = create_blank(&client).await?;
+            let new_target = backend.create_tab("about:blank").await?;
             registry.scratch_upsert(browser_name, &new_target)?;
             new_target
         }
     };
 
-    match attach_and_run(client.clone(), &attempt_one_target, &mut op).await {
+    match op(backend.clone(), attempt_one_target.clone()).await {
         Ok(value) => {
             let _ = registry.scratch_touch(browser_name);
             return Ok(value);
@@ -72,66 +69,20 @@ where
         Err(e) if is_scratch_failure(&e) => {
             // Scratch tab is wedged / dead / vanished. Tear down + recreate +
             // single retry. Fall through.
-            let _ = close_target(&client, &attempt_one_target).await;
+            let _ = backend.close_tab(&attempt_one_target).await;
             registry.scratch_delete(browser_name)?;
         }
         Err(e) => return Err(e),
     }
 
     // Attempt 2: fresh scratch tab. If this one also fails, escalate.
-    let new_target = create_blank(&client).await?;
+    let new_target = backend.create_tab("about:blank").await?;
     registry.scratch_upsert(browser_name, &new_target)?;
-    let result = attach_and_run(client.clone(), &new_target, &mut op).await;
+    let result = op(backend.clone(), new_target).await;
     if result.is_ok() {
         let _ = registry.scratch_touch(browser_name);
     }
     result
-}
-
-/// Attach a CDP session to `target_id`, run `op`, detach. Surfaces the
-/// op's `Result` verbatim so the caller can pattern-match `SessionError`.
-async fn attach_and_run<F, T, Fut>(client: Arc<CdpClient>, target_id: &str, op: &mut F) -> Result<T>
-where
-    F: FnMut(Arc<CdpClient>, String, String) -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let attach = client
-        .send(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-        )
-        .await?;
-    let session_id = attach
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Target.attachToTarget returned no sessionId"))?
-        .to_string();
-    let result = op(client.clone(), session_id.clone(), target_id.to_string()).await;
-    // Detach best-effort; failures here don't change the outcome.
-    let _ = client
-        .send(
-            "Target.detachFromTarget",
-            json!({ "sessionId": session_id }),
-        )
-        .await;
-    result
-}
-
-async fn create_blank(client: &CdpClient) -> Result<String> {
-    let v = client
-        .send("Target.createTarget", json!({ "url": "about:blank" }))
-        .await?;
-    v.get("targetId")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("Target.createTarget returned no targetId"))
-}
-
-async fn close_target(client: &CdpClient, target_id: &str) -> Result<()> {
-    let _ = client
-        .send("Target.closeTarget", json!({ "targetId": target_id }))
-        .await?;
-    Ok(())
 }
 
 /// Does this error suggest the scratch tab is dead and we should retry on
@@ -140,9 +91,9 @@ async fn close_target(client: &CdpClient, target_id: &str) -> Result<()> {
 /// - `SessionError::TabHung` — per-op timeout fired with no reply. Catches
 ///   the wedged-renderer case (iLO and friends).
 /// - `SessionError::TabCrashed` — renderer crash event reached us.
-/// - CDP protocol errors mentioning a missing target/session — the stored
-///   `target_id` no longer exists in the browser (typical after a browser
-///   restart between CLI invocations).
+/// - CDP/BiDi protocol errors mentioning a missing target/session/context
+///   — the stored `target_id` no longer exists in the browser (typical
+///   after a browser restart between CLI invocations).
 fn is_scratch_failure(err: &anyhow::Error) -> bool {
     if let Some(se) = err.downcast_ref::<SessionError>() {
         return matches!(
@@ -151,18 +102,26 @@ fn is_scratch_failure(err: &anyhow::Error) -> bool {
         );
     }
     let msg = format!("{err:#}").to_ascii_lowercase();
+    // CDP-shaped errors.
     msg.contains("no target with given id")
         || msg.contains("session is gone")
         || msg.contains("no session with given id")
         || msg.contains("target closed")
+        // BiDi-shaped errors (per W3C WebDriver BiDi).
+        || msg.contains("no such frame")
+        || msg.contains("no such node")
+        || msg.contains("no such context")
+        || msg.contains("invalid session id")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdp::CdpClient;
     use futures_util::{SinkExt, StreamExt};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -249,38 +208,27 @@ mod tests {
         }
     }
 
-    /// Op closure that runs `Runtime.evaluate("1")` against the given
-    /// session with a tight timeout, mirroring what a real lock-free
-    /// op would do.
-    async fn eval_op(
-        client: Arc<CdpClient>,
-        session_id: String,
-        _target_id: String,
-    ) -> Result<Value> {
-        let inner = client.send_with_session(
-            "Runtime.evaluate",
-            json!({"expression": "1", "returnByValue": true, "awaitPromise": false}),
-            Some(&session_id),
-        );
-        match tokio::time::timeout(std::time::Duration::from_millis(200), inner).await {
-            Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(SessionError::TabHung {
-                target_id: None,
-                url: None,
-                timeout_ms: 200,
-                hint: "test",
-            }
-            .into()),
-        }
+    /// Op closure that runs an engine-agnostic `evaluate("1")` against
+    /// the given scratch target with a tight timeout, mirroring what a
+    /// real lock-free op would do.
+    async fn eval_op(backend: TabBackend, target_id: String) -> Result<Value> {
+        backend
+            .evaluate(
+                &target_id,
+                "1",
+                false,
+                std::time::Duration::from_millis(200),
+            )
+            .await
     }
 
     #[tokio::test]
     async fn first_call_creates_scratch_and_returns_value() {
         let (url, create_count, _stop) = spawn_mock(EvalBehaviour::Always).await;
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let backend = TabBackend::Cdp(client);
         let reg = Registry::open_in_memory().unwrap();
-        let v = with_scratch_recovery(client, &reg, "brave-twilight", eval_op)
+        let v = with_scratch_recovery(&backend, &reg, "brave-twilight", eval_op)
             .await
             .unwrap();
         assert_eq!(v, json!(42));
@@ -293,11 +241,12 @@ mod tests {
     async fn second_call_reuses_scratch_row() {
         let (url, create_count, _stop) = spawn_mock(EvalBehaviour::Always).await;
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let backend = TabBackend::Cdp(client);
         let reg = Registry::open_in_memory().unwrap();
-        with_scratch_recovery(client.clone(), &reg, "b", eval_op)
+        with_scratch_recovery(&backend, &reg, "b", eval_op)
             .await
             .unwrap();
-        with_scratch_recovery(client, &reg, "b", eval_op)
+        with_scratch_recovery(&backend, &reg, "b", eval_op)
             .await
             .unwrap();
         assert_eq!(
@@ -313,8 +262,9 @@ mod tests {
     async fn recovers_after_one_wedge() {
         let (url, create_count, _stop) = spawn_mock(EvalBehaviour::Wedge(1)).await;
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let backend = TabBackend::Cdp(client);
         let reg = Registry::open_in_memory().unwrap();
-        let v = with_scratch_recovery(client, &reg, "b", eval_op)
+        let v = with_scratch_recovery(&backend, &reg, "b", eval_op)
             .await
             .unwrap();
         assert_eq!(v, json!(42));
@@ -333,8 +283,9 @@ mod tests {
     async fn escalates_after_second_wedge() {
         let (url, create_count, _stop) = spawn_mock(EvalBehaviour::Wedge(99)).await;
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let backend = TabBackend::Cdp(client);
         let reg = Registry::open_in_memory().unwrap();
-        let err = with_scratch_recovery(client, &reg, "b", eval_op)
+        let err = with_scratch_recovery(&backend, &reg, "b", eval_op)
             .await
             .expect_err("must escalate");
         let typed = err

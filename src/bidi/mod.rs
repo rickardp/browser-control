@@ -197,6 +197,49 @@ impl BidiClient {
         .await
     }
 
+    /// `browsingContext.create({type: "tab"})` — opens a fresh top-level
+    /// browsing context. If `url` is non-empty, navigates after create so
+    /// the returned context lands at the desired URL.
+    pub async fn browsing_context_create(&self, url: &str) -> Result<String> {
+        let v = self
+            .send("browsingContext.create", json!({"type": "tab"}))
+            .await?;
+        let context = v["context"]
+            .as_str()
+            .ok_or_else(|| anyhow!("browsingContext.create returned no context"))?
+            .to_string();
+        if !url.is_empty() && url != "about:blank" {
+            self.browsing_context_navigate(&context, url).await?;
+        }
+        Ok(context)
+    }
+
+    /// `browsingContext.close({context})`. Idempotent against an already-
+    /// closed context (BiDi returns an error but the caller's intent is
+    /// satisfied).
+    pub async fn browsing_context_close(&self, context: &str) -> Result<()> {
+        let _ = self
+            .send("browsingContext.close", json!({"context": context}))
+            .await;
+        Ok(())
+    }
+
+    /// `browsingContext.getTree()` flattened to a set of all live top-level
+    /// context ids. Used by the engine-agnostic tab registry for
+    /// sweep-on-read.
+    pub async fn browsing_context_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let v = self.send("browsingContext.getTree", json!({})).await?;
+        let contexts = v
+            .get("contexts")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(contexts
+            .iter()
+            .filter_map(|c| c.get("context").and_then(|x| x.as_str()).map(String::from))
+            .collect())
+    }
+
     pub async fn script_evaluate(&self, context: &str, expression: &str) -> Result<Value> {
         self.send(
             "script.evaluate",
