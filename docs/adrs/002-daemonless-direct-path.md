@@ -209,7 +209,12 @@ bundled with the architectural decision.
   **Status:** landed. `src/session/scratch.rs` +
   `src/registry/scratches.rs`. The default `eval <browser>` (no
   `--target`) routes through the scratch tab with one-shot recovery
-  on `TabHung` / `TabCrashed` / "no target" protocol errors.
+  on `TabHung` / `TabCrashed` / "no target" protocol errors. **Named
+  tabs** got the same recover-once contract via
+  `with_named_tab_recovery` in `src/session/tabs.rs`: a tab that dies
+  between `resolve_tab` and the op is closed + recreated under the
+  same name and the op retries once, otherwise typed
+  `SessionError::TabNotFound` / `TabHung` is surfaced.
 - **`tab` CLI subcommand** backed by a SQLite `tabs` table with
   sweep-on-read for stale rows (`name`, `target_id`, `last_url`,
   `last_used_at`, `daemon_created`). Stable tab identity across CLI
@@ -227,14 +232,71 @@ bundled with the architectural decision.
 - **SQLite `bidi_lock` row**, acquired on first BiDi op, released on
   `Drop` of a lock guard at process exit. `pid_alive` check on acquire
   handles the crashed-CLI case. Closes the Firefox BiDi race window.
-  **Status:** landed. `src/registry/bidi_lock.rs`. CLI commands that
-  resolve a registered BiDi browser acquire via
+  **Status:** landed, fully spread. `src/registry/bidi_lock.rs`. Every
+  CLI command that opens a BiDi session acquires via
   `acquire_bidi_lock_if_needed` (30 s default wait, typed
-  `BidiLockBusy` on timeout). Wired into `eval` and `fetch`; other
-  BiDi-capable commands inherit the existing
-  `session.end`-on-close + retry-on-collision mitigation and gain the
-  lock in a follow-up.
+  `BidiLockBusy` on timeout): `eval`, `fetch`, `cookies`, `storage`,
+  `wait-for-cookie`, `tab open`, `tab list`. `wait` skips the lock
+  (HTTP probe only, no `session.new`). The MCP server acquires lazily
+  on the first tool call via `ServerState::ensure_bidi_lock` and holds
+  for the server's lifetime, so concurrent MCP servers and CLI
+  invocations against the same Firefox can't race on `session.new`.
 - **SQLite `browser_cache` row** with TTL for `Browser.getVersion`,
   engine, and WS endpoint — eliminates per-invocation probes.
   **Status:** still deferred. Revisit when profiling shows per-invocation
   probe cost matters.
+
+- **Typed `SessionError::TabNotFound`**. **Status:** landed. Added next
+  to `TabHung` / `TabCrashed` so the CLI, MCP tools, and tests can
+  pattern-match instead of parsing strings. Carries `browser` + `name`
+  for the diagnostic message.
+
+- **`fetch --timeout-ms`** to bound the in-page JS fetch. **Status:**
+  landed. Default 60 000 ms (same as the previous hard-coded value).
+  `eval`, `fetch`, and `storage` ops now all honour a `timeout_ms`;
+  `wait-for-cookie --validate-url` keeps its inner 30 s bound.
+
+- **Engine-agnostic `<browser>/<tab>` syntax** across every command
+  that takes a `<browser>` positional. **Status:** wired into `eval`,
+  `fetch`, `tab open`, `tab list`. `--name` flag on `tab open` is gone
+  — the positional `<browser>/<name>` is the only form. `storage`
+  keeps its `--target <regex>` selector by design (path syntax would
+  be redundant); `cookies` / `wait-for-cookie` are browser-wide and
+  don't take a tab.
+
+- **`tab list --all`** merges the named-tab registry with every live
+  top-level tab in the browser (unregistered tabs surface with empty
+  `name`, `owner = "unnamed"`). Replaces the design intent of a
+  separate `tab adopt` verb: agents discover the id of a
+  user-opened tab via `tab list --all`, then drive it by id (future
+  follow-up: bind id → name without creating a new tab).
+
+- **Structured routing trace per command**. **Status:** landed.
+  `src/cli/trace.rs::CommandTrace` emits one `tracing::info!` line per
+  CLI dispatch on `target=browser_control::cli` with fixed fields:
+  `command, browser, engine, route, tab_name, target_id, elapsed_ms,
+  outcome, err`. Agents and operators tail stderr with
+  `BROWSER_CONTROL_LOG=info` (the default). Wired into `eval`,
+  `fetch`, `tab open`, `tab list`, `cookies`, `storage` (sub-command
+  granularity), `wait`, `wait-for-cookie`.
+
+- **MCP server BiDi lock**. **Status:** landed. The MCP server
+  acquires the SQLite BiDi lock lazily on first tool call via
+  `ServerState::ensure_bidi_lock`, holds for its lifetime, releases on
+  process exit. Closes the cross-process Firefox race for MCP-driven
+  workloads.
+
+- **MCP scratch routing + named-tab integration for tool handlers**.
+  **Status:** deferred. The MCP read-only tools (`get_dom`, `fetch`,
+  `screenshot`, `select_element`) still call `attach_active` →
+  `PageSession::attach(..., None)`, which selects the first page in
+  `Target.getTargets` order — the iLO failure mode is reachable via
+  MCP. Migration requires extending `TabBackend` with `screenshot`,
+  adding a "specific BiDi context" attach path in `PageSession`, and
+  rewriting each tool handler. Filed as a future follow-up so the MCP
+  surface gets its own review.
+
+- **Engine override `--engine <cdp|bidi>`** and **synthesized
+  named-tab keys for external `ws://` endpoints**: open design
+  questions noted during the trade-off review; intentionally not in
+  scope for this PR.

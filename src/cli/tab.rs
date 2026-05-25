@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::cli::env_resolver;
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::registry::{Registry, TabRow};
 use crate::session::backend::open_backend;
 use crate::session::tabs as session_tabs;
@@ -24,24 +25,27 @@ pub enum TabCmd {
     /// `<browser>/<name>` returns the existing tab (navigating if `url`
     /// differs from `last_url`).
     Open {
-        /// `<browser>` or `<browser>/<name>`. With no name, the daemon
-        /// assigns a cute name (`tab-<word>`) and creates fresh.
+        /// `<browser>` or `<browser>/<name>`. With no `/<name>`, the
+        /// daemon assigns a cute name (`tab-<word>`) and creates fresh.
         browser: String,
         /// Optional initial URL. Defaults to `about:blank`.
         #[arg(default_value = "")]
         url: String,
-        /// Stable name override (when the positional doesn't include `/<name>`).
-        /// If both forms are supplied, the positional wins.
-        #[arg(long)]
-        name: Option<String>,
         /// Emit JSON instead of the one-line text summary.
         #[arg(long)]
         json: bool,
     },
-    /// List every named tab the registry knows for `<browser>`. Sweeps
-    /// rows whose `target_id` is no longer in the live browser.
+    /// List tabs for `<browser>`.
+    ///
+    /// By default returns rows in the named-tab registry (those agents
+    /// opened explicitly via `tab open`). With `--all`, returns every
+    /// live top-level tab in the browser — registered rows merged with
+    /// unnamed user tabs (name column empty for the unnamed ones).
     List {
         browser: String,
+        /// Include every live tab in the browser, not just registered names.
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         json: bool,
     },
@@ -49,29 +53,33 @@ pub enum TabCmd {
 
 pub async fn run(cmd: TabCmd) -> Result<()> {
     match cmd {
-        TabCmd::Open {
-            browser,
-            url,
-            name,
-            json,
-        } => open(&browser, &url, name.as_deref(), json).await,
-        TabCmd::List { browser, json } => list(&browser, json).await,
+        TabCmd::Open { browser, url, json } => {
+            let mut trace = CommandTrace::new("tab-open");
+            match open(&browser, &url, json, &mut trace).await {
+                Ok(()) => {
+                    trace.ok(());
+                    Ok(())
+                }
+                Err(e) => Err(trace.err(e)),
+            }
+        }
+        TabCmd::List { browser, all, json } => {
+            let mut trace = CommandTrace::new("tab-list");
+            match list(&browser, all, json, &mut trace).await {
+                Ok(()) => {
+                    trace.ok(());
+                    Ok(())
+                }
+                Err(e) => Err(trace.err(e)),
+            }
+        }
     }
 }
 
-async fn open(positional: &str, url: &str, fallback_name: Option<&str>, json: bool) -> Result<()> {
+async fn open(positional: &str, url: &str, json: bool, trace: &mut CommandTrace) -> Result<()> {
     let target = env_resolver::parse_target(positional)
         .with_context(|| format!("parsing `{positional}` as <browser>[/<tab>]"))?;
-    let name = match (target.tab.as_deref(), fallback_name) {
-        (Some(p), _) => Some(p), // positional wins
-        (None, Some(f)) => {
-            // Validate even when supplied via flag, so error shape matches
-            // path-style usage.
-            env_resolver::validate_tab_name(f)?;
-            Some(f)
-        }
-        (None, None) => None,
-    };
+    let name = target.tab.as_deref();
     let url_opt = if url.is_empty() { None } else { Some(url) };
 
     let registry = Registry::open()?;
@@ -85,14 +93,25 @@ async fn open(positional: &str, url: &str, fallback_name: Option<&str>, json: bo
         }
     };
 
+    trace.browser(&browser_name).engine(resolved.engine);
+    if let Some(n) = name {
+        trace.tab_name(n);
+    }
+    trace.route("tab-open");
+
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
     let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
     let row = session_tabs::tab_open(&backend, &registry, &browser_name, name, url_opt).await?;
+    trace.target_id(&row.target_id);
+    if name.is_none() {
+        // Capture the daemon-assigned name in the trace too.
+        trace.tab_name(&row.name);
+    }
     print_summary(&row, json);
     Ok(())
 }
 
-async fn list(positional: &str, json: bool) -> Result<()> {
+async fn list(positional: &str, all: bool, json: bool, trace: &mut CommandTrace) -> Result<()> {
     // `tab list` only accepts a bare browser; tabs in the positional don't
     // make sense here.
     let target = env_resolver::parse_target(positional)?;
@@ -111,25 +130,94 @@ async fn list(positional: &str, json: bool) -> Result<()> {
             ));
         }
     };
+    trace.browser(&browser_name).engine(resolved.engine);
+    trace.route(if all { "tab-list-all" } else { "tab-list" });
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
     let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
     let rows = session_tabs::tab_list(&backend, &registry, &browser_name).await?;
 
+    // With `--all`, fold in every live tab the browser knows about with
+    // an empty `name` column. Registered ids stay as-is; unregistered
+    // ones get synthesized rows. Sorted: named rows first (alpha), then
+    // unnamed (by url).
+    let merged = if all {
+        let live = backend.live_targets().await?;
+        let known_ids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.target_id.as_str()).collect();
+        let mut out: Vec<DisplayRow> = rows.iter().map(DisplayRow::from_row).collect();
+        for t in &live {
+            if !known_ids.contains(t.id.as_str()) {
+                out.push(DisplayRow::from_live(t));
+            }
+        }
+        out
+    } else {
+        rows.iter().map(DisplayRow::from_row).collect()
+    };
+
     if json {
-        let arr: Vec<_> = rows.iter().map(tab_to_json).collect();
+        let arr: Vec<serde_json::Value> = merged.iter().map(DisplayRow::to_json).collect();
         println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else if rows.is_empty() {
+    } else if merged.is_empty() {
         println!("(no tabs)");
     } else {
-        println!("NAME\tSTATE\tIDLE_S\tURL");
+        println!("NAME\tOWNER\tIDLE_S\tURL");
         let now = crate::registry::now_epoch_s();
-        for r in &rows {
-            let idle = (now - r.last_used_at_epoch_s).max(0);
-            let provenance = if r.daemon_created { "agent" } else { "user" };
-            println!("{}\t{}\t{}\t{}", r.name, provenance, idle, r.last_url);
+        for r in &merged {
+            let idle = r
+                .last_used_at_epoch_s
+                .map(|t| (now - t).max(0).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!("{}\t{}\t{}\t{}", r.name, r.owner, idle, r.url);
         }
     }
     Ok(())
+}
+
+/// Unified row used by `tab list` output. Comes either from a registered
+/// `TabRow` (name + last_used_at populated, owner = "agent"/"user") or a
+/// live `LiveTarget` that has no row yet (name empty, idle "-",
+/// owner = "unnamed").
+struct DisplayRow {
+    name: String,
+    owner: &'static str,
+    url: String,
+    last_used_at_epoch_s: Option<i64>,
+    target_id: String,
+    daemon_created: bool,
+}
+
+impl DisplayRow {
+    fn from_row(r: &TabRow) -> Self {
+        Self {
+            name: r.name.clone(),
+            owner: if r.daemon_created { "agent" } else { "user" },
+            url: r.last_url.clone(),
+            last_used_at_epoch_s: Some(r.last_used_at_epoch_s),
+            target_id: r.target_id.clone(),
+            daemon_created: r.daemon_created,
+        }
+    }
+    fn from_live(t: &crate::session::backend::LiveTarget) -> Self {
+        Self {
+            name: String::new(),
+            owner: "unnamed",
+            url: t.url.clone(),
+            last_used_at_epoch_s: None,
+            target_id: t.id.clone(),
+            daemon_created: false,
+        }
+    }
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "owner": self.owner,
+            "target_id": self.target_id,
+            "url": self.url,
+            "last_used_at_epoch_s": self.last_used_at_epoch_s,
+            "daemon_created": self.daemon_created,
+        })
+    }
 }
 
 fn tab_to_json(r: &TabRow) -> serde_json::Value {

@@ -24,6 +24,7 @@
 use anyhow::{anyhow, Context, Result};
 use rand::Rng;
 
+use crate::errors::SessionError;
 use crate::registry::{words::WORDS, Registry, TabRow};
 use crate::session::backend::TabBackend;
 
@@ -151,6 +152,91 @@ pub async fn resolve_tab(
 async fn target_alive(backend: &TabBackend, target_id: &str) -> Result<bool> {
     let live = backend.live_target_ids().await?;
     Ok(live.contains(target_id))
+}
+
+/// Run `op` against the named tab `<browser>/<name>` with one round of
+/// recover-and-retry on tab failures. Mirrors [`crate::session::with_scratch_recovery`]
+/// but for the agent-owned named-tab path.
+///
+/// Semantics, in order:
+///
+/// 1. Resolve the row via [`resolve_tab`]. If the row is missing or its
+///    `target_id` is stale, surface a typed `SessionError::TabNotFound` —
+///    we do NOT auto-create a tab the agent never asked for.
+/// 2. Run `op` against the live `target_id`.
+/// 3. If `op` returns a recoverable failure (`TabHung`, `TabCrashed`, or a
+///    CDP/BiDi "no target / no context" protocol error), the tab died
+///    between resolve and op. Close the corpse (best-effort), recreate a
+///    fresh `about:blank` under the **same name**, retry `op` once.
+///    The new tab is blank — agents that need a specific URL on a recovered
+///    tab are expected to `tab open <browser>/<name> <url>` to rehydrate.
+/// 4. If the retry also fails, escalate the typed error to the caller.
+pub async fn with_named_tab_recovery<F, T, Fut>(
+    backend: &TabBackend,
+    registry: &Registry,
+    browser_name: &str,
+    tab_name: &str,
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut(TabBackend, String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    // Step 1: resolve. `resolve_tab` already sweeps stale rows internally
+    // (deletes the row if its target_id no longer exists in the browser).
+    let row = match resolve_tab(backend, registry, browser_name, tab_name).await? {
+        Some(r) => r,
+        None => {
+            return Err(SessionError::TabNotFound {
+                browser: browser_name.to_string(),
+                name: tab_name.to_string(),
+            }
+            .into());
+        }
+    };
+
+    // Step 2: first attempt.
+    // The `Ok(value)` branch returns early; the failure branch falls
+    // through to attempt 2. Clippy reads the early return as "needless"
+    // because the failure branch also has `return Err(e)` — but
+    // restructuring (e.g. via `if let`) makes the recover-once
+    // contract less obvious.
+    #[allow(clippy::needless_return)]
+    match op(backend.clone(), row.target_id.clone()).await {
+        Ok(value) => return Ok(value),
+        Err(e) if is_tab_failure(&e) => {
+            // Step 3: recover. Tab died between resolve and op.
+            let _ = backend.close_tab(&row.target_id).await;
+            // Replace the row in place with a fresh blank tab. Keep the name.
+            let new_target_id = backend.create_tab("about:blank").await?;
+            registry.tab_upsert(browser_name, tab_name, &new_target_id, "about:blank", true)?;
+            // Step 4: retry once.
+            op(backend.clone(), new_target_id).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Does this error suggest the named tab is dead and we should retry on
+/// a fresh one? Same shape as `scratch::is_scratch_failure` — kept here
+/// rather than re-exported so the two recovery wrappers don't develop
+/// hidden coupling.
+fn is_tab_failure(err: &anyhow::Error) -> bool {
+    if let Some(se) = err.downcast_ref::<SessionError>() {
+        return matches!(
+            se,
+            SessionError::TabHung { .. } | SessionError::TabCrashed { .. }
+        );
+    }
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("no target with given id")
+        || msg.contains("session is gone")
+        || msg.contains("no session with given id")
+        || msg.contains("target closed")
+        || msg.contains("no such frame")
+        || msg.contains("no such node")
+        || msg.contains("no such context")
+        || msg.contains("invalid session id")
 }
 
 fn fresh_cute_name(registry: &Registry, browser_name: &str) -> Result<String> {
@@ -521,5 +607,126 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resolved.target_id, opened.target_id);
+    }
+
+    // ---- with_named_tab_recovery -----------------------------------------
+
+    use crate::errors::SessionError;
+
+    /// Missing row → typed `TabNotFound`.
+    #[tokio::test]
+    async fn recover_missing_row_returns_tab_not_found() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        let err = with_named_tab_recovery(&backend, &reg, "b", "nope", |_, _| async {
+            Ok::<_, anyhow::Error>(serde_json::json!(null))
+        })
+        .await
+        .expect_err("must error");
+        let typed = err
+            .downcast_ref::<SessionError>()
+            .expect("typed SessionError");
+        match typed {
+            SessionError::TabNotFound { browser, name } => {
+                assert_eq!(browser, "b");
+                assert_eq!(name, "nope");
+            }
+            other => panic!("expected TabNotFound, got {other:?}"),
+        }
+    }
+
+    /// Stale row whose target_id is gone → resolve_tab sweeps it →
+    /// also `TabNotFound` (not silent recreate — the agent never asked
+    /// for the recreate at resolve time).
+    #[tokio::test]
+    async fn recover_stale_row_returns_tab_not_found_after_sweep() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        reg.tab_upsert("b", "ghost", "T999", "", true).unwrap();
+        let err = with_named_tab_recovery(&backend, &reg, "b", "ghost", |_, _| async {
+            Ok::<_, anyhow::Error>(serde_json::json!(null))
+        })
+        .await
+        .expect_err("must error after sweep");
+        assert!(matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::TabNotFound { .. })
+        ));
+        assert!(reg.tab_get("b", "ghost").unwrap().is_none(), "swept");
+    }
+
+    /// First op call wedges (returns `TabHung`); wrapper closes the tab,
+    /// recreates a fresh blank under the same name, retries; second
+    /// attempt succeeds. Caller sees a value.
+    #[tokio::test]
+    async fn recover_after_op_returns_tab_hung() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        let opened = tab_open(&backend, &reg, "b", Some("flaky"), None)
+            .await
+            .unwrap();
+        let original_target = opened.target_id.clone();
+
+        // Op that returns TabHung the first call, ok the second.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let result = with_named_tab_recovery(&backend, &reg, "b", "flaky", move |_, target_id| {
+            let calls = calls_clone.clone();
+            async move {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(SessionError::TabHung {
+                        target_id: Some(target_id.clone()),
+                        url: None,
+                        timeout_ms: 100,
+                        hint: "test",
+                    }
+                    .into())
+                } else {
+                    Ok::<_, anyhow::Error>(serde_json::json!(format!("ok:{target_id}")))
+                }
+            }
+        })
+        .await
+        .expect("recover succeeded");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The row now points at the fresh target, not the dead one.
+        let row = reg.tab_get("b", "flaky").unwrap().unwrap();
+        assert_ne!(
+            row.target_id, original_target,
+            "row updated to fresh target after recovery"
+        );
+        assert_eq!(row.last_url, "about:blank", "recovered tab is blank");
+        // The op was called with the fresh target on the second attempt.
+        assert_eq!(result, serde_json::json!(format!("ok:{}", row.target_id)));
+    }
+
+    /// Both attempts return `TabHung` → escalate to the caller.
+    #[tokio::test]
+    async fn recover_escalates_when_retry_also_fails() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        tab_open(&backend, &reg, "b", Some("doomed"), None)
+            .await
+            .unwrap();
+        let err =
+            with_named_tab_recovery(&backend, &reg, "b", "doomed", |_, target_id| async move {
+                Err::<serde_json::Value, _>(
+                    SessionError::TabHung {
+                        target_id: Some(target_id),
+                        url: None,
+                        timeout_ms: 100,
+                        hint: "test",
+                    }
+                    .into(),
+                )
+            })
+            .await
+            .expect_err("must escalate");
+        assert!(matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::TabHung { .. })
+        ));
     }
 }

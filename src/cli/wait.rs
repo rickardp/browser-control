@@ -3,21 +3,35 @@
 use anyhow::{anyhow, bail, Result};
 use std::time::{Duration, Instant};
 
+use crate::cli::trace::CommandTrace;
 use crate::detect::Engine;
 
 pub async fn run(browser: Option<String>, ready: bool, timeout: u64) -> Result<()> {
-    if !ready {
-        bail!("`wait` requires --ready in this version");
+    let mut trace = CommandTrace::new("wait");
+    trace.route("registry");
+    let result: Result<()> = async {
+        if !ready {
+            bail!("`wait` requires --ready in this version");
+        }
+        let resolved = crate::cli::mcp::resolve_browser(browser).await?;
+        trace.engine(resolved.engine);
+        wait_until_ready(
+            &resolved.endpoint,
+            resolved.engine,
+            Duration::from_secs(timeout),
+        )
+        .await?;
+        println!("ready");
+        Ok(())
     }
-    let resolved = crate::cli::mcp::resolve_browser(browser).await?;
-    wait_until_ready(
-        &resolved.endpoint,
-        resolved.engine,
-        Duration::from_secs(timeout),
-    )
-    .await?;
-    println!("ready");
-    Ok(())
+    .await;
+    match result {
+        Ok(()) => {
+            trace.ok(());
+            Ok(())
+        }
+        Err(e) => Err(trace.err(e)),
+    }
 }
 
 /// Convert a raw browser endpoint (which may be a `ws://host:port/...` URL or

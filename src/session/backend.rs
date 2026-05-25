@@ -39,6 +39,16 @@ pub enum TabBackend {
     Bidi(Arc<BidiClient>),
 }
 
+/// Lightweight view of a live tab returned by [`TabBackend::live_targets`].
+/// Used by `tab list --all` to merge the named-tab registry with the
+/// browser's current target/context set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTarget {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+}
+
 impl TabBackend {
     /// Create a fresh top-level tab. Returns the engine-specific id
     /// (CDP `targetId`, BiDi `context`) the registry stores verbatim.
@@ -111,6 +121,19 @@ impl TabBackend {
     /// Used by the registry's sweep-on-read to drop rows whose target
     /// no longer exists.
     pub async fn live_target_ids(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .live_targets()
+            .await?
+            .into_iter()
+            .map(|t| t.id)
+            .collect())
+    }
+
+    /// Snapshot of every live top-level tab with id + URL + title. Used by
+    /// `tab list --all` to merge the named-tab registry with the
+    /// browser's view of the world. CDP filters to `type == "page"`; BiDi
+    /// returns every top-level browsing context.
+    pub async fn live_targets(&self) -> Result<Vec<LiveTarget>> {
         match self {
             TabBackend::Cdp(c) => {
                 let v: Value = c.send("Target.getTargets", json!({})).await?;
@@ -121,10 +144,52 @@ impl TabBackend {
                     .unwrap_or_default();
                 Ok(arr
                     .iter()
-                    .filter_map(|t| t.get("targetId").and_then(|v| v.as_str()).map(String::from))
+                    .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+                    .map(|t| LiveTarget {
+                        id: t
+                            .get("targetId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        url: t
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        title: t
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
                     .collect())
             }
-            TabBackend::Bidi(c) => c.browsing_context_ids().await,
+            TabBackend::Bidi(c) => {
+                let v: Value = c.send("browsingContext.getTree", json!({})).await?;
+                let contexts = v
+                    .get("contexts")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(contexts
+                    .iter()
+                    .filter_map(|ctx| {
+                        let id = ctx.get("context").and_then(|v| v.as_str())?.to_string();
+                        let url = ctx
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        // BiDi getTree doesn't expose page titles directly
+                        // on the context node; leave blank for now.
+                        Some(LiveTarget {
+                            id,
+                            url,
+                            title: String::new(),
+                        })
+                    })
+                    .collect())
+            }
         }
     }
 

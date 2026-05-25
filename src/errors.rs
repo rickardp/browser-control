@@ -36,4 +36,10 @@ pub enum SessionError {
     /// distinguish "definitely dead" from "presumed wedged."
     #[error("tab crashed: {reason} [target={target_id:?}]")]
     TabCrashed { target_id: String, reason: String },
+    /// `<browser>/<name>` referenced a tab that doesn't exist in the
+    /// `tabs` registry. Agents see this when they reference a tab they
+    /// haven't `tab open`'d yet — the recovery is to open it first.
+    /// Distinct from `TabHung` because the tab was never there to wedge.
+    #[error("no tab `{name}` registered for browser `{browser}` — run `browser-control tab open {browser}/{name}` first")]
+    TabNotFound { browser: String, name: String },
 }

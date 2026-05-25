@@ -20,14 +20,15 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::registry::Registry;
 use crate::session::backend::open_backend;
-use crate::session::{tabs as session_tabs, with_scratch_recovery, PageSession};
+use crate::session::{with_named_tab_recovery, with_scratch_recovery, PageSession};
 
 pub async fn run(
     browser: Option<String>,
@@ -36,6 +37,35 @@ pub async fn run(
     json: bool,
     await_promise: bool,
     timeout_ms: u64,
+) -> Result<()> {
+    let mut trace = CommandTrace::new("eval");
+    match run_inner(
+        browser,
+        expression,
+        target,
+        json,
+        await_promise,
+        timeout_ms,
+        &mut trace,
+    )
+    .await
+    {
+        Ok(()) => {
+            trace.ok(());
+            Ok(())
+        }
+        Err(e) => Err(trace.err(e)),
+    }
+}
+
+async fn run_inner(
+    browser: Option<String>,
+    expression: String,
+    target: Option<String>,
+    json: bool,
+    await_promise: bool,
+    timeout_ms: u64,
+    trace: &mut CommandTrace,
 ) -> Result<()> {
     let raw = browser.unwrap_or_default();
     let parsed = if raw.is_empty() {
@@ -57,6 +87,7 @@ pub async fn run(
         Some(browser_only.clone())
     })
     .await?;
+    trace.browser(&browser_only).engine(resolved.engine);
     let timeout = Duration::from_millis(timeout_ms);
 
     // Open the registry once for the function lifetime — used for the
@@ -68,8 +99,10 @@ pub async fn run(
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
 
     let value = match (tab_name, target) {
-        // Path 1: <browser>/<tab> — named tab, engine-agnostic.
+        // Path 1: <browser>/<tab> — named tab, engine-agnostic, with
+        // recover-once around a tab that dies between resolve and op.
         (Some(name), None) => {
+            trace.route("named-tab").tab_name(&name);
             let browser_name = match &resolved.source {
                 Source::Registered { name } => name.clone(),
                 _ => bail!(
@@ -78,17 +111,18 @@ pub async fn run(
                 ),
             };
             let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-            let row = session_tabs::resolve_tab(&backend, &registry, &browser_name, &name)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "TabNotFound: no live tab `{name}` for `{browser_name}` \
-                         — run `browser-control tab open {browser_name}/{name}` first"
-                    )
-                })?;
-            backend
-                .evaluate(&row.target_id, &expression, await_promise, timeout)
-                .await?
+            let expr = expression.clone();
+            with_named_tab_recovery(
+                &backend,
+                &registry,
+                &browser_name,
+                &name,
+                move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, await_promise, timeout).await }
+                },
+            )
+            .await?
         }
         // Path 2: bare browser, no `--target` → scratch tab with
         // recover-once. Engine-agnostic via TabBackend.
@@ -97,6 +131,7 @@ pub async fn run(
                 // External URL endpoints don't have a registered name to
                 // key the scratch row by. Fall back to the legacy direct
                 // attach so `eval ws://...` still works.
+                trace.route("direct");
                 let session =
                     PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
                 let value = session
@@ -105,6 +140,7 @@ pub async fn run(
                 session.close().await;
                 value?
             } else {
+                trace.route("scratch");
                 let browser_name = match &resolved.source {
                     Source::Registered { name } => name.clone(),
                     _ => unreachable!("Source::External branch handled above"),
@@ -120,6 +156,7 @@ pub async fn run(
         }
         // Path 3: bare browser, --target regex → legacy selector.
         (None, Some(regex)) => {
+            trace.route("target-regex");
             let session =
                 PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
             let value = session

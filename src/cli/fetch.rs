@@ -20,16 +20,16 @@ use serde_json::{json, Map, Value};
 
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
 use crate::session::backend::open_backend;
-use crate::session::{tabs as session_tabs, PageSession};
+use crate::session::{with_named_tab_recovery, PageSession};
 
-/// Per-call timeout for the JS fetch executed inside the page. Generous —
-/// real HTTP fetches over slow networks legitimately take many seconds —
-/// but bounded so a wedged renderer fails fast instead of dragging out the
-/// upstream protocol timeout.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+// The default fetch timeout (60 000 ms) is set on the CLI flag in
+// `main.rs`. Bounded so a wedged renderer fails fast instead of dragging
+// out the upstream protocol timeout; tunable per invocation via
+// `--timeout-ms` for slow-network workloads.
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -41,9 +41,38 @@ pub async fn run(
     target: Option<String>,
     include: bool,
     output: Option<PathBuf>,
+    timeout_ms: u64,
+) -> Result<()> {
+    let mut trace = CommandTrace::new("fetch");
+    match run_inner(
+        browser, url, method, headers, data, target, include, output, timeout_ms, &mut trace,
+    )
+    .await
+    {
+        Ok(()) => {
+            trace.ok(());
+            Ok(())
+        }
+        Err(e) => Err(trace.err(e)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    browser: Option<String>,
+    url: String,
+    method: String,
+    headers: Vec<String>,
+    data: Option<String>,
+    target: Option<String>,
+    include: bool,
+    output: Option<PathBuf>,
+    timeout_ms: u64,
+    trace: &mut CommandTrace,
 ) -> Result<()> {
     let header_map = parse_headers(&headers)?;
     let expr = build_fetch_expr(&url, &method, &header_map, data.as_deref())?;
+    let fetch_timeout = Duration::from_millis(timeout_ms);
 
     // Path-syntax parsing: `<browser>` or `<browser>/<tab>` in the
     // positional. `--target <regex>` and `/<tab>` are mutually exclusive.
@@ -67,6 +96,7 @@ pub async fn run(
         Some(browser_only.clone())
     })
     .await?;
+    trace.browser(&browser_only).engine(resolved.engine);
 
     // Single Registry handle for the function lifetime: BiDi lock,
     // named-tab resolution, scratch fallback all share it.
@@ -75,31 +105,34 @@ pub async fn run(
 
     let result = match (tab_name, target.as_deref()) {
         // Path 1: <browser>/<tab> — fetch against the named tab.
-        // Engine-agnostic via TabBackend.
+        // Engine-agnostic via TabBackend + recover-once on dead tabs.
         (Some(name), None) => {
+            trace.route("named-tab").tab_name(&name);
             let browser_name = match &resolved.source {
                 Source::Registered { name } => name.clone(),
                 _ => bail!("named tabs (`<browser>/<name>`) require a registered browser"),
             };
             let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-            let row = session_tabs::resolve_tab(&backend, &registry, &browser_name, &name)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "TabNotFound: no live tab `{name}` for `{browser_name}` \
-                         — run `browser-control tab open {browser_name}/{name}` first"
-                    )
-                })?;
-            backend
-                .evaluate(&row.target_id, &expr, true, FETCH_TIMEOUT)
-                .await?
+            let expr = expr.clone();
+            with_named_tab_recovery(
+                &backend,
+                &registry,
+                &browser_name,
+                &name,
+                move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, true, fetch_timeout).await }
+                },
+            )
+            .await?
         }
         // Path 2: --target regex (legacy).
         (None, Some(regex)) => {
+            trace.route("target-regex");
             let session =
                 PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?;
             let value = session
-                .evaluate_with_timeout(&expr, true, Some(FETCH_TIMEOUT))
+                .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
                 .await;
             session.close().await;
             value?
@@ -110,10 +143,11 @@ pub async fn run(
         // about:blank) would lose this; we deliberately keep
         // attach_for_origin here instead.
         (None, None) => {
+            trace.route("attach-for-origin");
             let session =
                 PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?;
             let value = session
-                .evaluate_with_timeout(&expr, true, Some(FETCH_TIMEOUT))
+                .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
                 .await;
             session.close().await;
             value?

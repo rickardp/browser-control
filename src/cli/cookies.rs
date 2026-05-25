@@ -18,8 +18,10 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::cli::env_resolver::ResolvedBrowser;
-use crate::cli::mcp::resolve_browser;
+use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::detect::Engine;
+use crate::registry::Registry;
 use crate::session::targets::{open_bidi, open_cdp};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -52,56 +54,77 @@ pub async fn run(
     reveal: bool,
     json: bool,
 ) -> Result<()> {
-    let effective_format = if json { "json".to_string() } else { format };
-    match effective_format.as_str() {
-        "json" | "netscape" | "header" => {}
-        other => bail!("unknown --format `{other}`: expected one of `netscape`, `json`, `header`"),
-    }
-
-    let domain_re = domain
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("invalid --domain regex")?;
-    let name_re = name
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("invalid --name regex")?;
-
-    let resolved = resolve_browser(browser).await?;
-    let raw = fetch_cookies(&resolved).await?;
-
-    let cookies: Vec<NormalCookie> = raw
-        .into_iter()
-        .filter(|c| matches_filter(c, domain_re.as_ref(), name_re.as_ref()))
-        .collect();
-
-    // For `-o FILE` writes we always emit full values (the file is 0600).
-    // Redaction only applies to stdout + `header` format without `--reveal`.
-    let to_stdout = output.is_none();
-    let body = match effective_format.as_str() {
-        "json" => format_json(&cookies)?,
-        "netscape" => format_netscape(&cookies),
-        "header" => format_header(&cookies, !to_stdout || reveal),
-        _ => unreachable!(),
-    };
-
-    match output {
-        Some(path) => {
-            write_file(&path, &body)?;
-            eprintln!("wrote {} cookies to {}", cookies.len(), path.display());
-        }
-        None => {
-            use std::io::Write;
-            let mut out = std::io::stdout().lock();
-            out.write_all(body.as_bytes())?;
-            if !body.ends_with('\n') {
-                out.write_all(b"\n")?;
+    let mut trace = CommandTrace::new("cookies");
+    trace.route("registry");
+    let result: Result<()> = async {
+        let effective_format = if json { "json".to_string() } else { format };
+        match effective_format.as_str() {
+            "json" | "netscape" | "header" => {}
+            other => {
+                bail!("unknown --format `{other}`: expected one of `netscape`, `json`, `header`")
             }
         }
+
+        let domain_re = domain
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .context("invalid --domain regex")?;
+        let name_re = name
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .context("invalid --name regex")?;
+
+        let resolved = resolve_browser(browser).await?;
+        trace.engine(resolved.engine);
+        // Hold the BiDi single-session lock for the read; releases on Drop.
+        // No-op for CDP and for external URL endpoints.
+        let _bidi_lock = {
+            let registry = Registry::open()?;
+            acquire_bidi_lock_if_needed(&registry, &resolved)?
+        };
+        let raw = fetch_cookies(&resolved).await?;
+
+        let cookies: Vec<NormalCookie> = raw
+            .into_iter()
+            .filter(|c| matches_filter(c, domain_re.as_ref(), name_re.as_ref()))
+            .collect();
+
+        // For `-o FILE` writes we always emit full values (the file is 0600).
+        // Redaction only applies to stdout + `header` format without `--reveal`.
+        let to_stdout = output.is_none();
+        let body = match effective_format.as_str() {
+            "json" => format_json(&cookies)?,
+            "netscape" => format_netscape(&cookies),
+            "header" => format_header(&cookies, !to_stdout || reveal),
+            _ => unreachable!(),
+        };
+
+        match output {
+            Some(path) => {
+                write_file(&path, &body)?;
+                eprintln!("wrote {} cookies to {}", cookies.len(), path.display());
+            }
+            None => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                out.write_all(body.as_bytes())?;
+                if !body.ends_with('\n') {
+                    out.write_all(b"\n")?;
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    match result {
+        Ok(()) => {
+            trace.ok(());
+            Ok(())
+        }
+        Err(e) => Err(trace.err(e)),
+    }
 }
 
 async fn fetch_cdp(endpoint: &str) -> Result<Vec<NormalCookie>> {

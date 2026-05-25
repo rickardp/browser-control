@@ -16,8 +16,10 @@ use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::cli::cookies::{fetch_cookies, NormalCookie};
-use crate::cli::mcp::resolve_browser;
+use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
+use crate::registry::Registry;
 use crate::session::PageSession;
 
 pub async fn run(
@@ -28,44 +30,65 @@ pub async fn run(
     poll_interval: u64,
     validate_url: Option<String>,
 ) -> Result<()> {
-    let domain_re = Regex::new(&domain).context("invalid --domain regex")?;
-    let name_re = Regex::new(&name).context("invalid --name regex")?;
+    let mut trace = CommandTrace::new("wait-for-cookie");
+    trace.route("registry");
+    let result: Result<()> = async {
+        let domain_re = Regex::new(&domain).context("invalid --domain regex")?;
+        let name_re = Regex::new(&name).context("invalid --name regex")?;
 
-    let resolved = resolve_browser(browser).await?;
+        let resolved = resolve_browser(browser).await?;
+        trace.engine(resolved.engine);
+        // Hold the Firefox BiDi single-session lock across the whole poll
+        // loop (and the optional validate_via_page leg). Each `fetch_cookies`
+        // call opens + closes a BiDi session, so without the lock two
+        // concurrent CLI processes would race on `session.new`. No-op on CDP.
+        let _bidi_lock = {
+            let registry = Registry::open()?;
+            acquire_bidi_lock_if_needed(&registry, &resolved)?
+        };
 
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    let interval = Duration::from_secs(poll_interval.max(1));
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        let interval = Duration::from_secs(poll_interval.max(1));
 
-    let matched = loop {
-        let cookies = fetch_cookies(&resolved).await?;
-        if let Some(c) = cookies
-            .into_iter()
-            .find(|c| cookie_matches(c, &domain_re, &name_re))
-        {
-            break c;
+        let matched = loop {
+            let cookies = fetch_cookies(&resolved).await?;
+            if let Some(c) = cookies
+                .into_iter()
+                .find(|c| cookie_matches(c, &domain_re, &name_re))
+            {
+                break c;
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for cookie");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let nap = std::cmp::min(interval, remaining);
+            if nap.is_zero() {
+                bail!("timed out waiting for cookie");
+            }
+            sleep(nap).await;
+        };
+
+        eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
+
+        if let Some(url) = validate_url {
+            let session = PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+            let result = validate_via_page(&session, &url).await;
+            session.close().await;
+            result?;
         }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for cookie");
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let nap = std::cmp::min(interval, remaining);
-        if nap.is_zero() {
-            bail!("timed out waiting for cookie");
-        }
-        sleep(nap).await;
-    };
 
-    eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
-
-    if let Some(url) = validate_url {
-        let session = PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
-        let result = validate_via_page(&session, &url).await;
-        session.close().await;
-        result?;
+        println!("{}", matched.name);
+        Ok(())
     }
-
-    println!("{}", matched.name);
-    Ok(())
+    .await;
+    match result {
+        Ok(()) => {
+            trace.ok(());
+            Ok(())
+        }
+        Err(e) => Err(trace.err(e)),
+    }
 }
 
 /// Returns true when both regexes match the cookie's domain and name. Both

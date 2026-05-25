@@ -42,7 +42,13 @@ pub fn register_all(registry: &ToolRegistry) {
 /// CDP sessions are short-lived: we open and close a fresh WebSocket per
 /// call. BiDi sessions reuse one persistent client, because Firefox limits
 /// a browser instance to a single concurrent BiDi session.
+///
+/// Acquires the SQLite-backed BiDi single-session lock on first call so
+/// concurrent MCP servers (or a CLI invocation running in parallel) can't
+/// race on `session.new`. The lock is held for the server's lifetime
+/// via the `ServerState::bidi_lock` cache; idempotent on subsequent calls.
 async fn attach_active(state: &ServerState) -> Result<PageSession> {
+    state.ensure_bidi_lock().await?;
     match state.browser.engine {
         Engine::Cdp => PageSession::attach(&state.browser.endpoint, Engine::Cdp, None).await,
         Engine::Bidi => {

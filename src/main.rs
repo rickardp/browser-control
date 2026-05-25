@@ -99,6 +99,11 @@ enum Command {
         include: bool,
         #[arg(long, short = 'o')]
         output: Option<std::path::PathBuf>,
+        /// Per-call timeout in milliseconds for the in-page fetch. Default
+        /// 60 s is generous for slow networks; lower bounds catch wedged
+        /// renderers faster.
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u64,
     },
     /// Read or write localStorage / sessionStorage.
     Storage {
@@ -232,7 +237,13 @@ async fn main() -> Result<()> {
             target,
             include,
             output,
-        } => fetch::run(browser, url, method, headers, data, target, include, output).await,
+            timeout_ms,
+        } => {
+            fetch::run(
+                browser, url, method, headers, data, target, include, output, timeout_ms,
+            )
+            .await
+        }
         Command::Storage { action } => storage::run(action).await,
         Command::Eval {
             browser,

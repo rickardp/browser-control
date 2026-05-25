@@ -23,6 +23,24 @@ pub type BidiCache =
 pub struct ServerState {
     pub browser: ResolvedBrowser,
     pub bidi: BidiCache,
+    /// Firefox BiDi single-session lock, acquired lazily on first tool
+    /// call and held for the server's lifetime. `None` for CDP browsers
+    /// and external endpoints (where `acquire_bidi_lock_if_needed`
+    /// returns None) — the inner `Option<BidiLockGuard>` distinguishes
+    /// "haven't tried yet" from "tried, not applicable" via the outer
+    /// `Mutex` being unlocked vs returning None.
+    pub bidi_lock: std::sync::Arc<tokio::sync::Mutex<BidiLockState>>,
+}
+
+/// Three-state cache: `Pending` until first tool call attempts acquire;
+/// `Acquired` holding the guard; `NotApplicable` for CDP / external
+/// endpoints where no lock is needed.
+#[derive(Default)]
+pub enum BidiLockState {
+    #[default]
+    Pending,
+    Acquired(crate::registry::BidiLockGuard),
+    NotApplicable,
 }
 
 impl ServerState {
@@ -30,7 +48,25 @@ impl ServerState {
         Self {
             browser,
             bidi: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            bidi_lock: std::sync::Arc::new(tokio::sync::Mutex::new(BidiLockState::Pending)),
         }
+    }
+
+    /// Ensure the BiDi single-session lock is held (if applicable).
+    /// Lazy + idempotent: called by each tool handler before opening a
+    /// BiDi session, returns immediately on second+ calls.
+    pub async fn ensure_bidi_lock(&self) -> Result<()> {
+        use crate::cli::mcp::acquire_bidi_lock_if_needed;
+        use crate::registry::Registry;
+        let mut guard = self.bidi_lock.lock().await;
+        if matches!(*guard, BidiLockState::Pending) {
+            let registry = Registry::open()?;
+            *guard = match acquire_bidi_lock_if_needed(&registry, &self.browser)? {
+                Some(lock) => BidiLockState::Acquired(lock),
+                None => BidiLockState::NotApplicable,
+            };
+        }
+        Ok(())
     }
 }
 

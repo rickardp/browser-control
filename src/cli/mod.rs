@@ -10,5 +10,6 @@ pub mod start;
 pub mod storage;
 pub mod tab;
 pub mod targets;
+pub mod trace;
 pub mod wait;
 pub mod wait_for_cookie;

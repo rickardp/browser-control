@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use serde_json::Value;
 
-use crate::cli::mcp::resolve_browser;
+use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::registry::Registry;
 use crate::session::PageSession;
 
 /// Per-call timeout for storage probes. The expressions injected here are
@@ -57,7 +58,7 @@ pub enum StorageCmd {
 }
 
 pub async fn run(cmd: StorageCmd) -> Result<()> {
-    match cmd {
+    let (sub, result) = match cmd {
         StorageCmd::Get {
             browser,
             key,
@@ -65,21 +66,39 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             target,
             namespace,
             json,
-        } => run_get(browser, key, key_regex, target, namespace, json).await,
+        } => (
+            "storage-get",
+            run_get(browser, key, key_regex, target, namespace, json).await,
+        ),
         StorageCmd::Set {
             browser,
             key,
             value,
             target,
             namespace,
-        } => run_set(browser, key, value, target, namespace).await,
+        } => (
+            "storage-set",
+            run_set(browser, key, value, target, namespace).await,
+        ),
         StorageCmd::List {
             browser,
             key_regex,
             target,
             namespace,
             json,
-        } => run_list(browser, key_regex, target, namespace, json).await,
+        } => (
+            "storage-list",
+            run_list(browser, key_regex, target, namespace, json).await,
+        ),
+    };
+    let mut trace = crate::cli::trace::CommandTrace::new(sub);
+    trace.route("registry");
+    match result {
+        Ok(()) => {
+            trace.ok(());
+            Ok(())
+        }
+        Err(e) => Err(trace.err(e)),
     }
 }
 
@@ -89,6 +108,12 @@ async fn evaluate_in_target(
     expr: &str,
 ) -> Result<Value> {
     let resolved = resolve_browser(browser).await?;
+    // Acquire the Firefox BiDi single-session lock if this is a BiDi
+    // browser; held for the storage op. No-op on CDP.
+    let _bidi_lock = {
+        let registry = Registry::open()?;
+        acquire_bidi_lock_if_needed(&registry, &resolved)?
+    };
     let session =
         PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
     let value = session
