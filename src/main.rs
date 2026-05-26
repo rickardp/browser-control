@@ -43,9 +43,12 @@ enum Command {
         /// Browser to target. Overrides $BROWSER_CONTROL.
         #[arg(env = "BROWSER_CONTROL")]
         browser: Option<String>,
-        /// Stdio-forward to the official Playwright MCP instead of exposing our tools.
+        /// Override the `playwright-core` version used by the internal
+        /// Playwright sidecar (defaults to the pinned version in the
+        /// bundled `package.json`). Useful for picking up an upstream
+        /// API change without waiting for a browser-control release.
         #[arg(long)]
-        playwright: bool,
+        playwright_version: Option<String>,
     },
     /// List page targets in the active browser.
     Targets {
@@ -213,8 +216,8 @@ async fn main() -> Result<()> {
         } => browser_control::cli::start::run(browser, headless, no_wait, wait_timeout, json).await,
         Command::Mcp {
             browser,
-            playwright,
-        } => browser_control::cli::mcp::run_cli(browser, playwright).await,
+            playwright_version,
+        } => browser_control::cli::mcp::run_cli(browser, playwright_version).await,
         Command::Set { key, value, json } => set::run_set(key, value, json),
         Command::Get { key, json } => set::run_get(key, json),
         Command::Unset { key, json } => set::run_unset(key, json),

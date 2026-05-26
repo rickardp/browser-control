@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::cli::env_resolver::ResolvedBrowser;
+use crate::cli::env_resolver::{self, ResolvedBrowser};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
 use crate::cli::trace::CommandTrace;
 use crate::detect::Engine;
@@ -55,7 +55,6 @@ pub async fn run(
     json: bool,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("cookies");
-    trace.route("registry");
     let result: Result<()> = async {
         let effective_format = if json { "json".to_string() } else { format };
         match effective_format.as_str() {
@@ -76,8 +75,36 @@ pub async fn run(
             .transpose()
             .context("invalid --name regex")?;
 
-        let resolved = resolve_browser(browser).await?;
-        trace.engine(resolved.engine);
+        // Accept `<browser>[/<tab>]` for syntactic consistency with
+        // `eval`/`fetch`/`storage`. Cookies are inherently browser-wide
+        // (CDP `Network.getAllCookies` / BiDi `storage.getCookies` return
+        // the full cookie jar), so the tab arg is informational only — we
+        // strip it before resolving the browser. The route trace records
+        // `named-tab-informational` when a tab name was supplied, otherwise
+        // `browser-wide`.
+        let raw = browser.unwrap_or_default();
+        let parsed = if raw.is_empty() {
+            None
+        } else {
+            Some(env_resolver::parse_target(&raw)?)
+        };
+        let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
+        let browser_only = parsed
+            .as_ref()
+            .map(|p| strip_tab(&raw, p.tab.as_deref()))
+            .unwrap_or_default();
+        let resolved = resolve_browser(if browser_only.is_empty() {
+            None
+        } else {
+            Some(browser_only.clone())
+        })
+        .await?;
+        trace.browser(&browser_only).engine(resolved.engine);
+        if let Some(name) = &tab_name {
+            trace.route("named-tab-informational").tab_name(name);
+        } else {
+            trace.route("browser-wide");
+        }
         // Hold the BiDi single-session lock for the read; releases on Drop.
         // No-op for CDP and for external URL endpoints.
         let _bidi_lock = {
@@ -245,6 +272,17 @@ fn format_header(cookies: &[NormalCookie], reveal: bool) -> String {
         })
         .collect();
     format!("Cookie: {}", parts.join("; "))
+}
+
+/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
+fn strip_tab(raw: &str, tab: Option<&str>) -> String {
+    match tab {
+        Some(name) => raw
+            .strip_suffix(&format!("/{name}"))
+            .unwrap_or(raw)
+            .to_string(),
+        None => raw.to_string(),
+    }
 }
 
 fn write_file(path: &Path, body: &str) -> Result<()> {

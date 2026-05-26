@@ -287,28 +287,119 @@ impl PageSession {
     }
 }
 
+/// Per-candidate pre-flight probe budget when iterating URL-regex matches.
+///
+/// Each candidate gets this much wall-clock to reply to `Runtime.evaluate("1")`
+/// (CDP) or `script.evaluate("1")` (BiDi). Tight enough that a wedged
+/// renderer (Brave Sleeping Tab, devtools-paused, infinite-loop) fails fast
+/// so we can iterate to the next match; generous enough that a healthy tab
+/// on a loaded machine still answers.
+const PICK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<String> {
     let targets = client.list_targets().await?;
-    let mut pages = targets
+    let pages: Vec<&Value> = targets
         .iter()
-        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"));
-    let pick = if let Some(re) = pattern {
-        pages
-            .find(|t| {
-                t.get("url")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| re.is_match(u))
-            })
-            .ok_or_else(|| anyhow!("no CDP page target matched URL regex"))?
-    } else {
-        pages
-            .next()
-            .ok_or_else(|| anyhow!("no page target found"))?
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+        .collect();
+
+    // No regex: keep existing behaviour — take the first page. We do not
+    // probe in this branch because there's typically only one candidate and
+    // the caller hasn't expressed which they want; failing fast on a wedged
+    // single page would be more surprising than just letting the op timeout
+    // handle it.
+    let Some(re) = pattern else {
+        return pages
+            .first()
+            .and_then(|t| t.get("targetId").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("no page target found"));
     };
-    pick.get("targetId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("targetId missing from page target"))
+
+    let matches: Vec<&Value> = pages
+        .into_iter()
+        .filter(|t| {
+            t.get("url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|u| re.is_match(u))
+        })
+        .collect();
+    if matches.is_empty() {
+        return Err(anyhow!("no CDP page target matched URL regex"));
+    }
+
+    // Probe each match in order. Return the first responsive one. If all
+    // are unresponsive, surface a TabHung with the count so the caller
+    // gets an actionable error instead of a 10-second op timeout.
+    let mut hung_count = 0usize;
+    let mut last_target: Option<String> = None;
+    let mut last_url: Option<String> = None;
+    for t in &matches {
+        let target_id = match t.get("targetId").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let url = t
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        last_target = Some(target_id.clone());
+        last_url = url.clone();
+        if probe_cdp_target(client, &target_id, PICK_PROBE_TIMEOUT).await {
+            return Ok(target_id);
+        }
+        hung_count += 1;
+    }
+    let err: anyhow::Error = SessionError::TabHung {
+        target_id: last_target,
+        url: last_url,
+        timeout_ms: PICK_PROBE_TIMEOUT.as_millis() as u64,
+        hint: "all-matches-hung",
+    }
+    .into();
+    Err(err.context(format!(
+        "URL regex matched {hung_count} page(s) but none responded to a {}ms probe",
+        PICK_PROBE_TIMEOUT.as_millis()
+    )))
+}
+
+/// Probe a CDP target by attaching a transient session and evaluating `1`.
+///
+/// Returns `true` if the target answered within `budget`. Best-effort detach
+/// on the way out; the probe outcome doesn't depend on the detach succeeding.
+async fn probe_cdp_target(client: &CdpClient, target_id: &str, budget: Duration) -> bool {
+    let attach = tokio::time::timeout(
+        budget,
+        client.send(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        ),
+    )
+    .await;
+    let session_id = match attach {
+        Ok(Ok(v)) => match v.get("sessionId").and_then(|s| s.as_str()) {
+            Some(s) => s.to_string(),
+            None => return false,
+        },
+        _ => return false,
+    };
+    let eval = client.send_with_session(
+        "Runtime.evaluate",
+        json!({
+            "expression": "1",
+            "returnByValue": true,
+            "awaitPromise": false,
+        }),
+        Some(&session_id),
+    );
+    let alive = matches!(tokio::time::timeout(budget, eval).await, Ok(Ok(_)));
+    let _ = client
+        .send(
+            "Target.detachFromTarget",
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+    alive
 }
 
 async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Result<String> {
@@ -317,25 +408,69 @@ async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Resu
         .get("contexts")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("no contexts in browsingContext.getTree"))?;
-    if let Some(re) = pattern {
-        for c in contexts {
-            let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if re.is_match(url) {
-                return c
-                    .get("context")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| anyhow!("no context id"));
-            }
-        }
-        Err(anyhow!("no BiDi context matched URL regex"))
-    } else {
-        contexts
+
+    // No regex: existing "first top-level context" behaviour.
+    let Some(re) = pattern else {
+        return contexts
             .first()
             .and_then(|c| c.get("context").and_then(|v| v.as_str()))
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("no top-level browsing context"))
+            .ok_or_else(|| anyhow!("no top-level browsing context"));
+    };
+
+    let matches: Vec<&Value> = contexts
+        .iter()
+        .filter(|c| {
+            c.get("url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|u| re.is_match(u))
+        })
+        .collect();
+    if matches.is_empty() {
+        return Err(anyhow!("no BiDi context matched URL regex"));
     }
+
+    let mut hung_count = 0usize;
+    let mut last_ctx: Option<String> = None;
+    let mut last_url: Option<String> = None;
+    for c in &matches {
+        let ctx = match c.get("context").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let url = c
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        last_ctx = Some(ctx.clone());
+        last_url = url.clone();
+        if probe_bidi_context(client, &ctx, PICK_PROBE_TIMEOUT).await {
+            return Ok(ctx);
+        }
+        hung_count += 1;
+    }
+    let err: anyhow::Error = SessionError::TabHung {
+        target_id: last_ctx,
+        url: last_url,
+        timeout_ms: PICK_PROBE_TIMEOUT.as_millis() as u64,
+        hint: "all-matches-hung",
+    }
+    .into();
+    Err(err.context(format!(
+        "URL regex matched {hung_count} context(s) but none responded to a {}ms probe",
+        PICK_PROBE_TIMEOUT.as_millis()
+    )))
+}
+
+/// Probe a BiDi browsing context via `script.evaluate("1")`.
+///
+/// BiDi has no per-target attach; the existing session covers all contexts.
+/// Returns `true` if the context answered within `budget`.
+async fn probe_bidi_context(client: &BidiClient, context: &str, budget: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(budget, client.script_evaluate(context, "1")).await,
+        Ok(Ok(_))
+    )
 }
 
 /// True when both URLs share scheme, host, and effective port.
@@ -667,5 +802,138 @@ mod tests {
 
         s_bad.close().await;
         s_good.close().await;
+    }
+
+    /// CDP mock that selectively wedges `Runtime.evaluate` based on which
+    /// `sessionId` is in use. The mock maps each `attachToTarget` to a
+    /// distinct sessionId, so the test can decide "evals on tab X hang,
+    /// evals on tab Y succeed."
+    async fn spawn_cdp_mock_per_target_eval(
+        targets: Vec<Value>,
+        wedged_targets: Vec<&'static str>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // sessionId → wedge flag
+            let mut session_wedge: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            let mut next_session: u32 = 0;
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap_or("");
+                if method == "Runtime.evaluate" {
+                    if let Some(sid) = req.get("sessionId").and_then(|v| v.as_str()) {
+                        if session_wedge.get(sid).copied().unwrap_or(false) {
+                            // Drop on the floor.
+                            continue;
+                        }
+                    }
+                }
+                let result = match method {
+                    "Target.getTargets" => json!({"targetInfos": targets.clone()}),
+                    "Target.attachToTarget" => {
+                        let target_id = req
+                            .get("params")
+                            .and_then(|p| p.get("targetId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        next_session += 1;
+                        let sid = format!("S{next_session}");
+                        let wedge = wedged_targets.iter().any(|w| *w == target_id);
+                        session_wedge.insert(sid.clone(), wedge);
+                        json!({"sessionId": sid})
+                    }
+                    "Target.detachFromTarget" => json!({}),
+                    "Runtime.evaluate" => json!({"result": {"value": "ok"}}),
+                    _ => json!({}),
+                };
+                let resp = json!({"id": id, "result": result});
+                ws.send(Message::Text(resp.to_string())).await.unwrap();
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Regex matches two pages; the first is wedged, the second answers
+    /// the probe. We pick the second.
+    #[tokio::test]
+    async fn pick_cdp_iterates_past_hung_match() {
+        let url = spawn_cdp_mock_per_target_eval(
+            vec![
+                json!({"targetId":"DEAD","type":"page","url":"https://twitch.tv/gametechnology"}),
+                json!({"targetId":"LIVE","type":"page","url":"https://gametechnology.somewhere.com"}),
+            ],
+            vec!["DEAD"],
+        )
+        .await;
+        let s = PageSession::attach(&url, Engine::Cdp, Some(r"gametechnology"))
+            .await
+            .expect("must iterate past the wedged tab and pick LIVE");
+        match s {
+            PageSession::Cdp(p) => assert_eq!(p.target_id, "LIVE"),
+            _ => panic!("expected CDP"),
+        }
+    }
+
+    /// Regex matches two pages and both are wedged → typed TabHung with
+    /// the `all-matches-hung` hint. Must complete within
+    /// 2 × PICK_PROBE_TIMEOUT + slack (one probe per match).
+    #[tokio::test]
+    async fn pick_cdp_all_matches_hung_returns_tab_hung() {
+        let url = spawn_cdp_mock_per_target_eval(
+            vec![
+                json!({"targetId":"A","type":"page","url":"https://example.com/foo"}),
+                json!({"targetId":"B","type":"page","url":"https://example.com/bar"}),
+            ],
+            vec!["A", "B"],
+        )
+        .await;
+        let start = std::time::Instant::now();
+        let err = match PageSession::attach(&url, Engine::Cdp, Some(r"example\.com")).await {
+            Ok(_) => panic!("all matches wedged → must error"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < PICK_PROBE_TIMEOUT * 2 + Duration::from_millis(500),
+            "took too long: {elapsed:?}"
+        );
+        let typed = err.downcast_ref::<SessionError>().expect("typed error");
+        match typed {
+            SessionError::TabHung { hint, .. } => {
+                assert_eq!(*hint, "all-matches-hung");
+            }
+            other => panic!("expected TabHung, got {other:?}"),
+        }
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("URL regex matched 2 page(s)"),
+            "context missing count: {text}"
+        );
+    }
+
+    /// Regex matches one healthy page → picks it, the probe is a no-op
+    /// for behaviour (just confirms responsiveness) and we still attach.
+    #[tokio::test]
+    async fn pick_cdp_single_healthy_match_is_picked() {
+        let url = spawn_cdp_mock_per_target_eval(
+            vec![
+                json!({"targetId":"OK","type":"page","url":"https://example.com/x"}),
+            ],
+            vec![],
+        )
+        .await;
+        let s = PageSession::attach(&url, Engine::Cdp, Some(r"example"))
+            .await
+            .unwrap();
+        match s {
+            PageSession::Cdp(p) => assert_eq!(p.target_id, "OK"),
+            _ => panic!("expected CDP"),
+        }
     }
 }

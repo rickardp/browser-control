@@ -12,6 +12,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::errors::{is_bidi_target_gone, SessionError, TargetKind};
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -143,7 +145,7 @@ impl BidiClient {
 
         match tokio::time::timeout(SEND_TIMEOUT, rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(e.into()),
+            Ok(Ok(Err(e))) => Err(classify_bidi_error(e)),
             Ok(Err(_)) => Err(anyhow!("BiDi response channel cancelled")),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -267,6 +269,21 @@ impl BidiClient {
     }
 }
 
+/// Convert a `BidiError` reply into a typed `SessionError::TargetGone` when
+/// its code/message matches a known "gone" indicator (`no such frame`,
+/// `no such context`, `invalid session id`), otherwise pass through as the
+/// generic BiDi error.
+fn classify_bidi_error(err: BidiError) -> anyhow::Error {
+    if is_bidi_target_gone(&err.code, &err.message) {
+        return SessionError::TargetGone {
+            kind: TargetKind::Bidi,
+            details: format!("BiDi error {}: {}", err.code, err.message),
+        }
+        .into();
+    }
+    err.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +367,82 @@ mod tests {
 
         let unrelated: anyhow::Error = anyhow!("not a bidi error");
         assert!(!is_session_already_active(&unrelated));
+    }
+
+    /// BiDi error with a "context gone" code surfaces as typed
+    /// `SessionError::TargetGone`. Mirrors the CDP test so the same
+    /// recovery wrappers can switch on the typed variant.
+    #[tokio::test]
+    async fn send_classifies_target_gone() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                let id = v["id"].as_u64().unwrap();
+                let reply = json!({
+                    "id": id,
+                    "type": "error",
+                    "error": "no such frame",
+                    "message": "context C1 not found"
+                });
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = BidiClient::connect(&format!("ws://{}", addr))
+            .await
+            .unwrap();
+        let err = client
+            .send("script.evaluate", json!({"target": {"context": "C1"}}))
+            .await
+            .expect_err("must error");
+        let typed = err
+            .downcast_ref::<crate::errors::SessionError>()
+            .expect("typed SessionError");
+        match typed {
+            crate::errors::SessionError::TargetGone { kind, details } => {
+                assert_eq!(*kind, crate::errors::TargetKind::Bidi);
+                assert!(details.contains("no such frame"));
+            }
+            other => panic!("expected TargetGone, got {other:?}"),
+        }
+    }
+
+    /// Unrelated BiDi errors (e.g. `invalid argument`) are NOT classified
+    /// as `TargetGone` — they pass through as the regular `BidiError` so
+    /// tab-recovery doesn't fire on schema mistakes.
+    #[tokio::test]
+    async fn send_does_not_classify_unrelated_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                let id = v["id"].as_u64().unwrap();
+                let reply = json!({
+                    "id": id,
+                    "type": "error",
+                    "error": "invalid argument",
+                    "message": "missing required field"
+                });
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = BidiClient::connect(&format!("ws://{}", addr))
+            .await
+            .unwrap();
+        let err = client
+            .send("script.evaluate", json!({}))
+            .await
+            .expect_err("must error");
+        assert!(
+            err.downcast_ref::<crate::errors::SessionError>().is_none(),
+            "non-gone BiDi error must not classify as TargetGone"
+        );
     }
 
     #[tokio::test]

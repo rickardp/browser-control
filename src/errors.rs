@@ -42,4 +42,73 @@ pub enum SessionError {
     /// Distinct from `TabHung` because the tab was never there to wedge.
     #[error("no tab `{name}` registered for browser `{browser}` — run `browser-control tab open {browser}/{name}` first")]
     TabNotFound { browser: String, name: String },
+    /// Protocol-level error indicating the underlying target/session/context
+    /// referenced by the request no longer exists in the browser. Raised by
+    /// the CDP/BiDi client layer when the server returns a recognised
+    /// "gone" code (e.g. `no target with given id`, `no such frame`). The
+    /// recover-once wrappers treat this as a signal to recreate the tab
+    /// and retry; otherwise it would surface as a generic protocol error.
+    #[error("{kind:?} target gone: {details}")]
+    TargetGone { kind: TargetKind, details: String },
+    /// The requested operation cannot run against the currently selected
+    /// browser engine. Used by the Playwright sidecar tools (snapshot,
+    /// click, type, etc.) when the active browser is BiDi (Firefox) —
+    /// Playwright can't drive a user-launched Firefox. The agent's
+    /// recovery is to `browser_select` a Chromium-family browser, or
+    /// to use the engine-agnostic tools (`browser_evaluate`,
+    /// `browser_navigate`, etc.) which work on both engines.
+    #[error("tool `{tool}` requires {required_engine} engine; current browser uses {current_engine} ({hint})")]
+    EngineUnsupported {
+        tool: String,
+        required_engine: String,
+        current_engine: String,
+        hint: &'static str,
+    },
+}
+
+/// Which protocol surfaced a `TargetGone`. Useful for diagnostics; the
+/// recovery path treats both kinds identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Cdp,
+    Bidi,
+}
+
+/// Substrings that, when found in a CDP error `message`, indicate the
+/// target/session referenced by the call no longer exists. Centralised so
+/// the client-layer classifier and the recovery-wrapper fallback agree.
+pub const CDP_TARGET_GONE_NEEDLES: &[&str] = &[
+    "no target with given id",
+    "session is gone",
+    "no session with given id",
+    "target closed",
+];
+
+/// Substrings that indicate a BiDi context/frame/session is gone. BiDi
+/// also surfaces context-gone via the dedicated error codes
+/// `no such frame` / `no such context` etc.; we match on message text so
+/// we catch both shapes.
+pub const BIDI_TARGET_GONE_NEEDLES: &[&str] = &[
+    "no such frame",
+    "no such node",
+    "no such context",
+    "invalid session id",
+];
+
+/// Returns true if `message` matches any CDP "target gone" indicator.
+pub fn is_cdp_target_gone(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    CDP_TARGET_GONE_NEEDLES.iter().any(|n| m.contains(n))
+}
+
+/// Returns true if `code` or `message` indicates a BiDi context is gone.
+/// BiDi codes are stable per spec (`no such frame`, etc.), but we also
+/// scan the message in case the code is generic.
+pub fn is_bidi_target_gone(code: &str, message: &str) -> bool {
+    let c = code.to_ascii_lowercase();
+    if BIDI_TARGET_GONE_NEEDLES.iter().any(|n| c.contains(n)) {
+        return true;
+    }
+    let m = message.to_ascii_lowercase();
+    BIDI_TARGET_GONE_NEEDLES.iter().any(|n| m.contains(n))
 }

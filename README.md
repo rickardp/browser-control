@@ -53,8 +53,10 @@ $script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/sc
 & ([scriptblock]::Create($script)) -Purge
 ```
 
-Requires Rust 1.80 or newer when building from source. Node.js (for `npx`) is
-only required if you intend to use `mcp --playwright`.
+Requires Rust 1.80 or newer when building from source. A Node runtime
+(`bun` preferred, `node`+`npm` accepted) is required only if you invoke the
+Playwright-only MCP tools (`browser_click`, `browser_snapshot`, etc.); the
+sidecar is spawned lazily on first use.
 
 ## Usage
 
@@ -116,14 +118,14 @@ Windows: `%APPDATA%\browser-control\profiles\<kind>\default\`), so subsequent
 starts of the same kind reuse the same browser state across reboots. This is
 intentional: it avoids re-authenticating in every new browser session.
 
-### `mcp [BROWSER] [--playwright]`
+### `mcp [BROWSER] [--playwright-version <X.Y.Z>]`
 
 Start an MCP server on stdio that targets a running browser.
 
 ```sh
-browser-control mcp                     # use persisted default browser
-browser-control mcp firefox             # target a specific kind
-browser-control mcp --playwright        # passthrough to @playwright/mcp
+browser-control mcp                            # use persisted default browser
+browser-control mcp firefox                    # target a specific kind
+browser-control mcp --playwright-version 1.55  # pin a custom playwright-core
 ```
 
 Browser resolution order:
@@ -132,10 +134,16 @@ Browser resolution order:
 2. The persisted default from `browser-control set default <value>`
 3. Otherwise, exit with an error
 
-With `--playwright`, the CLI spawns the official `@playwright/mcp` via `npx`,
-hands it the resolved CDP endpoint, and forwards stdio bidirectionally. The
-host sees only Playwright MCP's tools; `browser-control`'s own MCP tools are
-not exposed in that mode.
+The server exposes engine-agnostic tools (`browser_navigate`, `browser_evaluate`,
+`browser_storage_get`, `browser_cookies`, …) that work on every supported
+browser including Firefox. Playwright-only interaction tools (`browser_click`,
+`browser_type`, `browser_snapshot`, `browser_press_key`, `browser_drag`,
+`browser_hover`, `browser_wait_for`, `browser_pdf_save`) route through an
+internal Node sidecar that wraps `playwright-core`. On the first call to one
+of these tools the sidecar is spawned (prefers `bun`, falls back to `node`+`npm`)
+against the active browser's CDP endpoint; on Firefox they return
+`EngineUnsupported`. The `--playwright-version` flag overrides the pinned
+`playwright-core` version for the sidecar.
 
 ### `set | get | unset <KEY> [VALUE]`
 
@@ -326,20 +334,6 @@ underlying model.
 }
 ```
 
-With `--playwright` passthrough (Playwright MCP's tool surface, but driving
-the browser that `browser-control` manages):
-
-```json
-{
-  "mcpServers": {
-    "browser-control": {
-      "command": "browser-control",
-      "args": ["mcp", "--playwright"]
-    }
-  }
-}
-```
-
 You can scope a single host invocation to a specific browser by setting
 `BROWSER_CONTROL`:
 
@@ -373,8 +367,9 @@ same registry.
                                                          ▲
                                                          │ CDP / BiDi
                                                          │
-              MCP host ──► browser-control mcp [--playwright] ┘
+              MCP host ──► browser-control mcp ┘
                               (resolves browser via registry / BROWSER_CONTROL)
+                              (Playwright tools route through internal sidecar)
 ```
 
 The CLI does not stop or restart browsers; the user owns lifecycle. Stale

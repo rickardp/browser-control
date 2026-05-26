@@ -1,4 +1,16 @@
 //! `browser-control storage` — local/sessionStorage get/set/list.
+//!
+//! Routing mirrors `eval`/`fetch`. The `<browser>` positional accepts the
+//! unified `<browser>[/<tab>]` syntax; three paths fall out of `(tab, --target)`:
+//!
+//! 1. `<browser>/<tab>` (no `--target`) — named-tab path via
+//!    [`with_named_tab_recovery`]. Engine-agnostic, recover-once on dead tabs.
+//! 2. `<browser>` (no `--target`) — scratch tab via [`with_scratch_recovery`].
+//!    Storage `Set` against a scratch (`about:blank`) writes to that origin —
+//!    symmetric with `eval`, where the same caveat applies.
+//! 3. `<browser> --target <regex>` — legacy `PageSession::attach`.
+//!
+//! `<browser>/<tab>` and `--target` are mutually exclusive.
 
 use std::time::Duration;
 
@@ -6,9 +18,12 @@ use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use serde_json::Value;
 
+use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::registry::Registry;
-use crate::session::PageSession;
+use crate::session::backend::open_backend;
+use crate::session::{with_named_tab_recovery, with_scratch_recovery, PageSession};
 
 /// Per-call timeout for storage probes. The expressions injected here are
 /// trivial (`localStorage.getItem`, `JSON.stringify(Object.entries(...))`,
@@ -58,7 +73,7 @@ pub enum StorageCmd {
 }
 
 pub async fn run(cmd: StorageCmd) -> Result<()> {
-    let (sub, result) = match cmd {
+    match cmd {
         StorageCmd::Get {
             browser,
             key,
@@ -66,61 +81,170 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             target,
             namespace,
             json,
-        } => (
-            "storage-get",
-            run_get(browser, key, key_regex, target, namespace, json).await,
-        ),
+        } => {
+            let mut trace = CommandTrace::new("storage-get");
+            match run_get(browser, key, key_regex, target, namespace, json, &mut trace).await {
+                Ok(()) => {
+                    trace.ok(());
+                    Ok(())
+                }
+                Err(e) => Err(trace.err(e)),
+            }
+        }
         StorageCmd::Set {
             browser,
             key,
             value,
             target,
             namespace,
-        } => (
-            "storage-set",
-            run_set(browser, key, value, target, namespace).await,
-        ),
+        } => {
+            let mut trace = CommandTrace::new("storage-set");
+            match run_set(browser, key, value, target, namespace, &mut trace).await {
+                Ok(()) => {
+                    trace.ok(());
+                    Ok(())
+                }
+                Err(e) => Err(trace.err(e)),
+            }
+        }
         StorageCmd::List {
             browser,
             key_regex,
             target,
             namespace,
             json,
-        } => (
-            "storage-list",
-            run_list(browser, key_regex, target, namespace, json).await,
-        ),
-    };
-    let mut trace = crate::cli::trace::CommandTrace::new(sub);
-    trace.route("registry");
-    match result {
-        Ok(()) => {
-            trace.ok(());
-            Ok(())
+        } => {
+            let mut trace = CommandTrace::new("storage-list");
+            match run_list(browser, key_regex, target, namespace, json, &mut trace).await {
+                Ok(()) => {
+                    trace.ok(());
+                    Ok(())
+                }
+                Err(e) => Err(trace.err(e)),
+            }
         }
-        Err(e) => Err(trace.err(e)),
     }
 }
 
-async fn evaluate_in_target(
+/// Run a JS expression against the resolved browser using the same
+/// three-path routing (`named-tab` / `scratch` / `target-regex` / `direct`)
+/// that `eval` uses. Returns the evaluated value.
+///
+/// Routing decision rules:
+/// - `<browser>/<tab>` + no `--target` → named-tab path.
+/// - bare `<browser>` + no `--target` → scratch path (or `direct` for
+///   external URL endpoints — there's no registry row to key a scratch by).
+/// - `<browser>` + `--target <regex>` → legacy attach.
+/// - Both `<browser>/<tab>` and `--target` → error.
+async fn evaluate_routed(
     browser: Option<String>,
     target: Option<String>,
     expr: &str,
+    trace: &mut CommandTrace,
 ) -> Result<Value> {
-    let resolved = resolve_browser(browser).await?;
-    // Acquire the Firefox BiDi single-session lock if this is a BiDi
-    // browser; held for the storage op. No-op on CDP.
-    let _bidi_lock = {
-        let registry = Registry::open()?;
-        acquire_bidi_lock_if_needed(&registry, &resolved)?
+    let raw = browser.unwrap_or_default();
+    let parsed = if raw.is_empty() {
+        None
+    } else {
+        Some(env_resolver::parse_target(&raw)?)
     };
-    let session =
-        PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
-    let value = session
-        .evaluate_with_timeout(expr, true, Some(STORAGE_TIMEOUT))
-        .await;
-    session.close().await;
-    value
+    let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
+    if tab_name.is_some() && target.is_some() {
+        bail!("specify the tab via either `<browser>/<name>` or `--target <regex>`, not both");
+    }
+    let browser_only = parsed
+        .as_ref()
+        .map(|p| strip_tab(&raw, p.tab.as_deref()))
+        .unwrap_or_default();
+    let resolved = resolve_browser(if browser_only.is_empty() {
+        None
+    } else {
+        Some(browser_only.clone())
+    })
+    .await?;
+    trace.browser(&browser_only).engine(resolved.engine);
+
+    let registry = Registry::open()?;
+    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+
+    match (tab_name, target) {
+        // Path 1: <browser>/<tab> — named tab with recover-once.
+        (Some(name), None) => {
+            trace.route("named-tab").tab_name(&name);
+            let browser_name = match &resolved.source {
+                Source::Registered { name } => name.clone(),
+                _ => bail!(
+                    "named tabs (`<browser>/<name>`) require a registered browser; \
+                     external endpoints can't carry tab names"
+                ),
+            };
+            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+            let expr = expr.to_string();
+            with_named_tab_recovery(
+                &backend,
+                &registry,
+                &browser_name,
+                &name,
+                move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await }
+                },
+            )
+            .await
+        }
+        // Path 2: bare browser, no `--target` → scratch tab with recover-once.
+        (None, None) => {
+            if matches!(resolved.source, Source::External) {
+                // External URL endpoint — no registry row to key a scratch
+                // by. Fall back to the legacy direct attach so external
+                // endpoints still work.
+                trace.route("direct");
+                let session =
+                    PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+                let value = session
+                    .evaluate_with_timeout(expr, true, Some(STORAGE_TIMEOUT))
+                    .await;
+                session.close().await;
+                value
+            } else {
+                trace.route("scratch");
+                let browser_name = match &resolved.source {
+                    Source::Registered { name } => name.clone(),
+                    _ => unreachable!("Source::External branch handled above"),
+                };
+                let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+                let expr = expr.to_string();
+                with_scratch_recovery(&backend, &registry, &browser_name, move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await }
+                })
+                .await
+            }
+        }
+        // Path 3: bare browser, --target regex → legacy selector.
+        (None, Some(regex)) => {
+            trace.route("target-regex");
+            let session =
+                PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
+            let value = session
+                .evaluate_with_timeout(expr, true, Some(STORAGE_TIMEOUT))
+                .await;
+            session.close().await;
+            value
+        }
+        _ => unreachable!("mutex was checked above"),
+    }
+}
+
+/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
+fn strip_tab(raw: &str, tab: Option<&str>) -> String {
+    match tab {
+        Some(name) => raw
+            .strip_suffix(&format!("/{name}"))
+            .unwrap_or(raw)
+            .to_string(),
+        None => raw.to_string(),
+    }
 }
 
 async fn run_get(
@@ -130,6 +254,7 @@ async fn run_get(
     target: Option<String>,
     namespace: String,
     json: bool,
+    trace: &mut CommandTrace,
 ) -> Result<()> {
     let ns = ns_global(&namespace)?;
     match (key.as_deref(), key_regex.as_deref()) {
@@ -137,7 +262,7 @@ async fn run_get(
         (None, None) => bail!("specify a KEY or --key-regex"),
         (Some(k), None) => {
             let expr = build_get_expr(ns, k);
-            let value = evaluate_in_target(browser, target, &expr).await?;
+            let value = evaluate_routed(browser, target, &expr, trace).await?;
             if value.is_null() {
                 bail!("key not found: {k}");
             }
@@ -152,7 +277,7 @@ async fn run_get(
         }
         (None, Some(pat)) => {
             let expr = build_get_by_regex_expr(ns, pat);
-            let value = evaluate_in_target(browser, target, &expr).await?;
+            let value = evaluate_routed(browser, target, &expr, trace).await?;
             if value.is_null() {
                 bail!("no key matches regex");
             }
@@ -177,10 +302,11 @@ async fn run_set(
     value: String,
     target: Option<String>,
     namespace: String,
+    trace: &mut CommandTrace,
 ) -> Result<()> {
     let ns = ns_global(&namespace)?;
     let expr = build_set_expr(ns, &key, &value);
-    evaluate_in_target(browser, target, &expr).await?;
+    evaluate_routed(browser, target, &expr, trace).await?;
     Ok(())
 }
 
@@ -190,10 +316,11 @@ async fn run_list(
     target: Option<String>,
     namespace: String,
     json: bool,
+    trace: &mut CommandTrace,
 ) -> Result<()> {
     let ns = ns_global(&namespace)?;
     let expr = build_list_expr(ns, key_regex.as_deref());
-    let value = evaluate_in_target(browser, target, &expr).await?;
+    let value = evaluate_routed(browser, target, &expr, trace).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -329,5 +456,32 @@ mod tests {
         let expr = build_list_expr("sessionStorage", Some("a\"b"));
         assert!(expr.contains("new RegExp(\"a\\\"b\")"), "expr: {expr}");
         assert!(expr.contains("const ns = sessionStorage;"));
+    }
+
+    #[test]
+    fn strip_tab_removes_suffix_when_present() {
+        assert_eq!(strip_tab("brave/cart", Some("cart")), "brave");
+        assert_eq!(strip_tab("brave", None), "brave");
+        // If `tab` is `Some` but does not in fact match the suffix, the
+        // original raw is returned unchanged (defensive — shouldn't happen
+        // in practice because the caller derives `tab` from the same raw).
+        assert_eq!(strip_tab("brave/cart", Some("other")), "brave/cart");
+    }
+
+    #[tokio::test]
+    async fn evaluate_routed_rejects_tab_and_target_together() {
+        let mut trace = CommandTrace::new("storage-get");
+        let err = evaluate_routed(
+            Some("brave/cart".to_string()),
+            Some(".*".to_string()),
+            "1",
+            &mut trace,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("either"),
+            "unexpected error: {err}"
+        );
     }
 }

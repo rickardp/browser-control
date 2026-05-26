@@ -166,8 +166,13 @@ async fn target_alive(backend: &TabBackend, target_id: &str) -> Result<bool> {
 /// 2. Run `op` against the live `target_id`.
 /// 3. If `op` returns a recoverable failure (`TabHung`, `TabCrashed`, or a
 ///    CDP/BiDi "no target / no context" protocol error), the tab died
-///    between resolve and op. Close the corpse (best-effort), recreate a
-///    fresh `about:blank` under the **same name**, retry `op` once.
+///    between resolve and op. **Leave the dead tab in the browser** — the
+///    agent named it, the corpse is human-inspectable. Create a fresh
+///    `about:blank` tab and re-point the registry row at it under the
+///    **same name**, then retry `op` once. After recovery,
+///    `<browser>/<name>` resolves to the new live tab; the dead tab is no
+///    longer addressable by name (and `tab list` won't show it, since
+///    sweep-on-read checks against `live_target_ids`).
 ///    The new tab is blank — agents that need a specific URL on a recovered
 ///    tab are expected to `tab open <browser>/<name> <url>` to rehydrate.
 /// 4. If the retry also fails, escalate the typed error to the caller.
@@ -206,8 +211,14 @@ where
         Ok(value) => return Ok(value),
         Err(e) if is_tab_failure(&e) => {
             // Step 3: recover. Tab died between resolve and op.
-            let _ = backend.close_tab(&row.target_id).await;
-            // Replace the row in place with a fresh blank tab. Keep the name.
+            //
+            // Do NOT close the dead tab. The agent named it; the corpse
+            // stays in the browser so the human can inspect it. The
+            // registry row gets re-pointed at a fresh blank tab under
+            // the same name — addressing-by-name now resolves to the
+            // new live tab, the dead tab is no longer reachable via
+            // `<browser>/<name>` and falls off `tab list` (sweep-on-read
+            // checks the row's target_id against live_target_ids).
             let new_target_id = backend.create_tab("about:blank").await?;
             registry.tab_upsert(browser_name, tab_name, &new_target_id, "about:blank", true)?;
             // Step 4: retry once.
@@ -222,12 +233,16 @@ where
 /// rather than re-exported so the two recovery wrappers don't develop
 /// hidden coupling.
 fn is_tab_failure(err: &anyhow::Error) -> bool {
+    // Primary: typed variants from the session / protocol layer.
     if let Some(se) = err.downcast_ref::<SessionError>() {
         return matches!(
             se,
-            SessionError::TabHung { .. } | SessionError::TabCrashed { .. }
+            SessionError::TabHung { .. }
+                | SessionError::TabCrashed { .. }
+                | SessionError::TargetGone { .. }
         );
     }
+    // Defensive fallback for un-classified raw protocol errors.
     let msg = format!("{err:#}").to_ascii_lowercase();
     msg.contains("no target with given id")
         || msg.contains("session is gone")
@@ -655,9 +670,10 @@ mod tests {
         assert!(reg.tab_get("b", "ghost").unwrap().is_none(), "swept");
     }
 
-    /// First op call wedges (returns `TabHung`); wrapper closes the tab,
-    /// recreates a fresh blank under the same name, retries; second
-    /// attempt succeeds. Caller sees a value.
+    /// First op call wedges (returns `TabHung`); wrapper leaves the dead
+    /// tab alone, recreates a fresh blank under the same name, retries;
+    /// second attempt succeeds. Caller sees a value, dead tab persists
+    /// in the browser for inspection.
     #[tokio::test]
     async fn recover_after_op_returns_tab_hung() {
         let (backend, _stop) = cdp_backend().await;
@@ -700,6 +716,91 @@ mod tests {
         assert_eq!(row.last_url, "about:blank", "recovered tab is blank");
         // The op was called with the fresh target on the second attempt.
         assert_eq!(result, serde_json::json!(format!("ok:{}", row.target_id)));
+    }
+
+    /// Recovery must NOT close the dead tab: the corpse stays in the
+    /// browser so the human can inspect it. The mock tracks live targets
+    /// via `Target.createTarget` / `Target.closeTarget`; if recovery
+    /// closes the dead one, `live_target_ids` will drop it.
+    #[tokio::test]
+    async fn recovery_leaves_dead_named_tab_in_browser() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        let opened = tab_open(&backend, &reg, "b", Some("doomed"), None)
+            .await
+            .unwrap();
+        let original_target = opened.target_id.clone();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let _ = with_named_tab_recovery(&backend, &reg, "b", "doomed", move |_, target_id| {
+            let calls = calls_clone.clone();
+            async move {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(SessionError::TabHung {
+                        target_id: Some(target_id),
+                        url: None,
+                        timeout_ms: 100,
+                        hint: "test",
+                    }
+                    .into())
+                } else {
+                    Ok::<_, anyhow::Error>(serde_json::json!("ok"))
+                }
+            }
+        })
+        .await
+        .expect("recover succeeded");
+
+        // Two live targets after recovery: the dead one + the fresh blank.
+        // (Recovery left the dead one alone instead of closing it.)
+        let live = backend.live_target_ids().await.unwrap();
+        assert!(
+            live.contains(&original_target),
+            "dead tab must persist; live = {live:?}, original = {original_target}"
+        );
+        assert_eq!(live.len(), 2, "expected dead + fresh; got {live:?}");
+
+        // The registry row points at the fresh tab, not the dead one.
+        let row = reg.tab_get("b", "doomed").unwrap().unwrap();
+        assert_ne!(row.target_id, original_target);
+    }
+
+    /// `is_tab_failure` matches the typed `TargetGone` variant first
+    /// (primary path) and falls back to substring matching for
+    /// un-classified raw errors.
+    #[test]
+    fn is_tab_failure_recognizes_typed_target_gone() {
+        use crate::errors::TargetKind;
+        let typed: anyhow::Error = SessionError::TargetGone {
+            kind: TargetKind::Cdp,
+            details: "CDP error -32000: target closed".into(),
+        }
+        .into();
+        assert!(is_tab_failure(&typed));
+
+        let typed_bidi: anyhow::Error = SessionError::TargetGone {
+            kind: TargetKind::Bidi,
+            details: "BiDi error no such frame: C1".into(),
+        }
+        .into();
+        assert!(is_tab_failure(&typed_bidi));
+
+        let hung: anyhow::Error = SessionError::TabHung {
+            target_id: None,
+            url: None,
+            timeout_ms: 100,
+            hint: "t",
+        }
+        .into();
+        assert!(is_tab_failure(&hung));
+
+        let raw: anyhow::Error = anyhow::anyhow!("Target closed");
+        assert!(is_tab_failure(&raw));
+
+        let unrelated: anyhow::Error = anyhow::anyhow!("dns failure");
+        assert!(!is_tab_failure(&unrelated));
     }
 
     /// Both attempts return `TabHung` → escalate to the caller.

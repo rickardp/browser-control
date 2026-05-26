@@ -1,0 +1,13 @@
+{
+  "name": "browser-control-playwright-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "sidecar.mjs",
+  "dependencies": {
+    "playwright-core": "1.49.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

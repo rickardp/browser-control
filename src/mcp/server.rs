@@ -6,7 +6,9 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::cli::env_resolver::ResolvedBrowser;
 use crate::session::backend::TabBackend;
@@ -15,14 +17,22 @@ use crate::session::backend::TabBackend;
 /// tool calls because Firefox limits concurrent BiDi sessions per browser
 /// to one. The browsing-context id is resolved per call so multiple tabs
 /// can be addressed once URL-regex selection is added.
-pub type BidiCache =
-    std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<crate::bidi::BidiClient>>>>;
+pub type BidiCache = Arc<Mutex<Option<Arc<crate::bidi::BidiClient>>>>;
 
 /// State carried by the server. Tools reach into this for the resolved
 /// browser endpoint and any cached engine clients.
+///
+/// `browser` is `RwLock`-wrapped so `browser_select` can swap the active
+/// browser at runtime; readers take a brief read lock and clone out the
+/// value they need (the struct is cheap to clone).
+///
+/// `active_target_id` is the in-memory pointer to the MCP server's
+/// "current tab" — replaces the SQLite `_mcp-<pid>` row pattern. The
+/// pointer is lazy-initialised on first stateful tool call and updated
+/// by `browser_tab_*` and `browser_select`.
 #[derive(Clone)]
 pub struct ServerState {
-    pub browser: ResolvedBrowser,
+    pub browser: Arc<RwLock<ResolvedBrowser>>,
     pub bidi: BidiCache,
     /// Firefox BiDi single-session lock, acquired lazily on first tool
     /// call and held for the server's lifetime. `None` for CDP browsers
@@ -30,12 +40,27 @@ pub struct ServerState {
     /// returns None) — the inner `Option<BidiLockGuard>` distinguishes
     /// "haven't tried yet" from "tried, not applicable" via the outer
     /// `Mutex` being unlocked vs returning None.
-    pub bidi_lock: std::sync::Arc<tokio::sync::Mutex<BidiLockState>>,
+    pub bidi_lock: Arc<Mutex<BidiLockState>>,
     /// Cached [`TabBackend`] for the configured browser, opened lazily
     /// on first tool call and reused for the server's lifetime. Avoids
     /// repeatedly running the BiDi `session.new` handshake and lets us
     /// share one CDP WebSocket across all tool calls.
-    pub backend: std::sync::Arc<tokio::sync::Mutex<Option<TabBackend>>>,
+    pub backend: Arc<Mutex<Option<TabBackend>>>,
+    /// In-memory "active tab" pointer. `None` until lazy-init by
+    /// `current_tab()` or set explicitly by `browser_tab_select` /
+    /// `browser_tab_new`. Cleared on `browser_tab_close` (when closing
+    /// the active tab) and on `browser_select`.
+    pub active_target_id: Arc<Mutex<Option<String>>>,
+    /// Lazy-spawned Playwright sidecar for the Chromium-only interaction
+    /// tools (`browser_click`, `browser_snapshot`, etc.). One sidecar
+    /// per server-per-browser; `browser_select` disposes the old one
+    /// and the next sidecar-using tool spawns a fresh one against the
+    /// new endpoint. `None` for BiDi browsers (the sidecar tools error
+    /// with `EngineUnsupported`) and on fresh servers until first use.
+    pub sidecar: Arc<Mutex<Option<crate::sidecar::Sidecar>>>,
+    /// Sidecar config (Playwright version override etc.) — set once at
+    /// server startup from CLI args, read on each sidecar spawn.
+    pub sidecar_config: crate::sidecar::SidecarConfig,
 }
 
 /// Three-state cache: `Pending` until first tool call attempts acquire;
@@ -51,12 +76,56 @@ pub enum BidiLockState {
 
 impl ServerState {
     pub fn new(browser: ResolvedBrowser) -> Self {
+        Self::with_sidecar_config(browser, crate::sidecar::SidecarConfig::default())
+    }
+
+    /// Construct a `ServerState` with a non-default sidecar config (e.g.
+    /// a custom Playwright version from `--playwright-version`).
+    pub fn with_sidecar_config(
+        browser: ResolvedBrowser,
+        sidecar_config: crate::sidecar::SidecarConfig,
+    ) -> Self {
         Self {
-            browser,
-            bidi: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            bidi_lock: std::sync::Arc::new(tokio::sync::Mutex::new(BidiLockState::Pending)),
-            backend: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            browser: Arc::new(RwLock::new(browser)),
+            bidi: Arc::new(Mutex::new(None)),
+            bidi_lock: Arc::new(Mutex::new(BidiLockState::Pending)),
+            backend: Arc::new(Mutex::new(None)),
+            active_target_id: Arc::new(Mutex::new(None)),
+            sidecar: Arc::new(Mutex::new(None)),
+            sidecar_config,
         }
+    }
+
+    /// Lazy-spawn the Playwright sidecar against the current browser.
+    /// Errors with `EngineUnsupported` when the active browser is BiDi
+    /// (Playwright can't drive a user-launched Firefox over BiDi/CDP).
+    ///
+    /// Idempotent: subsequent calls return the cached handle. The handle
+    /// is dropped (and the child killed) when `switch_browser` clears it.
+    pub async fn ensure_sidecar(&self, tool_name: &str) -> Result<crate::sidecar::Sidecar> {
+        let resolved = self.browser_snapshot().await;
+        if resolved.engine != crate::detect::Engine::Cdp {
+            return Err(crate::errors::SessionError::EngineUnsupported {
+                tool: tool_name.to_string(),
+                required_engine: "Chromium (CDP)".into(),
+                current_engine: format!("{:?}", resolved.engine),
+                hint: "use browser_evaluate or switch to a Chromium browser via browser_select",
+            }
+            .into());
+        }
+        let mut guard = self.sidecar.lock().await;
+        if let Some(sc) = guard.as_ref() {
+            return Ok(sc.clone());
+        }
+        let sc = crate::sidecar::Sidecar::start(self.sidecar_config.clone()).await?;
+        sc.connect(&resolved.endpoint).await?;
+        *guard = Some(sc.clone());
+        Ok(sc)
+    }
+
+    /// Snapshot the current resolved browser (cheap clone of a small struct).
+    pub async fn browser_snapshot(&self) -> ResolvedBrowser {
+        self.browser.read().await.clone()
     }
 
     /// Ensure the BiDi single-session lock is held (if applicable).
@@ -68,7 +137,8 @@ impl ServerState {
         let mut guard = self.bidi_lock.lock().await;
         if matches!(*guard, BidiLockState::Pending) {
             let registry = Registry::open()?;
-            *guard = match acquire_bidi_lock_if_needed(&registry, &self.browser)? {
+            let resolved = self.browser_snapshot().await;
+            *guard = match acquire_bidi_lock_if_needed(&registry, &resolved)? {
                 Some(lock) => BidiLockState::Acquired(lock),
                 None => BidiLockState::NotApplicable,
             };
@@ -86,97 +156,286 @@ impl ServerState {
         if let Some(b) = guard.as_ref() {
             return Ok(b.clone());
         }
-        let b = crate::session::backend::open_backend(&self.browser.endpoint, self.browser.engine)
-            .await?;
+        let resolved = self.browser_snapshot().await;
+        let b = crate::session::backend::open_backend(&resolved.endpoint, resolved.engine).await?;
         *guard = Some(b.clone());
         Ok(b)
     }
 
-    /// Lazy-open the **MCP server's** "active tab" — a daemon-created
-    /// row in the `tabs` table keyed by the server's pid (so concurrent
-    /// MCP servers against the same browser get distinct active tabs)
-    /// and the registered browser name.
+    /// Resolve the MCP server's "active tab" — backed by an in-memory
+    /// `active_target_id` pointer rather than a SQLite row.
     ///
-    /// The returned `(backend, target_id)` is the routing pair every
-    /// stateful MCP tool (`navigate`, `get_dom`, `screenshot`,
-    /// `select_element`, `fetch`) operates against. **Closes the iLO
-    /// failure mode for MCP**: tools no longer call
-    /// `PageSession::attach(..., None)` which would pick the first page
-    /// in `Target.getTargets` order (an iLO admin UI etc.).
+    /// The returned `(backend, target_id)` is the routing pair stateful
+    /// MCP tools (`browser_navigate`, `browser_get_html`, …) use when no
+    /// explicit `tab` / `target` arg is given.
     ///
-    /// On a tab that's died since last use (`target_id` no longer in
-    /// the live browser), recreates fresh `about:blank` under the same
-    /// name. Agents that need a specific URL navigate via the
-    /// `navigate` tool.
-    ///
-    /// External URL endpoints (no registered browser name) error: MCP
-    /// is meaningful only against a registered browser whose state can
-    /// outlive a single CLI invocation.
-    ///
-    /// This implementation does not call `session::tabs::tab_open`
-    /// because `Registry` is `!Send` (rusqlite `Connection` holds a
-    /// `RefCell`), and MCP tool handlers are `Send` futures. Instead we
-    /// open + close the Registry around each sync SQL op, never holding
-    /// it across an `.await` of a CDP/BiDi call.
-    pub async fn ensure_active_tab(&self) -> Result<(TabBackend, String)> {
-        use crate::cli::env_resolver::Source;
-        use crate::registry::Registry;
-
+    /// Behaviour:
+    /// - **None** → create an `about:blank` and store it.
+    /// - **Set but dead** (no longer in `live_target_ids`) → recreate
+    ///   `about:blank` and re-point the pointer. This is the scratch-style
+    ///   implicit recovery for the **server-owned** active tab; explicit
+    ///   tabs created via `browser_tab_new` / `browser_tab_select` also
+    ///   travel through here once they become the active tab, but
+    ///   recovery there means the agent-named tab is gone — see
+    ///   `browser_tab_select`'s dead-tab handling for the explicit-select
+    ///   contract.
+    /// - **Set and alive** → return as-is.
+    pub async fn current_tab(&self) -> Result<(TabBackend, String)> {
         let backend = self.ensure_backend().await?;
-        let browser_name = match &self.browser.source {
-            Source::Registered { name } => name.clone(),
-            Source::External => {
-                return Err(anyhow::anyhow!(
-                    "MCP server requires a registered browser; external URL endpoints \
-                     don't have a stable identity for a server-owned active tab"
-                ));
-            }
-        };
-        // Name scoped per MCP server PID so two MCPs against the same
-        // browser don't fight over the same row. Leading `_` keeps it
-        // out of the agent-visible namespace (validate_tab_name rejects
-        // it; the registry helpers accept it).
-        let name = format!("_mcp-{}", std::process::id());
-
-        // Sync: look up the existing row.
-        let existing = {
-            let registry = Registry::open()?;
-            registry.tab_get(&browser_name, &name)?
-        };
-
-        // Async: validate the cached target id is still alive.
-        if let Some(row) = existing {
+        let mut pointer = self.active_target_id.lock().await;
+        if let Some(tid) = pointer.as_ref() {
             let live = backend.live_target_ids().await?;
-            if live.contains(&row.target_id) {
-                // Sync: bump last_used_at.
-                let registry = Registry::open()?;
-                registry.tab_touch(&browser_name, &name)?;
-                return Ok((backend, row.target_id));
+            if live.contains(tid) {
+                return Ok((backend, tid.clone()));
             }
-            // Stale — close best-effort + delete row. CDP/BiDi roundtrip
-            // is async; SQL delete is sync.
-            let _ = backend.close_tab(&row.target_id).await;
-            let registry = Registry::open()?;
-            registry.tab_delete(&browser_name, &name)?;
+            // Dead — fall through to recreate.
         }
-
-        // Async: create a fresh `about:blank` tab.
-        let new_target_id = backend.create_tab("about:blank").await?;
-
-        // Sync: insert the row.
-        {
-            let registry = Registry::open()?;
-            registry.tab_upsert(&browser_name, &name, &new_target_id, "about:blank", true)?;
-        }
-        Ok((backend, new_target_id))
+        let new_tid = backend.create_tab("about:blank").await?;
+        *pointer = Some(new_tid.clone());
+        Ok((backend, new_tid))
     }
+
+    /// Route a stateful tool call to a backend + target id based on the
+    /// optional `tab` (named) and `target` (URL regex) args. `tab` and
+    /// `target` are mutually exclusive. Falls through to `current_tab()`
+    /// when neither is provided.
+    ///
+    /// For the named-tab path: the registered tab row is resolved (with
+    /// sweep-on-read for stale rows) and returned. Tools that want
+    /// recover-on-failure semantics should structure their op around the
+    /// returned `(backend, target_id)` — full `with_named_tab_recovery`
+    /// can't run from a `Send` MCP future because `Registry` is `!Send`.
+    ///
+    /// For the URL-regex path, probe-and-iterate via the live targets
+    /// snapshot. Surfaces `SessionError::TabHung` if every match is
+    /// unresponsive within a 500ms probe.
+    pub async fn resolve_target_for_args(
+        &self,
+        args: &Value,
+    ) -> Result<(TabBackend, String)> {
+        let tab = args.get("tab").and_then(|v| v.as_str()).map(String::from);
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        match (tab, target) {
+            (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                "`tab` and `target` are mutually exclusive"
+            )),
+            (Some(name), None) => {
+                let backend = self.ensure_backend().await?;
+                let browser_name = self.registered_browser_name().await?;
+                // Mimic `session::tabs::resolve_tab` here so we never hold
+                // a `!Send` `Registry` across `.await`: sync registry-read,
+                // async liveness probe, sync registry-mutate.
+                let row = sync_registry_op(|reg| reg.tab_get(&browser_name, &name))?
+                    .ok_or_else(|| crate::errors::SessionError::TabNotFound {
+                        browser: browser_name.clone(),
+                        name: name.clone(),
+                    })?;
+                let live = backend.live_target_ids().await?;
+                if !live.contains(&row.target_id) {
+                    // Stale — sweep, then error.
+                    let bn = browser_name.clone();
+                    let n = name.clone();
+                    sync_registry_op(move |reg| reg.tab_delete(&bn, &n))?;
+                    return Err(crate::errors::SessionError::TabNotFound {
+                        browser: browser_name,
+                        name,
+                    }
+                    .into());
+                }
+                let bn = browser_name.clone();
+                let n = name.clone();
+                sync_registry_op(move |reg| reg.tab_touch(&bn, &n))?;
+                Ok((backend, row.target_id))
+            }
+            (None, Some(regex)) => {
+                let backend = self.ensure_backend().await?;
+                let target_id = resolve_target_by_regex(&backend, &regex).await?;
+                Ok((backend, target_id))
+            }
+            (None, None) => self.current_tab().await,
+        }
+    }
+
+    /// The registered browser's name. Errors if the active browser is an
+    /// external URL endpoint (no stable identity for named tabs).
+    pub async fn registered_browser_name(&self) -> Result<String> {
+        use crate::cli::env_resolver::Source;
+        let resolved = self.browser_snapshot().await;
+        match resolved.source {
+            Source::Registered { name } => Ok(name),
+            Source::External => Err(anyhow::anyhow!(
+                "operation requires a registered browser; external URL endpoints \
+                 don't have a stable identity"
+            )),
+        }
+    }
+
+    /// Swap the active browser. Drops the cached backend and BiDi session,
+    /// releases the BiDi lock (if held), clears the active tab pointer,
+    /// then installs the new browser and re-acquires the BiDi lock if
+    /// the new one needs it. The next stateful tool call lazy-opens the
+    /// new backend.
+    pub async fn switch_browser(&self, new_browser: ResolvedBrowser) -> Result<()> {
+        // Close the cached BiDi session if any (best-effort).
+        {
+            let mut bidi = self.bidi.lock().await;
+            if let Some(client) = bidi.take() {
+                let _ = client.session_end().await;
+            }
+        }
+        // Drop the cached backend so the next call rebuilds against
+        // the new browser.
+        {
+            let mut backend = self.backend.lock().await;
+            *backend = None;
+        }
+        // Release the BiDi lock guard (Drop releases it) and reset to Pending.
+        {
+            let mut lock = self.bidi_lock.lock().await;
+            *lock = BidiLockState::Pending;
+        }
+        // Clear the active tab pointer.
+        {
+            let mut pointer = self.active_target_id.lock().await;
+            *pointer = None;
+        }
+        // Dispose the Playwright sidecar — different browser means
+        // different CDP endpoint; the next sidecar tool spawns a fresh
+        // child connected to the new endpoint.
+        {
+            let mut sidecar = self.sidecar.lock().await;
+            if let Some(sc) = sidecar.take() {
+                let _ = sc.call("dispose", serde_json::json!({})).await;
+                // Drop releases the child via SidecarInner::drop.
+                drop(sc);
+            }
+        }
+        // Install the new browser.
+        {
+            let mut br = self.browser.write().await;
+            *br = new_browser;
+        }
+        // Eagerly re-acquire the BiDi lock if applicable, so any error
+        // surfaces here rather than at the next tool call.
+        self.ensure_bidi_lock().await?;
+        Ok(())
+    }
+}
+
+/// Helper that opens a fresh `Registry` and runs a closure against it,
+/// returning the result. Used by the MCP layer to keep `!Send`
+/// `rusqlite::Connection` references off of `.await`-crossing scopes.
+/// The closure runs synchronously inside the helper; the registry is
+/// dropped before the function returns.
+pub(crate) fn sync_registry_op<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce(&crate::registry::Registry) -> Result<T>,
+{
+    let reg = crate::registry::Registry::open()?;
+    f(&reg)
+}
+
+/// Resolve a `BrowserSelector` to a `ResolvedBrowser` from a `Send`
+/// async context. The URL branch awaits an HTTP roundtrip (no registry
+/// needed); the registered/kind/path branches run synchronously via
+/// `tokio::task::spawn_blocking` so the `!Send` `Registry` never sits
+/// across `.await`.
+pub(crate) async fn resolve_browser_send(
+    selector: crate::cli::env_resolver::BrowserSelector,
+) -> Result<ResolvedBrowser> {
+    use crate::cli::env_resolver::{BrowserSelector, DefaultResolver, Resolver};
+    match selector {
+        BrowserSelector::Url(u) => match u.scheme() {
+            "ws" | "wss" => Ok(ResolvedBrowser {
+                engine: if u.path().contains("/session") {
+                    crate::detect::Engine::Bidi
+                } else {
+                    crate::detect::Engine::Cdp
+                },
+                endpoint: u.to_string(),
+                source: crate::cli::env_resolver::Source::External,
+            }),
+            "http" | "https" => {
+                let base = u.as_str().trim_end_matches('/').to_string();
+                let ws = DefaultResolver.fetch_version(&base).await?;
+                let ws_url = url::Url::parse(&ws)?;
+                Ok(ResolvedBrowser {
+                    engine: if ws_url.path().contains("/session") {
+                        crate::detect::Engine::Bidi
+                    } else {
+                        crate::detect::Engine::Cdp
+                    },
+                    endpoint: ws,
+                    source: crate::cli::env_resolver::Source::External,
+                })
+            }
+            other => anyhow::bail!("unsupported URL scheme: {other}"),
+        },
+        other => tokio::task::spawn_blocking(move || {
+            let reg = crate::registry::Registry::open()?;
+            // Non-URL branches of `resolve_with` are pure SQL with no
+            // awaits — the future polls to completion in one step.
+            // We need to drive a tiny async, but `block_on` is fine
+            // here on a blocking thread.
+            let rt = tokio::runtime::Builder::new_current_thread().build()?;
+            rt.block_on(crate::cli::env_resolver::resolve_with(
+                other,
+                &reg,
+                &DefaultResolver,
+            ))
+        })
+        .await?,
+    }
+}
+
+/// Resolve a `target` URL-regex arg to a live `target_id` on `backend`,
+/// using the same probe-and-iterate semantics as `pick_cdp_page` /
+/// `pick_bidi_context` in `session::attach`. Walks `live_targets()` and
+/// returns the first matching responsive target; if all matches are
+/// unresponsive, returns `SessionError::TabHung`. Errors `anyhow` if
+/// the regex matches nothing.
+async fn resolve_target_by_regex(backend: &TabBackend, regex: &str) -> Result<String> {
+    use crate::errors::SessionError;
+    use regex::Regex;
+    use std::time::Duration;
+    const PROBE: Duration = Duration::from_millis(500);
+
+    let re = Regex::new(regex)?;
+    let targets = backend.live_targets().await?;
+    let matches: Vec<_> = targets.iter().filter(|t| re.is_match(&t.url)).collect();
+    if matches.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no target matched URL regex `{regex}`"
+        ));
+    }
+    let mut last_id: Option<String> = None;
+    let mut last_url: Option<String> = None;
+    for t in &matches {
+        last_id = Some(t.id.clone());
+        last_url = Some(t.url.clone());
+        let ok = matches!(
+            tokio::time::timeout(PROBE, backend.evaluate(&t.id, "1", false, PROBE)).await,
+            Ok(Ok(_))
+        );
+        if ok {
+            return Ok(t.id.clone());
+        }
+    }
+    Err(SessionError::TabHung {
+        target_id: last_id,
+        url: last_url,
+        timeout_ms: PROBE.as_millis() as u64,
+        hint: "all-matches-hung",
+    }
+    .into())
 }
 
 impl std::fmt::Debug for ServerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerState")
-            .field("browser", &self.browser)
-            .finish()
+        f.debug_struct("ServerState").finish()
     }
 }
 

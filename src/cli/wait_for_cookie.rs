@@ -16,11 +16,18 @@ use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::cli::cookies::{fetch_cookies, NormalCookie};
+use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
 use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
-use crate::session::PageSession;
+use crate::session::backend::open_backend;
+use crate::session::{with_named_tab_recovery, with_scratch_recovery, PageSession};
+
+/// Per-fetch timeout when `--validate-url` drives a `fetch()` from the
+/// page context. 30 s catches a wedged renderer; the outer polling loop
+/// reruns this periodically.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn run(
     browser: Option<String>,
@@ -31,21 +38,38 @@ pub async fn run(
     validate_url: Option<String>,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("wait-for-cookie");
-    trace.route("registry");
     let result: Result<()> = async {
         let domain_re = Regex::new(&domain).context("invalid --domain regex")?;
         let name_re = Regex::new(&name).context("invalid --name regex")?;
 
-        let resolved = resolve_browser(browser).await?;
-        trace.engine(resolved.engine);
+        // Parse `<browser>[/<tab>]` so the optional `--validate-url` leg can
+        // route through a named tab. The cookie poll itself is browser-wide
+        // and uses no tab context.
+        let raw = browser.unwrap_or_default();
+        let parsed = if raw.is_empty() {
+            None
+        } else {
+            Some(env_resolver::parse_target(&raw)?)
+        };
+        let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
+        let browser_only = parsed
+            .as_ref()
+            .map(|p| strip_tab(&raw, p.tab.as_deref()))
+            .unwrap_or_default();
+        let resolved = resolve_browser(if browser_only.is_empty() {
+            None
+        } else {
+            Some(browser_only.clone())
+        })
+        .await?;
+        trace.browser(&browser_only).engine(resolved.engine);
+
         // Hold the Firefox BiDi single-session lock across the whole poll
-        // loop (and the optional validate_via_page leg). Each `fetch_cookies`
+        // loop (and the optional validate-url leg). Each `fetch_cookies`
         // call opens + closes a BiDi session, so without the lock two
         // concurrent CLI processes would race on `session.new`. No-op on CDP.
-        let _bidi_lock = {
-            let registry = Registry::open()?;
-            acquire_bidi_lock_if_needed(&registry, &resolved)?
-        };
+        let registry = Registry::open()?;
+        let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
 
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let interval = Duration::from_secs(poll_interval.max(1));
@@ -72,10 +96,15 @@ pub async fn run(
         eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
 
         if let Some(url) = validate_url {
-            let session = PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
-            let result = validate_via_page(&session, &url).await;
-            session.close().await;
-            result?;
+            // Three-path routing for the validate-url fetch:
+            //   - <browser>/<tab>  → named-tab path
+            //   - bare <browser>   → scratch path (or direct for external URL)
+            // The cookie poll above already finished, so this is the only
+            // place a tab context matters.
+            run_validate_url(&resolved, &registry, tab_name.as_deref(), &url, &mut trace).await?;
+        } else {
+            // No validate-url; only the cookie poll ran (browser-wide).
+            trace.route("poll");
         }
 
         println!("{}", matched.name);
@@ -91,20 +120,81 @@ pub async fn run(
     }
 }
 
-/// Returns true when both regexes match the cookie's domain and name. Both
-/// regexes are unanchored (`Regex::is_match` semantics).
-pub(crate) fn cookie_matches(c: &NormalCookie, domain_re: &Regex, name_re: &Regex) -> bool {
-    domain_re.is_match(&c.domain) && name_re.is_match(&c.name)
+/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
+fn strip_tab(raw: &str, tab: Option<&str>) -> String {
+    match tab {
+        Some(name) => raw
+            .strip_suffix(&format!("/{name}"))
+            .unwrap_or(raw)
+            .to_string(),
+        None => raw.to_string(),
+    }
 }
 
-async fn validate_via_page(session: &PageSession, url: &str) -> Result<()> {
+/// Drive the `--validate-url` fetch through the right routing path:
+/// named-tab (with recover-once), scratch (with recover-once), or direct
+/// attach for external URL endpoints.
+async fn run_validate_url(
+    resolved: &crate::cli::env_resolver::ResolvedBrowser,
+    registry: &Registry,
+    tab_name: Option<&str>,
+    url: &str,
+    trace: &mut CommandTrace,
+) -> Result<()> {
     let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
     let expr = format!("({})({})", FETCH_JS, serde_json::to_string(&args).unwrap());
-    // 30 s catches a wedged renderer without cutting off slow HTTP responses
-    // — the outer polling loop in `wait_for_cookie` reruns this periodically.
-    let value = session
-        .evaluate_with_timeout(&expr, true, Some(std::time::Duration::from_secs(30)))
-        .await?;
+
+    let value = match tab_name {
+        Some(name) => {
+            trace.route("named-tab").tab_name(name);
+            let browser_name = match &resolved.source {
+                Source::Registered { name } => name.clone(),
+                _ => bail!(
+                    "named tabs (`<browser>/<name>`) require a registered browser; \
+                     external endpoints can't carry tab names"
+                ),
+            };
+            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+            let expr = expr.clone();
+            with_named_tab_recovery(
+                &backend,
+                registry,
+                &browser_name,
+                name,
+                move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, true, VALIDATE_TIMEOUT).await }
+                },
+            )
+            .await?
+        }
+        None => {
+            if matches!(resolved.source, Source::External) {
+                trace.route("direct");
+                let session =
+                    PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+                let res = session
+                    .evaluate_with_timeout(&expr, true, Some(VALIDATE_TIMEOUT))
+                    .await;
+                session.close().await;
+                res?
+            } else {
+                trace.route("scratch");
+                let browser_name = match &resolved.source {
+                    Source::Registered { name } => name.clone(),
+                    _ => unreachable!("Source::External branch handled above"),
+                };
+                let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+                let expr = expr.clone();
+                with_scratch_recovery(&backend, registry, &browser_name, move |b, target_id| {
+                    let expr = expr.clone();
+                    async move { b.evaluate(&target_id, &expr, true, VALIDATE_TIMEOUT).await }
+                })
+                .await?
+            }
+        }
+    };
+
     let json_str = value.as_str().ok_or_else(|| {
         anyhow::anyhow!("validate-url: page returned non-string from fetch script")
     })?;
@@ -115,6 +205,12 @@ async fn validate_via_page(session: &PageSession, url: &str) -> Result<()> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| anyhow::anyhow!("validate-url: missing `status` in fetch response"))?;
     validate_status(status)
+}
+
+/// Returns true when both regexes match the cookie's domain and name. Both
+/// regexes are unanchored (`Regex::is_match` semantics).
+pub(crate) fn cookie_matches(c: &NormalCookie, domain_re: &Regex, name_re: &Regex) -> bool {
+    domain_re.is_match(&c.domain) && name_re.is_match(&c.name)
 }
 
 /// Require a 2xx status; otherwise produce an error.

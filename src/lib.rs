@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod paths;
 pub mod registry;
 pub mod session;
+pub mod sidecar;
 
 #[cfg(test)]
 pub(crate) mod test_support {

@@ -13,6 +13,8 @@ use tokio_tungstenite::tungstenite::Message;
 pub mod protocol;
 use protocol::{CdpError, Request, Response};
 
+use crate::errors::{is_cdp_target_gone, SessionError, TargetKind};
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -182,7 +184,7 @@ impl CdpClient {
 
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Ok(Err(e))) => Err(classify_cdp_error(e, session_id.is_some())),
             Ok(Err(_)) => Err(anyhow!("response channel dropped")),
             Err(_) => {
                 let mut p = self.pending.lock().await;
@@ -227,6 +229,22 @@ impl CdpClient {
         self.reader_handle.abort();
         let _ = self.reader_handle.await;
     }
+}
+
+/// Convert a `CdpError` reply into a typed `SessionError::TargetGone` if
+/// its message matches a known "gone" indicator, otherwise pass through as
+/// the generic CDP error. `attached` is true when the call carried a
+/// `sessionId` — only attached-session failures are classified, because
+/// browser-session errors typically mean "bad request," not "target gone."
+fn classify_cdp_error(err: CdpError, attached: bool) -> anyhow::Error {
+    if attached && is_cdp_target_gone(&err.message) {
+        return SessionError::TargetGone {
+            kind: TargetKind::Cdp,
+            details: format!("CDP error {}: {}", err.code, err.message),
+        }
+        .into();
+    }
+    anyhow!(err)
 }
 
 #[cfg(test)]
@@ -294,6 +312,77 @@ mod tests {
         assert_eq!(evt.method, "Target.targetCreated");
         assert_eq!(evt.session_id.as_deref(), Some("S1"));
         assert_eq!(evt.params["targetInfo"]["targetId"], "abc");
+        client.close().await;
+    }
+
+    /// Attached-session CDP error matching a "target gone" indicator
+    /// surfaces as a typed `SessionError::TargetGone`. The recovery
+    /// wrappers rely on the typed variant to skip substring matching.
+    #[tokio::test]
+    async fn send_with_session_classifies_target_gone() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let resp = json!({
+                    "id": id,
+                    "error": {"code": -32000, "message": "No target with given id found: T42"}
+                });
+                ws.send(Message::Text(resp.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let err = client
+            .send_with_session("Runtime.evaluate", json!({}), Some("S1"))
+            .await
+            .expect_err("must error");
+        let typed = err
+            .downcast_ref::<crate::errors::SessionError>()
+            .expect("typed SessionError");
+        match typed {
+            crate::errors::SessionError::TargetGone { kind, details } => {
+                assert_eq!(*kind, crate::errors::TargetKind::Cdp);
+                assert!(details.contains("No target with given id"));
+            }
+            other => panic!("expected TargetGone, got {other:?}"),
+        }
+        client.close().await;
+    }
+
+    /// Browser-session CDP errors (no `sessionId`) are NOT classified —
+    /// they pass through as generic anyhow errors. `Target.attachToTarget`
+    /// failing with "no such target" is a routing problem at the browser
+    /// level, not a wedged renderer, and shouldn't trigger tab recovery.
+    #[tokio::test]
+    async fn send_root_does_not_classify_target_gone() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let resp = json!({
+                    "id": id,
+                    "error": {"code": -32000, "message": "No target with given id found: T42"}
+                });
+                ws.send(Message::Text(resp.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let err = client
+            .send("Target.attachToTarget", json!({}))
+            .await
+            .expect_err("must error");
+        assert!(
+            err.downcast_ref::<crate::errors::SessionError>().is_none(),
+            "root-session error must NOT classify as TargetGone"
+        );
         client.close().await;
     }
 

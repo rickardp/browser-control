@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 #[test]
-fn mcp_tools_list_returns_ten_tools() {
+fn mcp_tools_list_returns_full_set() {
     let tmp = TempDir::new().unwrap();
     let bin = assert_cmd::cargo::cargo_bin("browser-control");
     let mut child = Command::new(bin)
@@ -44,22 +44,31 @@ fn mcp_tools_list_returns_ten_tools() {
     reader.read_line(&mut line).unwrap();
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("tools json");
     let tools = v["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 10, "expected 10 tools, got {tools:?}");
     let names: HashSet<String> = tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
+    // Playwright-shaped per-tab tools.
     for expected in [
-        "navigate",
-        "get_dom",
-        "screenshot",
-        "fetch",
-        "select_element",
+        "browser_navigate",
+        "browser_get_html",
+        "browser_take_screenshot",
+        "browser_fetch",
+        "browser_select_element",
+        "browser_cookies",
+        "browser_storage_get",
+        "browser_storage_set",
+        "browser_wait_for_cookie",
+        // Tab management.
+        "browser_tab_list",
+        "browser_tab_new",
+        "browser_tab_select",
+        "browser_tab_close",
+        // Browser management.
+        "browser_select",
+        "browser_list",
+        // Diagnostic CDP-shaped helper.
         "list_targets",
-        "cookies",
-        "storage_get",
-        "storage_set",
-        "wait_for_cookie",
     ] {
         assert!(
             names.contains(expected),

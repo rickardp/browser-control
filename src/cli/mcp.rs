@@ -7,14 +7,15 @@ use crate::mcp::server::{run, ServerState, ToolRegistry};
 use crate::registry::Registry;
 
 /// Entry point for `browser-control mcp`.
-pub async fn run_cli(browser_arg: Option<String>, playwright: bool) -> Result<()> {
-    if playwright {
-        let resolved = resolve_browser(browser_arg).await?;
-        let code = crate::mcp::playwright::run(&resolved).await?;
-        std::process::exit(code);
-    }
+pub async fn run_cli(
+    browser_arg: Option<String>,
+    playwright_version: Option<String>,
+) -> Result<()> {
     let resolved = resolve_browser(browser_arg).await?;
-    let state = ServerState::new(resolved);
+    let sidecar_config = crate::sidecar::SidecarConfig {
+        version: playwright_version,
+    };
+    let state = ServerState::with_sidecar_config(resolved, sidecar_config);
     let tools = ToolRegistry::new();
     crate::mcp::tools::register_all(&tools);
     run(state, tools).await

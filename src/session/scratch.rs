@@ -95,12 +95,18 @@ where
 ///   — the stored `target_id` no longer exists in the browser (typical
 ///   after a browser restart between CLI invocations).
 fn is_scratch_failure(err: &anyhow::Error) -> bool {
+    // Primary: typed variants from the session / protocol layer.
     if let Some(se) = err.downcast_ref::<SessionError>() {
         return matches!(
             se,
-            SessionError::TabHung { .. } | SessionError::TabCrashed { .. }
+            SessionError::TabHung { .. }
+                | SessionError::TabCrashed { .. }
+                | SessionError::TargetGone { .. }
         );
     }
+    // Defensive fallback: catch raw CDP/BiDi error strings that slip past
+    // the client-layer classifier (e.g. surfaced via `anyhow::Error` from
+    // an older code path or context-wrapped without downcast info).
     let msg = format!("{err:#}").to_ascii_lowercase();
     // CDP-shaped errors.
     msg.contains("no target with given id")
@@ -275,6 +281,45 @@ mod tests {
         );
         let row = reg.scratch_get("b").unwrap().unwrap();
         assert_eq!(row.target_id, "T2");
+    }
+
+    /// `is_scratch_failure` matches on the typed `TargetGone` variant
+    /// (primary path), the typed hung/crashed variants, and falls back to
+    /// substring matching for un-classified raw errors.
+    #[test]
+    fn is_scratch_failure_recognizes_typed_target_gone() {
+        use crate::errors::TargetKind;
+        let typed: anyhow::Error = SessionError::TargetGone {
+            kind: TargetKind::Cdp,
+            details: "CDP error -32000: No target with given id found: T1".into(),
+        }
+        .into();
+        assert!(is_scratch_failure(&typed));
+
+        let typed_bidi: anyhow::Error = SessionError::TargetGone {
+            kind: TargetKind::Bidi,
+            details: "BiDi error no such context: C1".into(),
+        }
+        .into();
+        assert!(is_scratch_failure(&typed_bidi));
+
+        // Hung and crashed remain recoverable.
+        let hung: anyhow::Error = SessionError::TabHung {
+            target_id: None,
+            url: None,
+            timeout_ms: 100,
+            hint: "test",
+        }
+        .into();
+        assert!(is_scratch_failure(&hung));
+
+        // Substring fallback still works for raw anyhow errors.
+        let raw: anyhow::Error = anyhow::anyhow!("No target with given id found: T1");
+        assert!(is_scratch_failure(&raw));
+
+        // Unrelated errors are NOT failures.
+        let unrelated: anyhow::Error = anyhow::anyhow!("network unreachable");
+        assert!(!is_scratch_failure(&unrelated));
     }
 
     /// Both attempts wedge → caller sees typed `TabHung`. We do NOT keep
