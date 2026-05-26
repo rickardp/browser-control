@@ -287,14 +287,21 @@ bundled with the architectural decision.
   workloads.
 
 - **MCP scratch routing + named-tab integration for tool handlers**.
-  **Status:** deferred. The MCP read-only tools (`get_dom`, `fetch`,
-  `screenshot`, `select_element`) still call `attach_active` →
-  `PageSession::attach(..., None)`, which selects the first page in
-  `Target.getTargets` order — the iLO failure mode is reachable via
-  MCP. Migration requires extending `TabBackend` with `screenshot`,
-  adding a "specific BiDi context" attach path in `PageSession`, and
-  rewriting each tool handler. Filed as a future follow-up so the MCP
-  surface gets its own review.
+  **Status:** landed. Every stateful MCP tool (`navigate`, `get_dom`,
+  `screenshot`, `select_element`, `fetch`, `storage_get`,
+  `storage_set`) routes through `ServerState::ensure_active_tab`,
+  which returns `(TabBackend, target_id)` for a server-owned row in
+  the `tabs` table named `_mcp-<server-pid>`. Tools no longer call
+  `PageSession::attach(..., None)` (which picked the first page in
+  `Target.getTargets` order) — the iLO failure mode is closed for the
+  MCP code path too. A new `TabBackend::screenshot` engine-agnostic
+  method backs the screenshot tool; the BiDi path uses
+  `browsingContext.captureScreenshot`. The MCP-owned tab is visible
+  in `tab list --all` for diagnostics, recycled on staleness with
+  `about:blank` (agents that need a specific URL navigate to it). The
+  CDP `TabBackend` is cached for the server's lifetime via
+  `ServerState::ensure_backend` so the BiDi `session.new` handshake
+  runs once.
 
 - **Engine override `--engine <cdp|bidi>`** and **synthesized
   named-tab keys for external `ws://` endpoints**: open design

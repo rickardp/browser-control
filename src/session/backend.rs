@@ -266,6 +266,57 @@ impl TabBackend {
             }
         }
     }
+
+    /// Capture a PNG screenshot of `target_id` and return base64-encoded
+    /// bytes.
+    ///
+    /// CDP path attaches a transient session, calls
+    /// `Page.captureScreenshot({format:"png", captureBeyondViewport:full_page})`,
+    /// detaches. BiDi path calls `browsingContext.captureScreenshot` —
+    /// the BiDi protocol always captures the viewport (no `full_page`
+    /// equivalent), so `full_page` is honoured only on CDP.
+    pub async fn screenshot(&self, target_id: &str, full_page: bool) -> Result<String> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let attach = c
+                    .send(
+                        "Target.attachToTarget",
+                        json!({ "targetId": target_id, "flatten": true }),
+                    )
+                    .await?;
+                let session_id = attach
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("attachToTarget returned no sessionId"))?
+                    .to_string();
+                let v = c
+                    .send_with_session(
+                        "Page.captureScreenshot",
+                        json!({
+                            "format": "png",
+                            "captureBeyondViewport": full_page,
+                        }),
+                        Some(&session_id),
+                    )
+                    .await;
+                let _ = c
+                    .send(
+                        "Target.detachFromTarget",
+                        json!({ "sessionId": session_id }),
+                    )
+                    .await;
+                let v = v?;
+                v["data"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow!("Page.captureScreenshot returned no data"))
+            }
+            TabBackend::Bidi(c) => {
+                let _ = full_page; // BiDi captures the viewport by default
+                c.browsing_context_capture_screenshot(target_id).await
+            }
+        }
+    }
 }
 
 /// Open the right [`TabBackend`] for a resolved browser endpoint, taking

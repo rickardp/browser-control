@@ -13,11 +13,25 @@ use std::time::{Duration, Instant};
 use crate::cli::cookies::fetch_cookies;
 use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
 use crate::cli::wait_for_cookie::cookie_matches;
-use crate::detect::Engine;
 use crate::dom::scripts::{FETCH_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
 use crate::mcp::server::{RegisteredTool, ServerState, ToolHandler, ToolRegistry};
-use crate::session::attach::PageSession;
-use crate::session::targets::{list as list_targets, open_bidi};
+use crate::session::targets::list as list_targets;
+
+/// Per-op timeout for read tools (`get_dom`, `select_element` short
+/// path, storage). 10 s is generous for legitimate DOM work and tight
+/// enough that a wedged renderer fast-fails.
+const MCP_OP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-op timeout for `fetch`. Slow HTTP fetches over real networks
+/// can take many seconds; 60 s matches the CLI `fetch --timeout-ms`
+/// default.
+const MCP_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-op timeout for `select_element`. The overlay waits for a human
+/// click, so the bound has to be much longer than for automated tools.
+/// Five minutes is plenty for an interactive selection without leaking
+/// forever if the page is left abandoned.
+const MCP_SELECT_ELEMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Register the standard tool set onto the given registry.
 pub fn register_all(registry: &ToolRegistry) {
@@ -34,37 +48,14 @@ pub fn register_all(registry: &ToolRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// Engine dispatch helpers.
+// Helpers.
 // ---------------------------------------------------------------------------
-
-/// Open (or return the cached) page session for the configured browser.
-///
-/// CDP sessions are short-lived: we open and close a fresh WebSocket per
-/// call. BiDi sessions reuse one persistent client, because Firefox limits
-/// a browser instance to a single concurrent BiDi session.
-///
-/// Acquires the SQLite-backed BiDi single-session lock on first call so
-/// concurrent MCP servers (or a CLI invocation running in parallel) can't
-/// race on `session.new`. The lock is held for the server's lifetime
-/// via the `ServerState::bidi_lock` cache; idempotent on subsequent calls.
-async fn attach_active(state: &ServerState) -> Result<PageSession> {
-    state.ensure_bidi_lock().await?;
-    match state.browser.engine {
-        Engine::Cdp => PageSession::attach(&state.browser.endpoint, Engine::Cdp, None).await,
-        Engine::Bidi => {
-            let mut guard = state.bidi.lock().await;
-            let client = if let Some(c) = guard.as_ref() {
-                c.clone()
-            } else {
-                let c = Arc::new(open_bidi(&state.browser.endpoint).await?);
-                c.session_new().await?;
-                *guard = Some(c.clone());
-                c
-            };
-            PageSession::from_bidi_cache(client, None).await
-        }
-    }
-}
+//
+// Tool routing now goes through `ServerState::ensure_active_tab`, which
+// returns `(TabBackend, target_id)` for the MCP server's dedicated tab
+// (`_mcp-<pid>` in the `tabs` registry). This closes the iLO failure
+// mode: tools no longer attach to "first page in `Target.getTargets`"
+// — they always operate against the server's own tab.
 
 fn text_content(text: impl Into<String>) -> Value {
     json!({ "content": [ { "type": "text", "text": text.into() } ] })
@@ -106,9 +97,8 @@ fn make_navigate() -> RegisteredTool {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing 'url'"))?
                     .to_string();
-                let session = attach_active(&state).await?;
-                session.navigate(&url).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                backend.navigate(&target_id, &url).await?;
                 Ok(text_content(format!("Navigated to {url}")))
             })
         }),
@@ -141,9 +131,10 @@ fn make_get_dom() -> RegisteredTool {
                     None => "null".to_string(),
                 };
                 let expr = format!("({GET_DOM_JS})({selector_literal})");
-                let session = attach_active(&state).await?;
-                let value = session.evaluate(&expr, false).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                let value = backend
+                    .evaluate(&target_id, &expr, false, MCP_OP_TIMEOUT)
+                    .await?;
                 let html = value.as_str().unwrap_or("").to_string();
                 Ok(text_content(html))
             })
@@ -172,9 +163,8 @@ fn make_screenshot() -> RegisteredTool {
                     .get("full_page")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let session = attach_active(&state).await?;
-                let b64 = session.screenshot(full_page).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                let b64 = backend.screenshot(&target_id, full_page).await?;
                 Ok(image_content(b64))
             })
         }),
@@ -209,9 +199,10 @@ fn make_fetch() -> RegisteredTool {
                 let args_json = serde_json::to_string(&args)?;
                 let args_literal = serde_json::to_string(&args_json)?;
                 let expr = format!("({FETCH_JS})({args_literal})");
-                let session = attach_active(&state).await?;
-                let value = session.evaluate(&expr, true).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                let value = backend
+                    .evaluate(&target_id, &expr, true, MCP_FETCH_TIMEOUT)
+                    .await?;
                 let raw = value.as_str().unwrap_or("").to_string();
                 let parsed: Value = serde_json::from_str(&raw)
                     .map_err(|e| anyhow!("invalid fetch response JSON: {e}"))?;
@@ -239,9 +230,13 @@ fn make_select_element() -> RegisteredTool {
         handler: handler(|state, _args| {
             Box::pin(async move {
                 let expr = SELECT_ELEMENT_JS.to_string();
-                let session = attach_active(&state).await?;
-                let value = session.evaluate(&expr, true).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                // select_element shows an interactive overlay that the
+                // human clicks — extend the bound generously so the
+                // human has time to click.
+                let value = backend
+                    .evaluate(&target_id, &expr, true, MCP_SELECT_ELEMENT_TIMEOUT)
+                    .await?;
                 let selector = value.as_str().unwrap_or("").to_string();
                 Ok(text_content(selector))
             })
@@ -363,9 +358,10 @@ fn make_storage_get() -> RegisteredTool {
                     .unwrap_or("local");
                 let ns = ns_global(namespace)?;
                 let expr = build_get_expr(ns, &key);
-                let session = attach_active(&state).await?;
-                let value = session.evaluate(&expr, true).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                let value = backend
+                    .evaluate(&target_id, &expr, true, MCP_OP_TIMEOUT)
+                    .await?;
                 // `build_get_expr` wraps the result in JSON.stringify, so the
                 // evaluator returns a JSON string. Unwrap one layer to surface
                 // the raw value (or `null` when the key is absent).
@@ -415,9 +411,10 @@ fn make_storage_set() -> RegisteredTool {
                     .unwrap_or("local");
                 let ns = ns_global(namespace)?;
                 let expr = build_set_expr(ns, &key, &value);
-                let session = attach_active(&state).await?;
-                let _ = session.evaluate(&expr, true).await?;
-                session.close().await;
+                let (backend, target_id) = state.ensure_active_tab().await?;
+                let _ = backend
+                    .evaluate(&target_id, &expr, true, MCP_OP_TIMEOUT)
+                    .await?;
                 Ok(text_content("ok"))
             })
         }),

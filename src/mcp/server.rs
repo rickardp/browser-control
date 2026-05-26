@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::cli::env_resolver::ResolvedBrowser;
+use crate::session::backend::TabBackend;
 
 /// Persistent BiDi client, opened lazily on first use. Reused across all
 /// tool calls because Firefox limits concurrent BiDi sessions per browser
@@ -30,6 +31,11 @@ pub struct ServerState {
     /// "haven't tried yet" from "tried, not applicable" via the outer
     /// `Mutex` being unlocked vs returning None.
     pub bidi_lock: std::sync::Arc<tokio::sync::Mutex<BidiLockState>>,
+    /// Cached [`TabBackend`] for the configured browser, opened lazily
+    /// on first tool call and reused for the server's lifetime. Avoids
+    /// repeatedly running the BiDi `session.new` handshake and lets us
+    /// share one CDP WebSocket across all tool calls.
+    pub backend: std::sync::Arc<tokio::sync::Mutex<Option<TabBackend>>>,
 }
 
 /// Three-state cache: `Pending` until first tool call attempts acquire;
@@ -49,6 +55,7 @@ impl ServerState {
             browser,
             bidi: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             bidi_lock: std::sync::Arc::new(tokio::sync::Mutex::new(BidiLockState::Pending)),
+            backend: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -67,6 +74,101 @@ impl ServerState {
             };
         }
         Ok(())
+    }
+
+    /// Lazy-open (or return cached) [`TabBackend`] for the server's
+    /// browser. Acquires the BiDi lock first if applicable. The backend
+    /// is cached for the server's lifetime so the BiDi `session.new`
+    /// handshake runs once and the CDP WebSocket is reused across calls.
+    pub async fn ensure_backend(&self) -> Result<TabBackend> {
+        self.ensure_bidi_lock().await?;
+        let mut guard = self.backend.lock().await;
+        if let Some(b) = guard.as_ref() {
+            return Ok(b.clone());
+        }
+        let b = crate::session::backend::open_backend(&self.browser.endpoint, self.browser.engine)
+            .await?;
+        *guard = Some(b.clone());
+        Ok(b)
+    }
+
+    /// Lazy-open the **MCP server's** "active tab" — a daemon-created
+    /// row in the `tabs` table keyed by the server's pid (so concurrent
+    /// MCP servers against the same browser get distinct active tabs)
+    /// and the registered browser name.
+    ///
+    /// The returned `(backend, target_id)` is the routing pair every
+    /// stateful MCP tool (`navigate`, `get_dom`, `screenshot`,
+    /// `select_element`, `fetch`) operates against. **Closes the iLO
+    /// failure mode for MCP**: tools no longer call
+    /// `PageSession::attach(..., None)` which would pick the first page
+    /// in `Target.getTargets` order (an iLO admin UI etc.).
+    ///
+    /// On a tab that's died since last use (`target_id` no longer in
+    /// the live browser), recreates fresh `about:blank` under the same
+    /// name. Agents that need a specific URL navigate via the
+    /// `navigate` tool.
+    ///
+    /// External URL endpoints (no registered browser name) error: MCP
+    /// is meaningful only against a registered browser whose state can
+    /// outlive a single CLI invocation.
+    ///
+    /// This implementation does not call `session::tabs::tab_open`
+    /// because `Registry` is `!Send` (rusqlite `Connection` holds a
+    /// `RefCell`), and MCP tool handlers are `Send` futures. Instead we
+    /// open + close the Registry around each sync SQL op, never holding
+    /// it across an `.await` of a CDP/BiDi call.
+    pub async fn ensure_active_tab(&self) -> Result<(TabBackend, String)> {
+        use crate::cli::env_resolver::Source;
+        use crate::registry::Registry;
+
+        let backend = self.ensure_backend().await?;
+        let browser_name = match &self.browser.source {
+            Source::Registered { name } => name.clone(),
+            Source::External => {
+                return Err(anyhow::anyhow!(
+                    "MCP server requires a registered browser; external URL endpoints \
+                     don't have a stable identity for a server-owned active tab"
+                ));
+            }
+        };
+        // Name scoped per MCP server PID so two MCPs against the same
+        // browser don't fight over the same row. Leading `_` keeps it
+        // out of the agent-visible namespace (validate_tab_name rejects
+        // it; the registry helpers accept it).
+        let name = format!("_mcp-{}", std::process::id());
+
+        // Sync: look up the existing row.
+        let existing = {
+            let registry = Registry::open()?;
+            registry.tab_get(&browser_name, &name)?
+        };
+
+        // Async: validate the cached target id is still alive.
+        if let Some(row) = existing {
+            let live = backend.live_target_ids().await?;
+            if live.contains(&row.target_id) {
+                // Sync: bump last_used_at.
+                let registry = Registry::open()?;
+                registry.tab_touch(&browser_name, &name)?;
+                return Ok((backend, row.target_id));
+            }
+            // Stale — close best-effort + delete row. CDP/BiDi roundtrip
+            // is async; SQL delete is sync.
+            let _ = backend.close_tab(&row.target_id).await;
+            let registry = Registry::open()?;
+            registry.tab_delete(&browser_name, &name)?;
+        }
+
+        // Async: create a fresh `about:blank` tab.
+        let new_target_id = backend.create_tab("about:blank").await?;
+
+        // Sync: insert the row.
+        {
+            let registry = Registry::open()?;
+            registry.tab_upsert(&browser_name, &name, &new_target_id, "about:blank", true)?;
+        }
+        Ok((backend, new_target_id))
     }
 }
 
