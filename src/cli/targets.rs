@@ -1,12 +1,22 @@
 //! `browser-control targets` — list page targets in the active browser.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
+use crate::cli::env_resolver;
 use crate::cli::mcp::resolve_browser;
 use crate::cli::output::{print_json, print_table};
 use crate::session::targets::{self, TargetInfo};
 
 pub async fn run(browser: Option<String>, url: Option<String>, json: bool) -> Result<()> {
+    if let Some(ref raw) = browser {
+        let parsed = env_resolver::parse_target(raw)?;
+        if parsed.tab.is_some() {
+            bail!(
+                "`targets` operates browser-wide; tab suffixes are not supported \
+                 (got `{raw}`). Use a bare browser selector instead."
+            );
+        }
+    }
     let resolved = resolve_browser(browser).await?;
     let targets = targets::list(&resolved.endpoint, resolved.engine, url.as_deref()).await?;
     let mut out = std::io::stdout();

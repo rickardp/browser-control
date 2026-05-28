@@ -41,7 +41,7 @@ enum Command {
     /// Start the MCP server on stdio.
     Mcp {
         /// Browser to target. Overrides $BROWSER_CONTROL.
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         /// Override the `playwright-core` version used by the internal
         /// Playwright sidecar (defaults to the pinned version in the
@@ -52,7 +52,7 @@ enum Command {
     },
     /// List page targets in the active browser.
     Targets {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         /// Filter pages whose URL matches this regex.
         #[arg(long)]
@@ -62,7 +62,7 @@ enum Command {
     },
     /// Export cookies from the active browser.
     Cookies {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         /// Filter by cookie domain regex.
         #[arg(long)]
@@ -84,7 +84,7 @@ enum Command {
     },
     /// Run an HTTP request from the browser page context.
     Fetch {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         url: String,
         #[arg(long, short = 'X', default_value = "GET")]
@@ -115,7 +115,7 @@ enum Command {
     },
     /// Evaluate a JavaScript expression in the active page.
     Eval {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         /// JavaScript expression.
         expression: String,
@@ -136,17 +136,18 @@ enum Command {
     },
     /// Wait until the browser endpoint is reachable.
     Wait {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
-        /// Block until the browser answers /json/version (CDP) or session.status (BiDi).
-        #[arg(long)]
+        /// Deprecated no-op kept for backward compatibility. Readiness is now
+        /// the default (and only) mode.
+        #[arg(long, hide = true)]
         ready: bool,
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
     /// Wait until a cookie matching the filter appears.
     WaitForCookie {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         #[arg(long)]
         domain: String,
@@ -183,8 +184,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Named-tab lifecycle: `tab open`, `tab list`. Addressable as
-    /// `<browser>/<name>` in every other command's positional.
+    /// Named-tab lifecycle: `tab open`, `tab list`, `tab adopt`.
+    /// Addressable as `--browser <browser>/<name>` in page-context commands.
     Tab {
         #[command(subcommand)]
         cmd: browser_control::cli::tab::TabCmd,

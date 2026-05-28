@@ -1,5 +1,7 @@
 //! `browser-control cookies` — export cookies from the active browser.
 //!
+//! Browser-wide command — tab suffixes on `--browser` are rejected.
+//!
 //! Output formats:
 //! - `json`: pretty JSON array of normalised cookies. Always contains full values
 //!   (machine-readable; user explicitly opted in).
@@ -78,20 +80,22 @@ pub async fn run(
         // Accept `<browser>[/<tab>]` for syntactic consistency with
         // `eval`/`fetch`/`storage`. Cookies are inherently browser-wide
         // (CDP `Network.getAllCookies` / BiDi `storage.getCookies` return
-        // the full cookie jar), so the tab arg is informational only — we
-        // strip it before resolving the browser. The route trace records
-        // `named-tab-informational` when a tab name was supplied, otherwise
-        // `browser-wide`.
+        // the full cookie jar), so tab suffixes are rejected.
         let raw = browser.unwrap_or_default();
         let parsed = if raw.is_empty() {
             None
         } else {
             Some(env_resolver::parse_target(&raw)?)
         };
-        let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
+        if parsed.as_ref().and_then(|p| p.tab.as_ref()).is_some() {
+            bail!(
+                "`cookies` operates browser-wide; tab suffixes are not supported \
+                 (got `{raw}`). Use a bare browser selector instead."
+            );
+        }
         let browser_only = parsed
             .as_ref()
-            .map(|p| strip_tab(&raw, p.tab.as_deref()))
+            .map(|_| raw.clone())
             .unwrap_or_default();
         let resolved = resolve_browser(if browser_only.is_empty() {
             None
@@ -100,11 +104,7 @@ pub async fn run(
         })
         .await?;
         trace.browser(&browser_only).engine(resolved.engine);
-        if let Some(name) = &tab_name {
-            trace.route("named-tab-informational").tab_name(name);
-        } else {
-            trace.route("browser-wide");
-        }
+        trace.route("browser-wide");
         // Hold the BiDi single-session lock for the read; releases on Drop.
         // No-op for CDP and for external URL endpoints.
         let _bidi_lock = {
@@ -272,17 +272,6 @@ fn format_header(cookies: &[NormalCookie], reveal: bool) -> String {
         })
         .collect();
     format!("Cookie: {}", parts.join("; "))
-}
-
-/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
-fn strip_tab(raw: &str, tab: Option<&str>) -> String {
-    match tab {
-        Some(name) => raw
-            .strip_suffix(&format!("/{name}"))
-            .unwrap_or(raw)
-            .to_string(),
-        None => raw.to_string(),
-    }
 }
 
 fn write_file(path: &Path, body: &str) -> Result<()> {

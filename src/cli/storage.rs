@@ -1,6 +1,6 @@
 //! `browser-control storage` — local/sessionStorage get/set/list.
 //!
-//! Routing mirrors `eval`/`fetch`. The `<browser>` positional accepts the
+//! Routing mirrors `eval`/`fetch`. The `--browser` flag accepts the
 //! unified `<browser>[/<tab>]` syntax; three paths fall out of `(tab, --target)`:
 //!
 //! 1. `<browser>/<tab>` (no `--target`) — named-tab path via
@@ -34,7 +34,7 @@ const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum StorageCmd {
     /// Read a single storage entry. With --key-regex, returns the first match.
     Get {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         key: Option<String>,
         #[arg(long)]
@@ -48,7 +48,7 @@ pub enum StorageCmd {
     },
     /// Write a single storage entry.
     Set {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         key: String,
         value: String,
@@ -59,7 +59,7 @@ pub enum StorageCmd {
     },
     /// List all storage entries (optionally filtered by key regex).
     List {
-        #[arg(env = "BROWSER_CONTROL")]
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
         browser: Option<String>,
         #[arg(long)]
         key_regex: Option<String>,

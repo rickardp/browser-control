@@ -1,5 +1,7 @@
 //! `browser-control wait-for-cookie` — block until a cookie appears.
 //!
+//! Browser-wide command — tab suffixes on `--browser` are rejected.
+//!
 //! v1 strategy: **polling only**. The plan envisions an event-driven path via
 //! CDP `Network.responseReceived` / BiDi `network.responseCompleted`, but for
 //! v1 simplicity we poll `Network.getAllCookies` / `storage.getCookies` at a
@@ -22,7 +24,7 @@ use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
 use crate::session::backend::open_backend;
-use crate::session::{with_named_tab_recovery, with_scratch_recovery, PageSession};
+use crate::session::{with_scratch_recovery, PageSession};
 
 /// Per-fetch timeout when `--validate-url` drives a `fetch()` from the
 /// page context. 30 s catches a wedged renderer; the outer polling loop
@@ -42,27 +44,26 @@ pub async fn run(
         let domain_re = Regex::new(&domain).context("invalid --domain regex")?;
         let name_re = Regex::new(&name).context("invalid --name regex")?;
 
-        // Parse `<browser>[/<tab>]` so the optional `--validate-url` leg can
-        // route through a named tab. The cookie poll itself is browser-wide
-        // and uses no tab context.
+        // Reject `<browser>/<tab>` — `wait-for-cookie` is browser-wide.
+        // The cookie poll uses `Network.getAllCookies` / `storage.getCookies`
+        // which are browser-scoped; tabs don't apply.
         let raw = browser.unwrap_or_default();
-        let parsed = if raw.is_empty() {
+        if !raw.is_empty() {
+            let parsed = env_resolver::parse_target(&raw)?;
+            if parsed.tab.is_some() {
+                bail!(
+                    "`wait-for-cookie` operates browser-wide; tab suffixes are not supported \
+                     (got `{raw}`). Use a bare browser selector instead."
+                );
+            }
+        }
+        let resolved = resolve_browser(if raw.is_empty() {
             None
         } else {
-            Some(env_resolver::parse_target(&raw)?)
-        };
-        let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
-        let browser_only = parsed
-            .as_ref()
-            .map(|p| strip_tab(&raw, p.tab.as_deref()))
-            .unwrap_or_default();
-        let resolved = resolve_browser(if browser_only.is_empty() {
-            None
-        } else {
-            Some(browser_only.clone())
+            Some(raw.clone())
         })
         .await?;
-        trace.browser(&browser_only).engine(resolved.engine);
+        trace.browser(&raw).engine(resolved.engine);
 
         // Hold the Firefox BiDi single-session lock across the whole poll
         // loop (and the optional validate-url leg). Each `fetch_cookies`
@@ -96,12 +97,7 @@ pub async fn run(
         eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
 
         if let Some(url) = validate_url {
-            // Three-path routing for the validate-url fetch:
-            //   - <browser>/<tab>  → named-tab path
-            //   - bare <browser>   → scratch path (or direct for external URL)
-            // The cookie poll above already finished, so this is the only
-            // place a tab context matters.
-            run_validate_url(&resolved, &registry, tab_name.as_deref(), &url, &mut trace).await?;
+            run_validate_url(&resolved, &registry, None, &url, &mut trace).await?;
         } else {
             // No validate-url; only the cookie poll ran (browser-wide).
             trace.route("poll");
@@ -120,79 +116,40 @@ pub async fn run(
     }
 }
 
-/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
-fn strip_tab(raw: &str, tab: Option<&str>) -> String {
-    match tab {
-        Some(name) => raw
-            .strip_suffix(&format!("/{name}"))
-            .unwrap_or(raw)
-            .to_string(),
-        None => raw.to_string(),
-    }
-}
-
-/// Drive the `--validate-url` fetch through the right routing path:
-/// named-tab (with recover-once), scratch (with recover-once), or direct
-/// attach for external URL endpoints.
+/// Drive the `--validate-url` fetch through scratch (with recover-once)
+/// or direct attach for external URL endpoints.
 async fn run_validate_url(
     resolved: &crate::cli::env_resolver::ResolvedBrowser,
     registry: &Registry,
-    tab_name: Option<&str>,
+    _tab_name: Option<&str>,
     url: &str,
     trace: &mut CommandTrace,
 ) -> Result<()> {
     let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
     let expr = format!("({})({})", FETCH_JS, serde_json::to_string(&args).unwrap());
 
-    let value = match tab_name {
-        Some(name) => {
-            trace.route("named-tab").tab_name(name);
-            let browser_name = match &resolved.source {
-                Source::Registered { name } => name.clone(),
-                _ => bail!(
-                    "named tabs (`<browser>/<name>`) require a registered browser; \
-                     external endpoints can't carry tab names"
-                ),
-            };
-            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+    let value = if matches!(resolved.source, Source::External) {
+        trace.route("direct");
+        let session =
+            PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+        let res = session
+            .evaluate_with_timeout(&expr, true, Some(VALIDATE_TIMEOUT))
+            .await;
+        session.close().await;
+        res?
+    } else {
+        trace.route("scratch");
+        let browser_name = match &resolved.source {
+            Source::Registered { name } => name.clone(),
+            _ => unreachable!("Source::External branch handled above"),
+        };
+        let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+        let expr = expr.clone();
+        with_scratch_recovery(&backend, registry, &browser_name, move |b, target_id| {
             let expr = expr.clone();
-            with_named_tab_recovery(
-                &backend,
-                registry,
-                &browser_name,
-                name,
-                move |b, target_id| {
-                    let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, true, VALIDATE_TIMEOUT).await }
-                },
-            )
-            .await?
-        }
-        None => {
-            if matches!(resolved.source, Source::External) {
-                trace.route("direct");
-                let session =
-                    PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
-                let res = session
-                    .evaluate_with_timeout(&expr, true, Some(VALIDATE_TIMEOUT))
-                    .await;
-                session.close().await;
-                res?
-            } else {
-                trace.route("scratch");
-                let browser_name = match &resolved.source {
-                    Source::Registered { name } => name.clone(),
-                    _ => unreachable!("Source::External branch handled above"),
-                };
-                let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-                let expr = expr.clone();
-                with_scratch_recovery(&backend, registry, &browser_name, move |b, target_id| {
-                    let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, true, VALIDATE_TIMEOUT).await }
-                })
-                .await?
-            }
-        }
+            async move { b.evaluate(&target_id, &expr, true, VALIDATE_TIMEOUT).await }
+        })
+        .await?
     };
 
     let json_str = value.as_str().ok_or_else(|| {

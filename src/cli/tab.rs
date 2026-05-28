@@ -1,12 +1,12 @@
 //! `browser-control tab` subcommand: named-tab lifecycle backed by the
-//! SQLite `tabs` table. The agent surface is intentionally minimal —
-//! `tab open` and `tab list`. There is no `tab close` or `tab navigate`
-//! per ADR-002 follow-up scope:
+//! SQLite `tabs` table. Commands: `tab open`, `tab list`, `tab adopt`.
 //!
 //! - Close is implicit (sweep-on-read evicts stale rows; LRU recycles
 //!   under budget pressure). Agents don't know when they're done.
 //! - Navigate is folded into `tab open <browser>/<name> <url>`, which
 //!   navigates the existing tab if `url` differs from `last_url`.
+//! - `tab adopt` binds an unnamed live tab (discovered via `tab list --all`)
+//!   to a name so it becomes addressable in page-context commands.
 
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
@@ -49,6 +49,19 @@ pub enum TabCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Adopt an existing live tab by target ID, binding it to a name.
+    ///
+    /// Use `tab list --all` to discover unnamed tabs and their target IDs,
+    /// then `tab adopt <browser>/<name> <target-id>` to make them
+    /// addressable via `--browser <browser>/<name>` in page-context commands.
+    Adopt {
+        /// `<browser>/<name>` — the browser and name to assign.
+        browser: String,
+        /// The target ID from `tab list --all`.
+        target_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(cmd: TabCmd) -> Result<()> {
@@ -66,6 +79,20 @@ pub async fn run(cmd: TabCmd) -> Result<()> {
         TabCmd::List { browser, all, json } => {
             let mut trace = CommandTrace::new("tab-list");
             match list(&browser, all, json, &mut trace).await {
+                Ok(()) => {
+                    trace.ok(());
+                    Ok(())
+                }
+                Err(e) => Err(trace.err(e)),
+            }
+        }
+        TabCmd::Adopt {
+            browser,
+            target_id,
+            json,
+        } => {
+            let mut trace = CommandTrace::new("tab-adopt");
+            match adopt(&browser, &target_id, json, &mut trace).await {
                 Ok(()) => {
                     trace.ok(());
                     Ok(())
@@ -171,6 +198,66 @@ async fn list(positional: &str, all: bool, json: bool, trace: &mut CommandTrace)
             println!("{}\t{}\t{}\t{}", r.name, r.owner, idle, r.url);
         }
     }
+    Ok(())
+}
+
+async fn adopt(
+    positional: &str,
+    target_id: &str,
+    json: bool,
+    trace: &mut CommandTrace,
+) -> Result<()> {
+    let target = env_resolver::parse_target(positional)
+        .with_context(|| format!("parsing `{positional}` as <browser>/<tab>"))?;
+    let name = target
+        .tab
+        .as_deref()
+        .ok_or_else(|| anyhow!("`tab adopt` requires `<browser>/<name>`, got `{positional}`"))?;
+
+    let registry = Registry::open()?;
+    let resolved = resolve_browser(Some(reassemble_browser_only(positional)?)).await?;
+    let browser_name = match &resolved.source {
+        crate::cli::env_resolver::Source::Registered { name } => name.clone(),
+        _ => {
+            return Err(anyhow!(
+                "named tabs require a registered browser; `{positional}` resolved to an external endpoint"
+            ));
+        }
+    };
+
+    trace
+        .browser(&browser_name)
+        .engine(resolved.engine)
+        .tab_name(name)
+        .route("tab-adopt");
+
+    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+    let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+
+    // Verify the target ID actually exists in the browser.
+    let live_ids = backend.live_target_ids().await?;
+    if !live_ids.contains(target_id) {
+        return Err(anyhow!(
+            "target ID `{target_id}` not found among live tabs. \
+             Use `tab list --all` to see available target IDs."
+        ));
+    }
+
+    // Get the URL of the live tab for the registry row.
+    let live_targets = backend.live_targets().await?;
+    let url = live_targets
+        .iter()
+        .find(|t| t.id == target_id)
+        .map(|t| t.url.as_str())
+        .unwrap_or("about:blank");
+
+    // daemon_created = false because this is a user-adopted tab.
+    registry.tab_upsert(&browser_name, name, target_id, url, false)?;
+    let row = registry
+        .tab_get(&browser_name, name)?
+        .ok_or_else(|| anyhow!("tab row missing immediately after upsert"))?;
+    trace.target_id(&row.target_id);
+    print_summary(&row, json);
     Ok(())
 }
 
