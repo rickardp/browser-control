@@ -112,3 +112,22 @@ pub fn is_bidi_target_gone(code: &str, message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     BIDI_TARGET_GONE_NEEDLES.iter().any(|n| m.contains(n))
 }
+
+/// Single shared predicate for "the tab the op targeted is dead; one
+/// recover-and-retry round is appropriate." Used by `with_scratch_recovery`,
+/// `with_named_tab_recovery`, and the bare-fetch origin-bound recovery
+/// in `cli::fetch`. Keeping these in one place avoids the three call
+/// sites drifting apart on what counts as recoverable.
+pub fn is_recoverable_tab_failure(err: &anyhow::Error) -> bool {
+    if let Some(se) = err.downcast_ref::<SessionError>() {
+        return matches!(
+            se,
+            SessionError::TabHung { .. }
+                | SessionError::TabCrashed { .. }
+                | SessionError::TargetGone { .. }
+        );
+    }
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    CDP_TARGET_GONE_NEEDLES.iter().any(|n| msg.contains(n))
+        || BIDI_TARGET_GONE_NEEDLES.iter().any(|n| msg.contains(n))
+}

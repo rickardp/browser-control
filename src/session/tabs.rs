@@ -168,13 +168,13 @@ async fn target_alive(backend: &TabBackend, target_id: &str) -> Result<bool> {
 ///    CDP/BiDi "no target / no context" protocol error), the tab died
 ///    between resolve and op. **Leave the dead tab in the browser** — the
 ///    agent named it, the corpse is human-inspectable. Create a fresh
-///    `about:blank` tab and re-point the registry row at it under the
-///    **same name**, then retry `op` once. After recovery,
-///    `<browser>/<name>` resolves to the new live tab; the dead tab is no
-///    longer addressable by name (and `tab list` won't show it, since
-///    sweep-on-read checks against `live_target_ids`).
-///    The new tab is blank — agents that need a specific URL on a recovered
-///    tab are expected to `tab open <browser>/<name> <url>` to rehydrate.
+///    tab, navigate it to the row's `last_url` (best-effort; falls back
+///    to `about:blank` if the rehydration navigation itself fails), and
+///    re-point the registry row at it under the **same name**, then
+///    retry `op` once. After recovery, `<browser>/<name>` resolves to
+///    the new live tab pointing at the same URL the agent last saw it
+///    at; the dead tab is no longer addressable by name (and `tab list`
+///    won't show it, since sweep-on-read checks against `live_target_ids`).
 /// 4. If the retry also fails, escalate the typed error to the caller.
 pub async fn with_named_tab_recovery<F, T, Fut>(
     backend: &TabBackend,
@@ -214,44 +214,50 @@ where
             //
             // Do NOT close the dead tab. The agent named it; the corpse
             // stays in the browser so the human can inspect it. The
-            // registry row gets re-pointed at a fresh blank tab under
-            // the same name — addressing-by-name now resolves to the
-            // new live tab, the dead tab is no longer reachable via
+            // registry row gets re-pointed at a fresh tab under the
+            // same name — addressing-by-name now resolves to the new
+            // live tab, the dead tab is no longer reachable via
             // `<browser>/<name>` and falls off `tab list` (sweep-on-read
             // checks the row's target_id against live_target_ids).
+            //
+            // Rehydrate `last_url`: if the dead tab was at a real URL,
+            // navigate the new tab there before retrying so the agent
+            // sees its addressable state preserved. Best-effort — if
+            // navigation itself fails (origin gone, network down) we
+            // fall back to blank rather than block recovery.
+            let rehydrate_url = if row.last_url.is_empty() || row.last_url == "about:blank" {
+                "about:blank".to_string()
+            } else {
+                row.last_url.clone()
+            };
             let new_target_id = backend.create_tab("about:blank").await?;
-            registry.tab_upsert(browser_name, tab_name, &new_target_id, "about:blank", true)?;
+            let (stored_url, ready_target) = if rehydrate_url != "about:blank" {
+                match backend.navigate(&new_target_id, &rehydrate_url).await {
+                    Ok(()) => (rehydrate_url, new_target_id),
+                    Err(nav_err) => {
+                        tracing::warn!(
+                            target = "session::tabs",
+                            "rehydrating {browser_name}/{tab_name} to {rehydrate_url} failed: {nav_err:#}; falling back to about:blank"
+                        );
+                        ("about:blank".to_string(), new_target_id)
+                    }
+                }
+            } else {
+                ("about:blank".to_string(), new_target_id)
+            };
+            registry.tab_upsert(browser_name, tab_name, &ready_target, &stored_url, true)?;
             // Step 4: retry once.
-            op(backend.clone(), new_target_id).await
+            op(backend.clone(), ready_target).await
         }
         Err(e) => Err(e),
     }
 }
 
 /// Does this error suggest the named tab is dead and we should retry on
-/// a fresh one? Same shape as `scratch::is_scratch_failure` — kept here
-/// rather than re-exported so the two recovery wrappers don't develop
-/// hidden coupling.
+/// a fresh one? Delegates to the shared classifier in `errors` so the
+/// scratch / named-tab / origin-bound recovery wrappers can never drift.
 fn is_tab_failure(err: &anyhow::Error) -> bool {
-    // Primary: typed variants from the session / protocol layer.
-    if let Some(se) = err.downcast_ref::<SessionError>() {
-        return matches!(
-            se,
-            SessionError::TabHung { .. }
-                | SessionError::TabCrashed { .. }
-                | SessionError::TargetGone { .. }
-        );
-    }
-    // Defensive fallback for un-classified raw protocol errors.
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("no target with given id")
-        || msg.contains("session is gone")
-        || msg.contains("no session with given id")
-        || msg.contains("target closed")
-        || msg.contains("no such frame")
-        || msg.contains("no such node")
-        || msg.contains("no such context")
-        || msg.contains("invalid session id")
+    crate::errors::is_recoverable_tab_failure(err)
 }
 
 fn fresh_cute_name(registry: &Registry, browser_name: &str) -> Result<String> {
@@ -801,6 +807,57 @@ mod tests {
 
         let unrelated: anyhow::Error = anyhow::anyhow!("dns failure");
         assert!(!is_tab_failure(&unrelated));
+    }
+
+    /// Recovery rehydrates the dead tab's `last_url` onto the fresh tab
+    /// instead of dropping the agent back to `about:blank`. The agent
+    /// addresses by name and expects the name to point at the same URL
+    /// after a transient renderer failure.
+    #[tokio::test]
+    async fn recover_rehydrates_last_url_onto_fresh_tab() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        // Seed a row whose last_url is a real URL (not about:blank).
+        let opened = tab_open(
+            &backend,
+            &reg,
+            "b",
+            Some("pinned"),
+            Some("https://example.com/app"),
+        )
+        .await
+        .unwrap();
+        let original_target = opened.target_id.clone();
+        assert_eq!(opened.last_url, "https://example.com/app");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let _ = with_named_tab_recovery(&backend, &reg, "b", "pinned", move |_, target_id| {
+            let calls = calls_clone.clone();
+            async move {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(SessionError::TabHung {
+                        target_id: Some(target_id),
+                        url: None,
+                        timeout_ms: 100,
+                        hint: "test",
+                    }
+                    .into())
+                } else {
+                    Ok::<_, anyhow::Error>(serde_json::json!("ok"))
+                }
+            }
+        })
+        .await
+        .expect("recover succeeded");
+
+        let row = reg.tab_get("b", "pinned").unwrap().unwrap();
+        assert_ne!(row.target_id, original_target, "row points at fresh tab");
+        assert_eq!(
+            row.last_url, "https://example.com/app",
+            "last_url rehydrated on recovery instead of falling back to about:blank"
+        );
     }
 
     /// Both attempts return `TabHung` → escalate to the caller.

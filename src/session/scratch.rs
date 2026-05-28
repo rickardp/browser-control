@@ -17,7 +17,6 @@
 
 use anyhow::Result;
 
-use crate::errors::SessionError;
 use crate::registry::Registry;
 use crate::session::backend::TabBackend;
 
@@ -86,44 +85,22 @@ where
 }
 
 /// Does this error suggest the scratch tab is dead and we should retry on
-/// a fresh one? We treat three categories as recoverable:
+/// a fresh one? Delegates to the shared classifier in `errors` so the
+/// scratch / named-tab / origin-bound recovery wrappers can never drift.
 ///
-/// - `SessionError::TabHung` — per-op timeout fired with no reply. Catches
-///   the wedged-renderer case (iLO and friends).
+/// We treat three categories as recoverable:
+/// - `SessionError::TabHung` — per-op timeout fired with no reply.
 /// - `SessionError::TabCrashed` — renderer crash event reached us.
-/// - CDP/BiDi protocol errors mentioning a missing target/session/context
-///   — the stored `target_id` no longer exists in the browser (typical
-///   after a browser restart between CLI invocations).
+/// - CDP/BiDi protocol errors mentioning a missing target/session/context.
 fn is_scratch_failure(err: &anyhow::Error) -> bool {
-    // Primary: typed variants from the session / protocol layer.
-    if let Some(se) = err.downcast_ref::<SessionError>() {
-        return matches!(
-            se,
-            SessionError::TabHung { .. }
-                | SessionError::TabCrashed { .. }
-                | SessionError::TargetGone { .. }
-        );
-    }
-    // Defensive fallback: catch raw CDP/BiDi error strings that slip past
-    // the client-layer classifier (e.g. surfaced via `anyhow::Error` from
-    // an older code path or context-wrapped without downcast info).
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    // CDP-shaped errors.
-    msg.contains("no target with given id")
-        || msg.contains("session is gone")
-        || msg.contains("no session with given id")
-        || msg.contains("target closed")
-        // BiDi-shaped errors (per W3C WebDriver BiDi).
-        || msg.contains("no such frame")
-        || msg.contains("no such node")
-        || msg.contains("no such context")
-        || msg.contains("invalid session id")
+    crate::errors::is_recoverable_tab_failure(err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cdp::CdpClient;
+    use crate::errors::SessionError;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicU32, Ordering};

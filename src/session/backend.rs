@@ -221,26 +221,37 @@ impl TabBackend {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("attachToTarget returned no sessionId"))?
                     .to_string();
-                let inner = c.send_with_session(
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": expression,
-                        "returnByValue": true,
-                        "awaitPromise": await_promise,
-                    }),
-                    Some(&session_id),
-                );
-                let value = match tokio::time::timeout(timeout, inner).await {
-                    Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(SessionError::TabHung {
-                        target_id: Some(target_id.to_string()),
-                        url: None,
-                        timeout_ms: timeout.as_millis() as u64,
-                        hint: "op-timeout",
-                    }
-                    .into()),
+                // Enable the Inspector domain on the attached session so
+                // `Inspector.targetCrashed` is delivered while the
+                // evaluate is in flight. Best-effort: older Chromium
+                // builds and headless variants may answer with an
+                // empty result but never raise — failing the enable
+                // would silently mute crash detection, so we proceed.
+                let _ = c
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
+                    .await;
+                let inner = async {
+                    let v = c
+                        .send_with_session(
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": expression,
+                                "returnByValue": true,
+                                "awaitPromise": await_promise,
+                            }),
+                            Some(&session_id),
+                        )
+                        .await?;
+                    Ok::<Value, anyhow::Error>(v["result"]["value"].clone())
                 };
+                let value = crate::session::crash::evaluate_with_crash_detection(
+                    c,
+                    target_id,
+                    Some(&session_id),
+                    inner,
+                    Some(timeout),
+                )
+                .await;
                 let _ = c
                     .send(
                         "Target.detachFromTarget",

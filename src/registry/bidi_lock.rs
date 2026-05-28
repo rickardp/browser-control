@@ -65,14 +65,13 @@ impl BidiLockGuard {
 
 impl Drop for BidiLockGuard {
     fn drop(&mut self) {
-        // We can't call `Registry::open_at` here: the parent `Registry`
-        // that issued this guard still holds the process-level fs2 file
-        // lock, so reopening would deadlock. Instead, talk to SQLite
-        // directly via a raw `rusqlite::Connection`. The DELETE is a
-        // single atomic statement and SQLite handles concurrent
-        // connections to the same DB internally, so we don't need the
-        // Registry's mutex here.
+        // Talk to SQLite directly via a raw `rusqlite::Connection`. We
+        // can't reach back into the parent `Registry` from Drop without
+        // significant lifetime gymnastics, and the DELETE is a single
+        // atomic statement — SQLite's own concurrency (WAL +
+        // busy_timeout) covers serialisation against other writers.
         if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
             let _ = conn.execute(
                 "DELETE FROM bidi_locks WHERE browser_name = ?1 AND holder_pid = ?2",
                 rusqlite::params![self.browser_name, self.holder_pid],

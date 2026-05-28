@@ -142,15 +142,42 @@ async fn run_inner(
         // cookies/credentials propagate. Scratch routing (which would use
         // about:blank) would lose this; we deliberately keep
         // attach_for_origin here instead.
+        //
+        // Recover-once: if the first attempt's tab dies between attach
+        // and evaluate (renderer wedged, target closed externally,
+        // engine restart between invocations), drop the dead session
+        // best-effort and re-attach for the same origin once. Mirrors
+        // the contract scratch / named-tab paths already enforce.
+        // Auth-inheritance is preserved because each attempt
+        // independently re-resolves the origin-bound target — we never
+        // fall back to about:blank, which would silently break
+        // credentialed fetches.
         (None, None) => {
             trace.route("attach-for-origin");
             let session =
                 PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?;
-            let value = session
+            let first = session
                 .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
                 .await;
             session.close().await;
-            value?
+            match first {
+                Ok(v) => v,
+                Err(e) if crate::errors::is_recoverable_tab_failure(&e) => {
+                    tracing::warn!(
+                        target = "fetch",
+                        "origin-bound fetch failed with recoverable error; re-attaching and retrying once: {e:#}"
+                    );
+                    let retry =
+                        PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url)
+                            .await?;
+                    let result = retry
+                        .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
+                        .await;
+                    retry.close().await;
+                    result?
+                }
+                Err(e) => return Err(e),
+            }
         }
         _ => unreachable!("mutex was checked above"),
     };

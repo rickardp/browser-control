@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
 use rusqlite::{params, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,15 +37,16 @@ pub struct BrowserRow {
     pub started_at: String,
 }
 
-/// SQLite registry handle. Holds an advisory exclusive file lock for its lifetime
-/// (except for in-memory registries).
+/// SQLite registry handle. SQLite-level WAL + `busy_timeout` handles
+/// concurrent reader/writer coordination across processes; we no longer
+/// hold a long-lived exclusive file lock for the lifetime of the
+/// handle. A short exclusive lock is taken only across the
+/// schema-migration window in `open_at` to serialise initial
+/// `CREATE TABLE` / `CREATE INDEX` against a concurrent first open.
 pub struct Registry {
     conn: rusqlite::Connection,
     #[allow(dead_code)]
     db_path: PathBuf,
-    // Held to keep the advisory lock alive; dropped releases the lock.
-    #[allow(dead_code)]
-    lock: Option<File>,
 }
 
 impl Registry {
@@ -64,6 +65,13 @@ impl Registry {
             }
         }
 
+        // Hold an exclusive file lock only across the initial schema
+        // migration. SQLite's own `CREATE TABLE IF NOT EXISTS` is
+        // idempotent and safe under concurrent execution, but
+        // narrowing the lock to this window keeps the historical
+        // serialisation guarantee for any future schema-altering
+        // change while letting steady-state CLI invocations proceed
+        // in parallel.
         let lock_path = lock_path_for(path);
         let lock_file = OpenOptions::new()
             .create(true)
@@ -84,10 +92,16 @@ impl Registry {
         configure_conn(&conn)?;
         schema::apply(&conn)?;
 
+        // Release the migration lock. From here on, SQLite's
+        // WAL + busy_timeout handles inter-process coordination
+        // for both reads and writes; CLI invocations no longer
+        // serialise on browser I/O.
+        let _ = FileExt::unlock(&lock_file);
+        drop(lock_file);
+
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
-            lock: Some(lock_file),
         })
     }
 
@@ -100,7 +114,6 @@ impl Registry {
         Ok(Self {
             conn,
             db_path: PathBuf::from(":memory:"),
-            lock: None,
         })
     }
 
@@ -217,11 +230,19 @@ impl Registry {
 }
 
 fn configure_conn(conn: &rusqlite::Connection) -> Result<()> {
-    // WAL improves concurrent reader/writer behavior; ignore the row callback.
+    // WAL allows concurrent readers + one writer per process group.
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("setting journal_mode = WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("setting synchronous = NORMAL")?;
+    // `busy_timeout` is what makes concurrent invocations safe now that
+    // we no longer hold the long-lived advisory file lock. SQLite will
+    // retry a contended write for up to this duration before returning
+    // SQLITE_BUSY. Five seconds is generous for our workloads (single
+    // INSERT/UPDATE per CLI invocation) and short enough that a stuck
+    // process surfaces visibly instead of hanging forever.
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("setting busy_timeout")?;
     Ok(())
 }
 

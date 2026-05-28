@@ -57,6 +57,13 @@ impl PageSession {
                 let client = open_cdp(endpoint).await?;
                 let target_id = pick_cdp_page(&client, pattern.as_ref()).await?;
                 let session_id = client.attach_to_target(&target_id).await?;
+                // Enable Inspector domain so `Inspector.targetCrashed`
+                // is delivered to this session while evaluates are in
+                // flight. Best-effort; see `TabBackend::evaluate` for
+                // rationale.
+                let _ = client
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
+                    .await;
                 Ok(PageSession::Cdp(CdpPage {
                     client,
                     session_id,
@@ -113,6 +120,9 @@ impl PageSession {
                     None => create_cdp_tab(&client, &origin_root).await?,
                 };
                 let session_id = client.attach_to_target(&target_id).await?;
+                let _ = client
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
+                    .await;
                 Ok(PageSession::Cdp(CdpPage {
                     client,
                     session_id,
@@ -160,6 +170,15 @@ impl PageSession {
     /// loop, modal dialog, devtools-paused, embedded admin UIs whose
     /// renderer ignores `Runtime.evaluate`).
     ///
+    /// On the CDP arm, the in-flight `Runtime.evaluate` is additionally
+    /// raced against the renderer-crash events
+    /// (`Target.targetCrashed` / `Inspector.targetCrashed`) for this
+    /// target/session — a matching event short-circuits the call with a
+    /// typed [`SessionError::TabCrashed`] instead of waiting for the
+    /// timeout. BiDi has no equivalent protocol event; a context crash
+    /// surfaces as `no such frame/context` on the next request and is
+    /// classified as `TargetGone` by the client layer.
+    ///
     /// If `timeout` is `None`, the call is bounded only by the underlying
     /// client's protocol timeout (CDP: 30 s, BiDi: 30 s).
     pub async fn evaluate_with_timeout(
@@ -170,9 +189,9 @@ impl PageSession {
     ) -> Result<Value> {
         let target_id = self.target_id();
         let url = None;
-        let inner = async {
-            match self {
-                PageSession::Cdp(p) => {
+        match self {
+            PageSession::Cdp(p) => {
+                let inner = async {
                     let v = p
                         .client
                         .send_with_session(
@@ -185,27 +204,37 @@ impl PageSession {
                             Some(&p.session_id),
                         )
                         .await?;
-                    Ok(v["result"]["value"].clone())
-                }
-                PageSession::Bidi(p) => {
+                    Ok::<Value, anyhow::Error>(v["result"]["value"].clone())
+                };
+                crate::session::crash::evaluate_with_crash_detection(
+                    &p.client,
+                    &p.target_id,
+                    Some(&p.session_id),
+                    inner,
+                    timeout,
+                )
+                .await
+            }
+            PageSession::Bidi(p) => {
+                let inner = async {
                     let _ = await_promise; // BiDi always awaits per script_evaluate
                     let v = p.client.script_evaluate(&p.context, expression).await?;
-                    Ok(v["result"]["value"].clone())
+                    Ok::<Value, anyhow::Error>(v["result"]["value"].clone())
+                };
+                match timeout {
+                    None => inner.await,
+                    Some(d) => match tokio::time::timeout(d, inner).await {
+                        Ok(r) => r,
+                        Err(_) => Err(SessionError::TabHung {
+                            target_id,
+                            url,
+                            timeout_ms: d.as_millis() as u64,
+                            hint: "op-timeout",
+                        }
+                        .into()),
+                    },
                 }
             }
-        };
-        match timeout {
-            None => inner.await,
-            Some(d) => match tokio::time::timeout(d, inner).await {
-                Ok(r) => r,
-                Err(_) => Err(SessionError::TabHung {
-                    target_id,
-                    url,
-                    timeout_ms: d.as_millis() as u64,
-                    hint: "op-timeout",
-                }
-                .into()),
-            },
         }
     }
 

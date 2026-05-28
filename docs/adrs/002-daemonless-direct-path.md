@@ -176,26 +176,35 @@ bundled with the architectural decision.
 
 **Losses**
 
-- Until the scratch-tab recover-once wrapper lands, the CLI can still
-  surface `TabHung` to the caller. This is a known regression against
-  the "always proceed" rule and is the highest-priority follow-up.
-- The Firefox BiDi "Maximum number of active sessions" failure mode is
-  mitigated (`session.end` on close + retry-on-collision) but not yet
-  eliminated by an explicit lock. The SQLite lock follow-up closes the
-  remaining race window.
-- Agents cannot yet address a tab by stable name across CLI
-  invocations. Until the named-tab table lands, the only addressing
-  mechanisms are `--target <url-regex>` and the most-recently-used
-  tab.
+- The "always proceed" rule comes at the cost of one extra round-trip
+  per recovery: a wedged or crashed renderer surfaces only after the
+  per-op timeout fires, then the wrapper recreates and retries. Agents
+  see slightly higher tail latency under failure compared to a daemon
+  that could detect a dead tab eagerly. For the wedged case this is
+  fundamental (no protocol event); for the crashed case it is bounded
+  by the crash-event path (see Follow-ups → renderer-crash detection).
+- BiDi has no protocol event analogous to `Target.targetCrashed` /
+  `Inspector.targetCrashed`. Firefox context crashes surface as
+  `no such frame` / `no such context` on the next request, which the
+  `TargetGone` classifier already routes through recover-once — but the
+  in-flight call still waits for its timeout rather than short-circuiting
+  on a crash signal.
 
 **Non-impact**
 
 - The shipped CLI surface (`list-installed`, `list-running`, `start`,
   `targets`, `cookies`, `fetch`, `storage`, `eval`, `wait`,
-  `wait-for-cookie`, `set` / `get` / `unset`, `mcp`) is unchanged
-  except for the new `eval --timeout-ms` flag.
-- The SQLite registry under the OS app-data dir is unchanged.
-  ADR-001 remains in force.
+  `wait-for-cookie`, `set` / `get` / `unset`, `mcp`, `tab`) is
+  unchanged in shape; new flags (`eval --timeout-ms`,
+  `fetch --timeout-ms`) and the unified `<browser>/<name>` path
+  syntax are additive.
+- The SQLite registry under the OS app-data dir is unchanged in shape
+  (ADR-001 remains in force). The registry's lock granularity narrowed:
+  the exclusive file lock is now held only across schema migration
+  during `Registry::open_at`, not for the lifetime of the handle.
+  Steady-state CLI invocations rely on SQLite's WAL + `busy_timeout`
+  for inter-process coordination and no longer serialise on browser
+  I/O.
 
 ## Related
 
@@ -212,9 +221,17 @@ bundled with the architectural decision.
   on `TabHung` / `TabCrashed` / "no target" protocol errors. **Named
   tabs** got the same recover-once contract via
   `with_named_tab_recovery` in `src/session/tabs.rs`: a tab that dies
-  between `resolve_tab` and the op is closed + recreated under the
-  same name and the op retries once, otherwise typed
-  `SessionError::TabNotFound` / `TabHung` is surfaced.
+  between `resolve_tab` and the op is **left in place** in the browser
+  (corpse stays human-inspectable), the registry row is re-pointed at a
+  fresh tab under the same name, the fresh tab is navigated to the
+  dead row's `last_url` (best-effort rehydration; falls back to
+  `about:blank` only if rehydration navigation itself fails), and the
+  op retries once. Otherwise typed `SessionError::TabNotFound` /
+  `TabHung` / `TabCrashed` is surfaced. **Bare-browser `fetch`**
+  (origin-bound, no explicit tab) gets the same one-shot recovery
+  around `attach_for_origin` — auth-inheritance is preserved because
+  each attempt independently re-resolves the origin-bound target
+  rather than falling back to `about:blank`.
 - **`tab` CLI subcommand** backed by a SQLite `tabs` table with
   sweep-on-read for stale rows (`name`, `target_id`, `last_url`,
   `last_used_at`, `daemon_created`). Stable tab identity across CLI
@@ -245,6 +262,27 @@ bundled with the architectural decision.
   engine, and WS endpoint — eliminates per-invocation probes.
   **Status:** still deferred. Revisit when profiling shows per-invocation
   probe cost matters.
+
+- **Narrowed registry lock.** **Status:** landed. `Registry::open_at`
+  no longer holds a process-wide exclusive file lock for the lifetime
+  of the handle. The lock is taken across schema migration only;
+  steady-state CLI invocations rely on SQLite's WAL + `busy_timeout`
+  (5 s) for inter-process coordination. Unrelated invocations against
+  the same registry — and the same browser — no longer serialise on
+  each other's browser I/O.
+
+- **CDP renderer-crash detection.** **Status:** landed.
+  `src/session/crash.rs` runs every CDP `Runtime.evaluate` in a
+  `tokio::select!` against a subscription filter for
+  `Target.targetCrashed` (matched on `targetId`) and
+  `Inspector.targetCrashed` (matched on `sessionId`). A matching event
+  short-circuits the in-flight call with typed `SessionError::TabCrashed`
+  instead of waiting for the per-op timeout. `Inspector.enable` is
+  emitted on each per-page attach (`PageSession::attach`,
+  `attach_for_origin`, and `TabBackend::evaluate`'s transient session)
+  so the per-session event is actually delivered. BiDi has no
+  equivalent event; context crashes there still surface as
+  `TargetGone` on the next request — see Losses.
 
 - **Typed `SessionError::TabNotFound`**. **Status:** landed. Added next
   to `TabHung` / `TabCrashed` so the CLI, MCP tools, and tests can
