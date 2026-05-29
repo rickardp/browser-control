@@ -93,10 +93,7 @@ pub async fn run(
                  (got `{raw}`). Use a bare browser selector instead."
             );
         }
-        let browser_only = parsed
-            .as_ref()
-            .map(|_| raw.clone())
-            .unwrap_or_default();
+        let browser_only = parsed.as_ref().map(|_| raw.clone()).unwrap_or_default();
         let resolved = resolve_browser(if browser_only.is_empty() {
             None
         } else {
@@ -183,7 +180,7 @@ fn bool_field(v: &Value, k: &str) -> bool {
     v.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
 }
 
-fn normalize_cdp(v: &Value) -> NormalCookie {
+pub(crate) fn normalize_cdp(v: &Value) -> NormalCookie {
     let expires =
         v.get("expires")
             .and_then(|x| x.as_i64())
@@ -204,7 +201,7 @@ fn normalize_cdp(v: &Value) -> NormalCookie {
     }
 }
 
-fn normalize_bidi(v: &Value) -> NormalCookie {
+pub(crate) fn normalize_bidi(v: &Value) -> NormalCookie {
     let value = v
         .get("value")
         .and_then(|inner| inner.get("value").and_then(|x| x.as_str()))

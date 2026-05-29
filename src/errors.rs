@@ -43,8 +43,8 @@ pub enum SessionError {
     /// click, type, etc.) when the active browser is BiDi (Firefox) —
     /// Playwright can't drive a user-launched Firefox. The agent's
     /// recovery is to `browser_select` a Chromium-family browser, or
-    /// to use the engine-agnostic tools (`browser_evaluate`,
-    /// `browser_navigate`, etc.) which work on both engines.
+    /// to use the engine-agnostic tools (`browser_get_html`,
+    /// `browser_fetch`, `browser_navigate`, etc.) which work on both engines.
     #[error("tool `{tool}` requires {required_engine} engine; current browser uses {current_engine} ({hint})")]
     EngineUnsupported {
         tool: String,
@@ -103,8 +103,8 @@ pub fn is_bidi_target_gone(code: &str, message: &str) -> bool {
 
 /// Single shared predicate for "the tab the op targeted is dead; one
 /// recover-and-retry round is appropriate." Used by `with_scratch_recovery`,
-/// `with_named_tab_recovery`, and the bare-fetch origin-bound recovery
-/// in `cli::fetch`. Keeping these in one place avoids the three call
+/// `with_named_tab_recovery`, and the origin-bound evaluate helper.
+/// Keeping these in one place avoids the call
 /// sites drifting apart on what counts as recoverable.
 pub fn is_recoverable_tab_failure(err: &anyhow::Error) -> bool {
     if let Some(se) = err.downcast_ref::<SessionError>() {

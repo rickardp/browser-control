@@ -109,7 +109,7 @@ impl ServerState {
                 tool: tool_name.to_string(),
                 required_engine: "Chromium (CDP)".into(),
                 current_engine: format!("{:?}", resolved.engine),
-                hint: "use browser_evaluate or switch to a Chromium browser via browser_select",
+                hint: "use engine-agnostic tools such as browser_get_html, browser_fetch, browser_take_screenshot, or switch to a Chromium browser via browser_select",
             }
             .into());
         }
@@ -218,19 +218,14 @@ impl ServerState {
     /// For the URL-regex path, probe-and-iterate via the live targets
     /// snapshot. Surfaces `SessionError::TabHung` if every match is
     /// unresponsive within a 500ms probe.
-    pub async fn resolve_target_for_args(
-        &self,
-        args: &Value,
-    ) -> Result<(TabBackend, String)> {
+    pub async fn resolve_target_for_args(&self, args: &Value) -> Result<(TabBackend, String)> {
         let tab = args.get("tab").and_then(|v| v.as_str()).map(String::from);
         let target = args
             .get("target")
             .and_then(|v| v.as_str())
             .map(String::from);
         match (tab, target) {
-            (Some(_), Some(_)) => Err(anyhow::anyhow!(
-                "`tab` and `target` are mutually exclusive"
-            )),
+            (Some(_), Some(_)) => Err(anyhow::anyhow!("`tab` and `target` are mutually exclusive")),
             (Some(name), None) => {
                 let backend = self.ensure_backend().await?;
                 let browser_name = self.registered_browser_name().await?;
@@ -395,20 +390,22 @@ pub(crate) async fn resolve_browser_send(
             }
             other => anyhow::bail!("unsupported URL scheme: {other}"),
         },
-        other => tokio::task::spawn_blocking(move || {
-            let reg = crate::registry::Registry::open()?;
-            // Non-URL branches of `resolve_with` are pure SQL with no
-            // awaits — the future polls to completion in one step.
-            // We need to drive a tiny async, but `block_on` is fine
-            // here on a blocking thread.
-            let rt = tokio::runtime::Builder::new_current_thread().build()?;
-            rt.block_on(crate::cli::env_resolver::resolve_with(
-                other,
-                &reg,
-                &DefaultResolver,
-            ))
-        })
-        .await?,
+        other => {
+            tokio::task::spawn_blocking(move || {
+                let reg = crate::registry::Registry::open()?;
+                // Non-URL branches of `resolve_with` are pure SQL with no
+                // awaits — the future polls to completion in one step.
+                // We need to drive a tiny async, but `block_on` is fine
+                // here on a blocking thread.
+                let rt = tokio::runtime::Builder::new_current_thread().build()?;
+                rt.block_on(crate::cli::env_resolver::resolve_with(
+                    other,
+                    &reg,
+                    &DefaultResolver,
+                ))
+            })
+            .await?
+        }
     }
 }
 
@@ -428,9 +425,7 @@ async fn resolve_target_by_regex(backend: &TabBackend, regex: &str) -> Result<St
     let targets = backend.live_targets().await?;
     let matches: Vec<_> = targets.iter().filter(|t| re.is_match(&t.url)).collect();
     if matches.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no target matched URL regex `{regex}`"
-        ));
+        return Err(anyhow::anyhow!("no target matched URL regex `{regex}`"));
     }
     let mut last_id: Option<String> = None;
     let mut last_url: Option<String> = None;
@@ -605,7 +600,11 @@ where
                 // Spawn the handler so the read loop stays responsive while
                 // a slow tool runs. The frame is sent to the single writer
                 // task on completion, preserving serialized stdout writes.
-                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 let handler = tools.handler(&name);
                 let state = state.clone();
@@ -1042,7 +1041,10 @@ mod tests {
 
         // The stale row must have been swept.
         let reg = crate::registry::Registry::open().unwrap();
-        assert!(reg.tab_get("bx", "gone").unwrap().is_none(), "row not swept");
+        assert!(
+            reg.tab_get("bx", "gone").unwrap().is_none(),
+            "row not swept"
+        );
 
         std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
     }

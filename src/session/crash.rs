@@ -55,7 +55,11 @@ where
     Fut: std::future::Future<Output = Result<Value>>,
 {
     let events = client.subscribe();
-    let crash_watch = watch_for_crash(events, target_id.to_string(), session_id.map(str::to_string));
+    let crash_watch = watch_for_crash(
+        events,
+        target_id.to_string(),
+        session_id.map(str::to_string),
+    );
     tokio::pin!(fut);
     tokio::pin!(crash_watch);
 

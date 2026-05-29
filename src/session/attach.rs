@@ -286,7 +286,7 @@ impl PageSession {
             PageSession::Bidi(p) => {
                 let _ = full_page; // BiDi captures the viewport by default
                 p.client
-                    .browsing_context_capture_screenshot(&p.context)
+                    .browsing_context_capture_screenshot(&p.context, None)
                     .await
             }
         }
@@ -314,6 +314,66 @@ impl PageSession {
             }
         }
     }
+}
+
+/// Attach to a page on `origin_url`'s document origin, evaluate `expression`,
+/// close the session, and retry once on recoverable target-level failures.
+///
+/// This is the shared path for credentialed page-context fetches. Each attempt
+/// resolves the target by origin, so retrying never falls back to an opaque
+/// `about:blank` scratch tab that would drop cookies or trip CORS.
+pub async fn evaluate_for_origin_with_recover_once(
+    endpoint: &str,
+    engine: Engine,
+    origin_url: &str,
+    expression: &str,
+    await_promise: bool,
+    timeout: Duration,
+) -> Result<Value> {
+    let first = evaluate_for_origin_once(
+        endpoint,
+        engine,
+        origin_url,
+        expression,
+        await_promise,
+        timeout,
+    )
+    .await;
+    match first {
+        Ok(v) => Ok(v),
+        Err(e) if crate::errors::is_recoverable_tab_failure(&e) => {
+            tracing::warn!(
+                target = "session",
+                "origin-bound evaluate failed with recoverable error; re-attaching and retrying once: {e:#}"
+            );
+            evaluate_for_origin_once(
+                endpoint,
+                engine,
+                origin_url,
+                expression,
+                await_promise,
+                timeout,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn evaluate_for_origin_once(
+    endpoint: &str,
+    engine: Engine,
+    origin_url: &str,
+    expression: &str,
+    await_promise: bool,
+    timeout: Duration,
+) -> Result<Value> {
+    let session = PageSession::attach_for_origin(endpoint, engine, origin_url).await?;
+    let result = session
+        .evaluate_with_timeout(expression, await_promise, Some(timeout))
+        .await;
+    session.close().await;
+    result
 }
 
 /// Per-candidate pre-flight probe budget when iterating URL-regex matches.
@@ -368,10 +428,7 @@ async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<St
             Some(s) => s.to_string(),
             None => continue,
         };
-        let url = t
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let url = t.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
         last_target = Some(target_id.clone());
         last_url = url.clone();
         if probe_cdp_target(client, &target_id, PICK_PROBE_TIMEOUT).await {
@@ -467,10 +524,7 @@ async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Resu
             Some(s) => s.to_string(),
             None => continue,
         };
-        let url = c
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let url = c.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
         last_ctx = Some(ctx.clone());
         last_url = url.clone();
         if probe_bidi_context(client, &ctx, PICK_PROBE_TIMEOUT).await {
@@ -588,6 +642,11 @@ async fn create_bidi_tab(client: &BidiClient, url: &str) -> Result<String> {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message;
 
     async fn spawn_cdp_mock(targets: Vec<Value>) -> String {
@@ -614,6 +673,90 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    async fn spawn_cdp_origin_eval_mock(
+        targets: Vec<Value>,
+        fail_first_eval: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let targets = Arc::new(targets);
+        let created_urls = Arc::new(Mutex::new(Vec::new()));
+        let attached_targets = Arc::new(Mutex::new(Vec::new()));
+        let eval_count = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn({
+            let targets = targets.clone();
+            let created_urls = created_urls.clone();
+            let attached_targets = attached_targets.clone();
+            let eval_count = eval_count.clone();
+            async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let targets = targets.clone();
+                    let created_urls = created_urls.clone();
+                    let attached_targets = attached_targets.clone();
+                    let eval_count = eval_count.clone();
+                    tokio::spawn(async move {
+                        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        while let Some(Ok(Message::Text(t))) = ws.next().await {
+                            let req: Value = serde_json::from_str(&t).unwrap();
+                            let id = req["id"].as_u64().unwrap();
+                            let method = req["method"].as_str().unwrap_or("");
+                            if method == "Runtime.evaluate"
+                                && fail_first_eval
+                                && eval_count.fetch_add(1, Ordering::SeqCst) == 0
+                            {
+                                let resp = json!({
+                                    "id": id,
+                                    "error": {
+                                        "code": -32000,
+                                        "message": "No target with given id",
+                                    }
+                                });
+                                ws.send(Message::Text(resp.to_string())).await.unwrap();
+                                continue;
+                            }
+                            let result = match method {
+                                "Target.getTargets" => {
+                                    json!({"targetInfos": targets.as_ref().clone()})
+                                }
+                                "Target.createTarget" => {
+                                    let url = req
+                                        .pointer("/params/url")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    created_urls.lock().await.push(url);
+                                    json!({"targetId": "NEW"})
+                                }
+                                "Target.attachToTarget" => {
+                                    let target_id = req
+                                        .pointer("/params/targetId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let mut attached = attached_targets.lock().await;
+                                    attached.push(target_id);
+                                    json!({"sessionId": format!("S{}", attached.len())})
+                                }
+                                "Target.detachFromTarget" => json!({}),
+                                "Inspector.enable" => json!({}),
+                                "Runtime.evaluate" => json!({"result": {"value": "ok"}}),
+                                _ => json!({}),
+                            };
+                            let resp = json!({"id": id, "result": result});
+                            ws.send(Message::Text(resp.to_string())).await.unwrap();
+                        }
+                    });
+                }
+            }
+        });
+
+        (format!("ws://{addr}"), created_urls, attached_targets)
     }
 
     #[test]
@@ -664,6 +807,56 @@ mod tests {
             PageSession::Cdp(p) => assert_eq!(p.target_id, "NEW"),
             _ => panic!("expected CDP"),
         }
+    }
+
+    #[tokio::test]
+    async fn evaluate_for_origin_creates_origin_tab_when_no_match() {
+        let (url, created_urls, attached_targets) = spawn_cdp_origin_eval_mock(
+            vec![json!({"targetId":"a","type":"page","url":"https://other.test/"})],
+            false,
+        )
+        .await;
+        let value = evaluate_for_origin_with_recover_once(
+            &url,
+            Engine::Cdp,
+            "https://example.com/api",
+            "1+1",
+            true,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!("ok"));
+        assert_eq!(
+            *created_urls.lock().await,
+            vec!["https://example.com/".to_string()]
+        );
+        assert_eq!(*attached_targets.lock().await, vec!["NEW".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn evaluate_for_origin_reattaches_and_retries_once() {
+        let (url, created_urls, attached_targets) = spawn_cdp_origin_eval_mock(
+            vec![json!({"targetId":"A","type":"page","url":"https://example.com/login"})],
+            true,
+        )
+        .await;
+        let value = evaluate_for_origin_with_recover_once(
+            &url,
+            Engine::Cdp,
+            "https://example.com/api",
+            "1+1",
+            true,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!("ok"));
+        assert!(created_urls.lock().await.is_empty());
+        assert_eq!(
+            *attached_targets.lock().await,
+            vec!["A".to_string(), "A".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -951,9 +1144,7 @@ mod tests {
     #[tokio::test]
     async fn pick_cdp_single_healthy_match_is_picked() {
         let url = spawn_cdp_mock_per_target_eval(
-            vec![
-                json!({"targetId":"OK","type":"page","url":"https://example.com/x"}),
-            ],
+            vec![json!({"targetId":"OK","type":"page","url":"https://example.com/x"})],
             vec![],
         )
         .await;

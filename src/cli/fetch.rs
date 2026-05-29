@@ -25,7 +25,7 @@ use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
 use crate::session::backend::open_backend;
-use crate::session::{with_named_tab_recovery, PageSession};
+use crate::session::{evaluate_for_origin_with_recover_once, with_named_tab_recovery, PageSession};
 
 // The default fetch timeout (60 000 ms) is set on the CLI flag in
 // `main.rs`. Bounded so a wedged renderer fails fast instead of dragging
@@ -93,8 +93,8 @@ async fn run_inner(
     .await?;
     trace.browser(&browser_only).engine(resolved.engine);
 
-    // Single Registry handle for the function lifetime: BiDi lock,
-    // named-tab resolution, scratch fallback all share it.
+    // Single Registry handle for the function lifetime: BiDi lock and
+    // named-tab resolution share it.
     let registry = Registry::open()?;
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
 
@@ -138,41 +138,19 @@ async fn run_inner(
         // about:blank) would lose this; we deliberately keep
         // attach_for_origin here instead.
         //
-        // Recover-once: if the first attempt's tab dies between attach
-        // and evaluate (renderer wedged, target closed externally,
-        // engine restart between invocations), drop the dead session
-        // best-effort and re-attach for the same origin once. Mirrors
-        // the contract scratch / named-tab paths already enforce.
-        // Auth-inheritance is preserved because each attempt
-        // independently re-resolves the origin-bound target — we never
-        // fall back to about:blank, which would silently break
-        // credentialed fetches.
+        // Recover-once lives in the shared session helper so CLI fetch and
+        // wait-for-cookie validation cannot drift on the origin-bound contract.
         (None, None) => {
             trace.route("attach-for-origin");
-            let session =
-                PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?;
-            let first = session
-                .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
-                .await;
-            session.close().await;
-            match first {
-                Ok(v) => v,
-                Err(e) if crate::errors::is_recoverable_tab_failure(&e) => {
-                    tracing::warn!(
-                        target = "fetch",
-                        "origin-bound fetch failed with recoverable error; re-attaching and retrying once: {e:#}"
-                    );
-                    let retry =
-                        PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url)
-                            .await?;
-                    let result = retry
-                        .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
-                        .await;
-                    retry.close().await;
-                    result?
-                }
-                Err(e) => return Err(e),
-            }
+            evaluate_for_origin_with_recover_once(
+                &resolved.endpoint,
+                resolved.engine,
+                &url,
+                &expr,
+                true,
+                fetch_timeout,
+            )
+            .await?
         }
         _ => unreachable!("mutex was checked above"),
     };

@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
+use crate::cli::cookies::{normalize_bidi, normalize_cdp, NormalCookie};
 use crate::errors::SessionError;
 
 /// Wall-clock bound for `navigate`/`screenshot`. `evaluate` takes its
@@ -234,6 +235,30 @@ impl TabBackend {
         }
     }
 
+    /// Resolve a target whose document origin matches `url`'s origin,
+    /// reusing a live tab already on that origin if one exists and creating
+    /// one rooted at the origin otherwise. Returns the engine-specific id.
+    ///
+    /// This is the routing primitive for `browser_fetch`: running the
+    /// in-page fetch from a same-origin document is what lets cookies and
+    /// credentials propagate and lets the response bypass CORS. Routing a
+    /// fetch through an `about:blank` scratch tab (this backend's default
+    /// active tab) gives it an opaque origin, which silently breaks
+    /// authenticated and CORS-sensitive requests — see `cli::fetch`'s
+    /// origin-bound path for the same contract.
+    pub async fn resolve_or_create_for_origin(&self, url: &str) -> Result<String> {
+        let want = url::Url::parse(url).map_err(|e| anyhow!("invalid fetch URL `{url}`: {e}"))?;
+        for t in self.live_targets().await? {
+            if let Ok(parsed) = url::Url::parse(&t.url) {
+                if crate::session::attach::same_origin(&parsed, &want) {
+                    return Ok(t.id);
+                }
+            }
+        }
+        let root = crate::session::attach::origin_root_url(&want);
+        self.create_tab(&root).await
+    }
+
     /// Evaluate `expression` in `target_id`'s main world, returning the
     /// raw result value (after `returnByValue`). Bounded by `timeout`;
     /// expiry returns typed [`SessionError::TabHung`].
@@ -327,7 +352,16 @@ impl TabBackend {
     /// detaches. BiDi path calls `browsingContext.captureScreenshot` —
     /// the BiDi protocol always captures the viewport (no `full_page`
     /// equivalent), so `full_page` is honoured only on CDP.
-    pub async fn screenshot(&self, target_id: &str, full_page: bool) -> Result<String> {
+    ///
+    /// When `clip` is `Some({x, y, width, height})` (document coordinates, as
+    /// produced by [`crate::dom::scripts::GET_CLIP_RECT_JS`]) the capture is
+    /// restricted to that rectangle, which takes precedence over `full_page`.
+    pub async fn screenshot(
+        &self,
+        target_id: &str,
+        full_page: bool,
+        clip: Option<Value>,
+    ) -> Result<String> {
         match self {
             TabBackend::Cdp(c) => {
                 let attach = c
@@ -347,16 +381,26 @@ impl TabBackend {
                 let _ = c
                     .send_with_session("Inspector.enable", json!({}), Some(&session_id))
                     .await;
+                // A clip rectangle lives outside the viewport in the general
+                // case (the element was scrolled into view by the caller, but
+                // may still be taller than the viewport), so force
+                // `captureBeyondViewport` whenever clipping.
+                let mut params = json!({
+                    "format": "png",
+                    "captureBeyondViewport": full_page || clip.is_some(),
+                });
+                if let Some(rect) = &clip {
+                    params["clip"] = json!({
+                        "x": rect["x"],
+                        "y": rect["y"],
+                        "width": rect["width"],
+                        "height": rect["height"],
+                        "scale": 1,
+                    });
+                }
                 let inner = async {
-                    c.send_with_session(
-                        "Page.captureScreenshot",
-                        json!({
-                            "format": "png",
-                            "captureBeyondViewport": full_page,
-                        }),
-                        Some(&session_id),
-                    )
-                    .await
+                    c.send_with_session("Page.captureScreenshot", params, Some(&session_id))
+                        .await
                 };
                 // Bound by timeout + renderer-crash detection so a wedged
                 // capture surfaces as recoverable `TabHung`/`TabCrashed`,
@@ -383,7 +427,7 @@ impl TabBackend {
             }
             TabBackend::Bidi(c) => {
                 let _ = full_page; // BiDi captures the viewport by default
-                let fut = c.browsing_context_capture_screenshot(target_id);
+                let fut = c.browsing_context_capture_screenshot(target_id, clip);
                 match tokio::time::timeout(NAV_OP_TIMEOUT, fut).await {
                     Ok(r) => r,
                     Err(_) => Err(SessionError::TabHung {
@@ -394,6 +438,35 @@ impl TabBackend {
                     }
                     .into()),
                 }
+            }
+        }
+    }
+
+    /// Fetch the full cookie jar through this backend's *existing* client,
+    /// normalised across engines. Unlike `cli::cookies::fetch_cookies`,
+    /// this reuses the already-open session instead of opening a fresh
+    /// one — required on Firefox, where BiDi permits only one session per
+    /// browser, so a second `session.new` against a server-held browser
+    /// fails or races. Cookies are browser-wide on both engines (CDP
+    /// `Network.getAllCookies` / BiDi `storage.getCookies`), so no target
+    /// id is needed.
+    pub(crate) async fn cookies(&self) -> Result<Vec<NormalCookie>> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let v = c.send("Network.getAllCookies", json!({})).await?;
+                let arr = v
+                    .get("cookies")
+                    .and_then(|x| x.as_array())
+                    .ok_or_else(|| anyhow!("CDP Network.getAllCookies: missing `cookies` array"))?;
+                Ok(arr.iter().map(normalize_cdp).collect())
+            }
+            TabBackend::Bidi(c) => {
+                let v = c.send("storage.getCookies", json!({})).await?;
+                let arr = v
+                    .get("cookies")
+                    .and_then(|x| x.as_array())
+                    .ok_or_else(|| anyhow!("BiDi storage.getCookies: missing `cookies` array"))?;
+                Ok(arr.iter().map(normalize_bidi).collect())
             }
         }
     }
@@ -462,7 +535,12 @@ mod tests {
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut next_target = 0u32;
             let mut next_session = 0u32;
-            let mut live = std::collections::HashSet::<String>::new();
+            // target id -> last-known url, so getTargets can report a URL
+            // and origin resolution has something to match against.
+            let mut live = std::collections::HashMap::<String, String>::new();
+            // Sessions attach to a target; remember which so navigate can
+            // update the right target's url.
+            let mut sessions = std::collections::HashMap::<String, String>::new();
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
@@ -479,7 +557,12 @@ mod tests {
                                 "Target.createTarget" => {
                                     next_target += 1;
                                     let tid = format!("T{next_target}");
-                                    live.insert(tid.clone());
+                                    let url = req
+                                        .pointer("/params/url")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    live.insert(tid.clone(), url);
                                     json!({"targetId": tid})
                                 }
                                 "Target.closeTarget" => {
@@ -493,15 +576,34 @@ mod tests {
                                 }
                                 "Target.attachToTarget" => {
                                     next_session += 1;
-                                    json!({"sessionId": format!("S{next_session}")})
+                                    let sid = format!("S{next_session}");
+                                    if let Some(tid) = req
+                                        .pointer("/params/targetId")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        sessions.insert(sid.clone(), tid.to_string());
+                                    }
+                                    json!({"sessionId": sid})
                                 }
                                 "Target.detachFromTarget" => json!({}),
-                                "Page.navigate" => json!({}),
+                                "Page.navigate" => {
+                                    // Update the attached target's url so a
+                                    // later getTargets reflects the navigation.
+                                    if let (Some(sid), Some(url)) = (
+                                        req.pointer("/sessionId").and_then(|v| v.as_str()),
+                                        req.pointer("/params/url").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Some(tid) = sessions.get(sid) {
+                                            live.insert(tid.clone(), url.to_string());
+                                        }
+                                    }
+                                    json!({})
+                                }
                                 "Runtime.evaluate" => json!({"result": {"value": 7}}),
                                 "Target.getTargets" => {
                                     let infos: Vec<Value> = live
                                         .iter()
-                                        .map(|tid| json!({"targetId": tid, "type": "page", "url": ""}))
+                                        .map(|(tid, url)| json!({"targetId": tid, "type": "page", "url": url}))
                                         .collect();
                                     json!({"targetInfos": infos})
                                 }
@@ -597,6 +699,46 @@ mod tests {
         backend.close_tab(&t1).await.unwrap();
         let live = backend.live_target_ids().await.unwrap();
         assert!(!live.contains(&t1));
+    }
+
+    #[tokio::test]
+    async fn resolve_for_origin_reuses_same_origin_tab() {
+        let (url, _stop) = spawn_cdp_mock().await;
+        let backend = open_backend(&url, crate::detect::Engine::Cdp)
+            .await
+            .unwrap();
+        // Open a tab and navigate it onto the target origin.
+        let t1 = backend.create_tab("about:blank").await.unwrap();
+        backend
+            .navigate(&t1, "https://example.com/login")
+            .await
+            .unwrap();
+        // A fetch to a different path on the same origin must reuse t1,
+        // not spin up a fresh tab.
+        let resolved = backend
+            .resolve_or_create_for_origin("https://example.com/api/v1")
+            .await
+            .unwrap();
+        assert_eq!(resolved, t1);
+    }
+
+    #[tokio::test]
+    async fn resolve_for_origin_creates_tab_when_no_match() {
+        let (url, _stop) = spawn_cdp_mock().await;
+        let backend = open_backend(&url, crate::detect::Engine::Cdp)
+            .await
+            .unwrap();
+        let t1 = backend.create_tab("about:blank").await.unwrap();
+        backend.navigate(&t1, "https://other.test/").await.unwrap();
+        // No live tab on example.com → a new one is created, rooted at the
+        // origin so the in-page fetch inherits that origin.
+        let resolved = backend
+            .resolve_or_create_for_origin("https://example.com/api")
+            .await
+            .unwrap();
+        assert_ne!(resolved, t1);
+        let live = backend.live_target_ids().await.unwrap();
+        assert!(live.contains(&resolved));
     }
 
     #[tokio::test]

@@ -18,13 +18,12 @@ use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::cli::cookies::{fetch_cookies, NormalCookie};
-use crate::cli::env_resolver::{self, Source};
+use crate::cli::env_resolver;
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
 use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
-use crate::session::backend::open_backend;
-use crate::session::{with_scratch_recovery, PageSession};
+use crate::session::evaluate_for_origin_with_recover_once;
 
 /// Per-fetch timeout when `--validate-url` drives a `fetch()` from the
 /// page context. 30 s catches a wedged renderer; the outer polling loop
@@ -97,7 +96,7 @@ pub async fn run(
         eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
 
         if let Some(url) = validate_url {
-            run_validate_url(&resolved, &registry, &url, &mut trace).await?;
+            run_validate_url(&resolved, &url, &mut trace).await?;
         } else {
             // No validate-url; only the cookie poll ran (browser-wide).
             trace.route("poll");
@@ -110,40 +109,27 @@ pub async fn run(
     trace.finish(result)
 }
 
-/// Drive the `--validate-url` fetch through scratch (with recover-once)
-/// or direct attach for external URL endpoints.
+/// Drive the `--validate-url` fetch from the requested URL's origin, with
+/// recover-once by re-resolving that origin. This intentionally avoids scratch
+/// / `about:blank`, which would drop cookies or trip CORS.
 async fn run_validate_url(
     resolved: &crate::cli::env_resolver::ResolvedBrowser,
-    registry: &Registry,
     url: &str,
     trace: &mut CommandTrace,
 ) -> Result<()> {
     let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
     let expr = format!("({})({})", FETCH_JS, serde_json::to_string(&args).unwrap());
 
-    let value = if matches!(resolved.source, Source::External) {
-        trace.route("direct");
-        let session =
-            PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
-        let res = session
-            .evaluate_with_timeout(&expr, true, Some(VALIDATE_TIMEOUT))
-            .await;
-        session.close().await;
-        res?
-    } else {
-        trace.route("scratch");
-        let browser_name = match &resolved.source {
-            Source::Registered { name } => name.clone(),
-            _ => unreachable!("Source::External branch handled above"),
-        };
-        let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-        let expr = expr.clone();
-        with_scratch_recovery(&backend, registry, &browser_name, move |b, target_id| {
-            let expr = expr.clone();
-            async move { b.evaluate(&target_id, &expr, true, VALIDATE_TIMEOUT).await }
-        })
-        .await?
-    };
+    trace.route("attach-for-origin");
+    let value = evaluate_for_origin_with_recover_once(
+        &resolved.endpoint,
+        resolved.engine,
+        url,
+        &expr,
+        true,
+        VALIDATE_TIMEOUT,
+    )
+    .await?;
 
     let json_str = value.as_str().ok_or_else(|| {
         anyhow::anyhow!("validate-url: page returned non-string from fetch script")
@@ -175,6 +161,13 @@ pub(crate) fn validate_status(status: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::env_resolver::{ResolvedBrowser, Source};
+    use crate::detect::Engine;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
 
     fn cookie(domain: &str, name: &str) -> NormalCookie {
         NormalCookie {
@@ -187,6 +180,72 @@ mod tests {
             same_site: None,
             expires: None,
         }
+    }
+
+    async fn spawn_validate_cdp_mock() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let created_urls = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn({
+            let created_urls = created_urls.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("");
+                    let result = match method {
+                        "Target.getTargets" => json!({
+                            "targetInfos": [{
+                                "targetId": "OTHER",
+                                "type": "page",
+                                "url": "https://other.test/",
+                            }]
+                        }),
+                        "Target.createTarget" => {
+                            let url = req
+                                .pointer("/params/url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            created_urls.lock().await.push(url);
+                            json!({"targetId": "NEW"})
+                        }
+                        "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                        "Target.detachFromTarget" => json!({}),
+                        "Inspector.enable" => json!({}),
+                        "Runtime.evaluate" => {
+                            json!({"result": {"value": json!({"status": 204}).to_string()}})
+                        }
+                        _ => json!({}),
+                    };
+                    let resp = json!({"id": id, "result": result});
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        (format!("ws://{addr}"), created_urls)
+    }
+
+    #[tokio::test]
+    async fn validate_url_registered_browser_uses_origin_tab_not_scratch() {
+        let (endpoint, created_urls) = spawn_validate_cdp_mock().await;
+        let resolved = ResolvedBrowser {
+            endpoint,
+            engine: Engine::Cdp,
+            source: Source::Registered {
+                name: "chrome-test".to_string(),
+            },
+        };
+        let mut trace = CommandTrace::new("wait-for-cookie");
+        run_validate_url(&resolved, "https://example.com/api/check", &mut trace)
+            .await
+            .unwrap();
+        assert_eq!(
+            *created_urls.lock().await,
+            vec!["https://example.com/".to_string()]
+        );
     }
 
     #[test]

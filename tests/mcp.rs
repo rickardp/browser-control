@@ -9,9 +9,10 @@ use browser_control::mcp::server::{run_with_streams, ServerState, ToolRegistry};
 use browser_control::mcp::tools::register_all;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 fn dummy_state() -> ServerState {
@@ -206,11 +207,231 @@ async fn spawn_cdp_mock(behaviour: MockBehaviour) -> (String, oneshot::Sender<()
     (format!("ws://{addr}"), stop_tx)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedEvaluate {
+    target_id: String,
+}
+
+#[derive(Debug, Default)]
+struct RecordingCdpState {
+    created_targets: Vec<(String, String)>,
+    evaluations: Vec<RecordedEvaluate>,
+}
+
+async fn spawn_recording_cdp_mock(
+    initial_targets: Vec<(&str, &str)>,
+) -> (String, oneshot::Sender<()>, Arc<Mutex<RecordingCdpState>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let recorded = Arc::new(Mutex::new(RecordingCdpState::default()));
+    tokio::spawn({
+        let recorded = recorded.clone();
+        let initial_targets: Vec<(String, String)> = initial_targets
+            .into_iter()
+            .map(|(id, url)| (id.to_string(), url.to_string()))
+            .collect();
+        async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut next_target = 0u32;
+            let mut next_session = 0u32;
+            let mut live: HashMap<String, String> = initial_targets.into_iter().collect();
+            let mut sessions: HashMap<String, String> = HashMap::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    msg = ws.next() => {
+                        let msg = match msg {
+                            Some(Ok(m)) => m,
+                            _ => break,
+                        };
+                        if let Message::Text(t) = msg {
+                            let req: Value = serde_json::from_str(&t).unwrap();
+                            let id = req["id"].as_u64().unwrap();
+                            let method = req["method"].as_str().unwrap_or("");
+                            let result = match method {
+                                "Target.getTargets" => {
+                                    let infos: Vec<Value> = live
+                                        .iter()
+                                        .map(|(tid, url)| json!({
+                                            "targetId": tid,
+                                            "type": "page",
+                                            "url": url,
+                                            "title": format!("page-{tid}"),
+                                        }))
+                                        .collect();
+                                    json!({"targetInfos": infos})
+                                }
+                                "Target.createTarget" => {
+                                    next_target += 1;
+                                    let tid = format!("NEW{next_target}");
+                                    let url = req
+                                        .pointer("/params/url")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("about:blank")
+                                        .to_string();
+                                    live.insert(tid.clone(), url.clone());
+                                    recorded
+                                        .lock()
+                                        .await
+                                        .created_targets
+                                        .push((tid.clone(), url));
+                                    json!({"targetId": tid})
+                                }
+                                "Target.attachToTarget" => {
+                                    next_session += 1;
+                                    let sid = format!("S{next_session}");
+                                    let tid = req
+                                        .pointer("/params/targetId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    sessions.insert(sid.clone(), tid);
+                                    json!({"sessionId": sid})
+                                }
+                                "Target.detachFromTarget" => {
+                                    if let Some(sid) = req
+                                        .pointer("/params/sessionId")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        sessions.remove(sid);
+                                    }
+                                    json!({})
+                                }
+                                "Inspector.enable" => json!({}),
+                                "Runtime.evaluate" => {
+                                    let target_id = req
+                                        .get("sessionId")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|sid| sessions.get(sid))
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    recorded
+                                        .lock()
+                                        .await
+                                        .evaluations
+                                        .push(RecordedEvaluate { target_id });
+                                    let payload = json!({
+                                        "ok": true,
+                                        "status": 200,
+                                        "body": "ok"
+                                    })
+                                    .to_string();
+                                    json!({"result": {"value": payload}})
+                                }
+                                _ => json!({}),
+                            };
+                            let resp = json!({"id": id, "result": result});
+                            ws.send(Message::Text(resp.to_string())).await.unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (format!("ws://{addr}"), stop_tx, recorded)
+}
+
+#[derive(Debug, Default)]
+struct RecordingBidiState {
+    session_new_calls: usize,
+    methods: Vec<String>,
+}
+
+async fn spawn_recording_bidi_mock() -> (String, oneshot::Sender<()>, Arc<Mutex<RecordingBidiState>>)
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let recorded = Arc::new(Mutex::new(RecordingBidiState::default()));
+    tokio::spawn({
+        let recorded = recorded.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        let recorded = recorded.clone();
+                        tokio::spawn(async move {
+                            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                                let req: Value = serde_json::from_str(&t).unwrap();
+                                let id = req["id"].as_u64().unwrap();
+                                let method = req["method"].as_str().unwrap_or("").to_string();
+                                {
+                                    let mut rec = recorded.lock().await;
+                                    rec.methods.push(method.clone());
+                                }
+                                if method == "session.new" {
+                                    let mut rec = recorded.lock().await;
+                                    rec.session_new_calls += 1;
+                                    if rec.session_new_calls > 1 {
+                                        let resp = json!({
+                                            "type": "error",
+                                            "id": id,
+                                            "error": "session not created",
+                                            "message": "unexpected second session.new",
+                                        });
+                                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                                        continue;
+                                    }
+                                    let resp = json!({
+                                        "type": "success",
+                                        "id": id,
+                                        "result": {"sessionId": "SESSION1"},
+                                    });
+                                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                                    continue;
+                                }
+                                let result = match method.as_str() {
+                                    "browsingContext.getTree" => json!({
+                                        "contexts": [{
+                                            "context": "CTX1",
+                                            "url": "https://example.com/",
+                                        }]
+                                    }),
+                                    "storage.getCookies" => json!({
+                                        "cookies": [{
+                                            "domain": "example.com",
+                                            "name": "session",
+                                            "value": {"type": "string", "value": "abc"},
+                                            "path": "/",
+                                            "secure": false,
+                                            "httpOnly": true,
+                                            "sameSite": "lax",
+                                            "expiry": 1893456000,
+                                        }]
+                                    }),
+                                    "session.end" => json!({}),
+                                    _ => json!({}),
+                                };
+                                let resp = json!({"type": "success", "id": id, "result": result});
+                                ws.send(Message::Text(resp.to_string())).await.unwrap();
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+    (format!("ws://{addr}"), stop_tx, recorded)
+}
+
 /// Wrap a `ServerState` around the given mock URL.
 fn state_for_mock(url: &str) -> ServerState {
     ServerState::new(ResolvedBrowser {
         endpoint: url.into(),
         engine: Engine::Cdp,
+        source: Source::External,
+    })
+}
+
+fn bidi_state_for_mock(url: &str) -> ServerState {
+    ServerState::new(ResolvedBrowser {
+        endpoint: url.into(),
+        engine: Engine::Bidi,
         source: Source::External,
     })
 }
@@ -421,7 +642,130 @@ async fn browser_navigate_rejects_both_tab_and_target() {
     )
     .await
     .expect_err("must reject");
-    assert!(err.to_string().to_lowercase().contains("mutually exclusive"));
+    assert!(err
+        .to_string()
+        .to_lowercase()
+        .contains("mutually exclusive"));
+}
+
+#[tokio::test]
+async fn browser_fetch_without_route_creates_url_origin_tab_without_setting_active() {
+    let (url, _stop, recorded) = spawn_recording_cdp_mock(vec![]).await;
+    let state = state_for_mock(&url);
+
+    let out = call_tool(
+        state.clone(),
+        "browser_fetch",
+        json!({"url": "https://example.com/api/data"}),
+    )
+    .await
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
+    assert_eq!(parsed["ok"], true);
+
+    let rec = recorded.lock().await;
+    assert_eq!(
+        rec.created_targets,
+        vec![("NEW1".to_string(), "https://example.com/".to_string())]
+    );
+    assert_eq!(
+        rec.evaluations,
+        vec![RecordedEvaluate {
+            target_id: "NEW1".to_string()
+        }]
+    );
+    drop(rec);
+    assert!(state.active_target_id.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn browser_fetch_without_route_reuses_matching_origin_tab_without_setting_active() {
+    let (url, _stop, recorded) =
+        spawn_recording_cdp_mock(vec![("EXISTING", "https://example.com/app")]).await;
+    let state = state_for_mock(&url);
+
+    let out = call_tool(
+        state.clone(),
+        "browser_fetch",
+        json!({"url": "https://example.com/api/data"}),
+    )
+    .await
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
+    assert_eq!(parsed["ok"], true);
+
+    let rec = recorded.lock().await;
+    assert!(
+        rec.created_targets.is_empty(),
+        "same-origin tab should be reused, got {:?}",
+        rec.created_targets
+    );
+    assert_eq!(
+        rec.evaluations,
+        vec![RecordedEvaluate {
+            target_id: "EXISTING".to_string()
+        }]
+    );
+    drop(rec);
+    assert!(state.active_target_id.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn bidi_browser_wide_tools_reuse_server_owned_backend() {
+    let (url, _stop, recorded) = spawn_recording_bidi_mock().await;
+    let state = bidi_state_for_mock(&url);
+
+    state.ensure_backend().await.unwrap();
+    assert_eq!(recorded.lock().await.session_new_calls, 1);
+
+    let targets_out = call_tool(state.clone(), "list_targets", json!({}))
+        .await
+        .unwrap();
+    let targets: Vec<Value> = serde_json::from_str(&text_payload(&targets_out)).unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0]["id"], "CTX1");
+    assert_eq!(targets[0]["kind"], "context");
+
+    let cookies_out = call_tool(state.clone(), "browser_cookies", json!({}))
+        .await
+        .unwrap();
+    let cookies: Vec<Value> = serde_json::from_str(&text_payload(&cookies_out)).unwrap();
+    assert_eq!(cookies.len(), 1);
+    assert_eq!(cookies[0]["name"], "session");
+
+    let waited = call_tool(
+        state.clone(),
+        "browser_wait_for_cookie",
+        json!({
+            "domain": "^example\\.com$",
+            "name": "^session$",
+            "timeout_seconds": 0.05,
+            "poll_interval_seconds": 0.001,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(text_payload(&waited), "session");
+
+    let rec = recorded.lock().await;
+    assert_eq!(
+        rec.session_new_calls, 1,
+        "browser-wide BiDi tools must reuse the established backend"
+    );
+    assert_eq!(
+        rec.methods
+            .iter()
+            .filter(|method| method.as_str() == "browsingContext.getTree")
+            .count(),
+        1
+    );
+    assert_eq!(
+        rec.methods
+            .iter()
+            .filter(|method| method.as_str() == "storage.getCookies")
+            .count(),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -531,9 +875,13 @@ async fn browser_select_switches_to_registered_browser() {
         engine: Engine::Cdp,
         source: Source::External,
     });
-    let out = call_tool(state.clone(), "browser_select", json!({"name": "switch-target"}))
-        .await
-        .unwrap();
+    let out = call_tool(
+        state.clone(),
+        "browser_select",
+        json!({"name": "switch-target"}),
+    )
+    .await
+    .unwrap();
     let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
     assert_eq!(parsed["name"], "switch-target");
     assert_eq!(parsed["endpoint"], mock_url);
@@ -544,4 +892,3 @@ async fn browser_select_switches_to_registered_browser() {
     assert!(state.active_target_id.lock().await.is_none());
     std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
 }
-

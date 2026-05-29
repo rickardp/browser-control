@@ -17,12 +17,12 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cli::cookies::fetch_cookies;
 use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
 use crate::cli::wait_for_cookie::cookie_matches;
-use crate::dom::scripts::{FETCH_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
+use crate::detect::Engine;
+use crate::dom::scripts::{FETCH_JS, GET_CLIP_RECT_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
 use crate::mcp::server::{RegisteredTool, ServerState, ToolHandler, ToolRegistry};
-use crate::session::targets::list as list_targets;
+use crate::session::targets::TargetInfo;
 
 /// Per-op timeout for read tools (`browser_get_html`,
 /// `browser_select_element` short path, storage). 10 s is generous for
@@ -219,8 +219,24 @@ fn make_take_screenshot() -> RegisteredTool {
                     .get("full_page")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let selector = args.get("selector").and_then(|v| v.as_str());
                 let (backend, target_id) = state.resolve_target_for_args(&args).await?;
-                let b64 = backend.screenshot(&target_id, full_page).await?;
+                // A selector clips the capture to that element's bounding box.
+                let clip = match selector {
+                    Some(sel) => {
+                        let sel_literal = serde_json::to_string(sel)?;
+                        let expr = format!("({GET_CLIP_RECT_JS})({sel_literal})");
+                        let rect = backend
+                            .evaluate(&target_id, &expr, false, MCP_OP_TIMEOUT)
+                            .await?;
+                        if rect.is_null() {
+                            return Err(anyhow!("selector matched no visible element: {sel}"));
+                        }
+                        Some(rect)
+                    }
+                    None => None,
+                };
+                let b64 = backend.screenshot(&target_id, full_page, clip).await?;
                 Ok(image_content(b64))
             })
         }),
@@ -261,7 +277,21 @@ fn make_fetch() -> RegisteredTool {
                 let args_json = serde_json::to_string(&for_js)?;
                 let args_literal = serde_json::to_string(&args_json)?;
                 let expr = format!("({FETCH_JS})({args_literal})");
-                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                // Explicit `tab`/`target` routing is honoured verbatim. With
+                // neither, route to a tab on the URL's origin rather than the
+                // server's `about:blank` active tab — an opaque-origin fetch
+                // silently drops cookies/credentials and trips CORS. Mirrors
+                // `cli::fetch`'s origin-bound default path.
+                let has_route = args.get("tab").and_then(|v| v.as_str()).is_some()
+                    || args.get("target").and_then(|v| v.as_str()).is_some();
+                let (backend, target_id) = if has_route {
+                    state.resolve_target_for_args(&args).await?
+                } else {
+                    let backend = state.ensure_backend().await?;
+                    let url = args.get("url").and_then(|v| v.as_str()).unwrap();
+                    let target_id = backend.resolve_or_create_for_origin(url).await?;
+                    (backend, target_id)
+                };
                 let value = backend
                     .evaluate(&target_id, &expr, true, MCP_FETCH_TIMEOUT)
                     .await?;
@@ -327,13 +357,33 @@ fn make_list_targets() -> RegisteredTool {
         }),
         handler: handler(|state, args| {
             Box::pin(async move {
-                let filter = args
+                let filter_re = args
                     .get("filter")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let resolved = state.browser_snapshot().await;
-                let targets =
-                    list_targets(&resolved.endpoint, resolved.engine, filter.as_deref()).await?;
+                    .map(Regex::new)
+                    .transpose()
+                    .map_err(|e| anyhow!("invalid `filter` regex: {e}"))?;
+                // Route through the server-owned backend rather than opening
+                // a fresh BiDi session (which would fail/race on Firefox).
+                // `live_targets` is the same primitive `browser_tab_list`
+                // uses; re-shape it into the legacy CDP-style `TargetInfo`.
+                let backend = state.ensure_backend().await?;
+                let kind = match state.browser_snapshot().await.engine {
+                    Engine::Cdp => "page",
+                    Engine::Bidi => "context",
+                };
+                let targets: Vec<TargetInfo> = backend
+                    .live_targets()
+                    .await?
+                    .into_iter()
+                    .filter(|t| filter_re.as_ref().map_or(true, |re| re.is_match(&t.url)))
+                    .map(|t| TargetInfo {
+                        id: t.id,
+                        url: t.url,
+                        title: t.title,
+                        kind: kind.to_string(),
+                    })
+                    .collect();
                 Ok(text_content(serde_json::to_string_pretty(&targets)?))
             })
         }),
@@ -371,8 +421,11 @@ fn make_cookies() -> RegisteredTool {
                     .map(Regex::new)
                     .transpose()
                     .map_err(|e| anyhow!("invalid `name` regex: {e}"))?;
-                let resolved = state.browser_snapshot().await;
-                let all = fetch_cookies(&resolved).await?;
+                // Route through the server-owned backend (reuses the open
+                // session) instead of `fetch_cookies`, which opens a fresh
+                // BiDi session and would fail/race on Firefox.
+                let backend = state.ensure_backend().await?;
+                let all = backend.cookies().await?;
                 let filtered: Vec<_> = all
                     .into_iter()
                     .filter(|c| {
@@ -527,9 +580,12 @@ fn make_wait_for_cookie() -> RegisteredTool {
                     .max(0.001);
                 let deadline = Instant::now() + Duration::from_secs_f64(timeout_s);
                 let interval = Duration::from_secs_f64(interval_s);
+                // Acquire the server-owned backend once; reuse it each poll
+                // rather than opening a fresh BiDi session per iteration
+                // (which would fail/race on Firefox).
+                let backend = state.ensure_backend().await?;
                 loop {
-                    let resolved = state.browser_snapshot().await;
-                    let cookies = fetch_cookies(&resolved).await?;
+                    let cookies = backend.cookies().await?;
                     if let Some(c) = cookies
                         .into_iter()
                         .find(|c| cookie_matches(c, &domain_re, &name_re))
@@ -596,8 +652,7 @@ async fn tab_list_value(state: &ServerState) -> Result<Value> {
 fn make_tab_new() -> RegisteredTool {
     RegisteredTool {
         name: "browser_tab_new".into(),
-        description: "Create a new tab and make it the active tab. Defaults to about:blank."
-            .into(),
+        description: "Create a new tab and make it the active tab. Defaults to about:blank.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -711,9 +766,7 @@ fn make_tab_close() -> RegisteredTool {
                     (Some(e), _) => e,
                     (None, Some(a)) => a.clone(),
                     (None, None) => {
-                        return Err(anyhow!(
-                            "no `target_id` given and no active tab to close"
-                        ));
+                        return Err(anyhow!("no `target_id` given and no active tab to close"));
                     }
                 };
                 backend.close_tab(&tid).await?;
@@ -738,7 +791,9 @@ fn make_browser_select() -> RegisteredTool {
     RegisteredTool {
         name: "browser_select".into(),
         description: "Switch the active browser by registered name (or any selector accepted by \
-                      the CLI, e.g. `chrome`, `firefox-pikachu`)."
+                      the CLI, e.g. `chrome`, `firefox-pikachu`). The switch is committed before \
+                      Firefox BiDi lock preparation; if preparation fails, the new browser remains \
+                      active and the caller decides whether to retry, switch elsewhere, or switch back."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -755,8 +810,7 @@ fn make_browser_select() -> RegisteredTool {
                     .ok_or_else(|| anyhow!("missing 'name'"))?
                     .to_string();
                 let selector = crate::cli::env_resolver::parse(&name)?;
-                let resolved =
-                    crate::mcp::server::resolve_browser_send(selector).await?;
+                let resolved = crate::mcp::server::resolve_browser_send(selector).await?;
                 let resolved_clone = resolved.clone();
                 state.switch_browser(resolved).await?;
                 let tabs = tab_list_value(&state).await?;
@@ -918,10 +972,7 @@ impl SidecarTool {
 
         // Schema: shared tab/target args plus this tool's params, with the
         // `required` list derived from the same table.
-        let extra: Vec<(&str, Value)> = params
-            .iter()
-            .map(|p| (p.name, p.schema.clone()))
-            .collect();
+        let extra: Vec<(&str, Value)> = params.iter().map(|p| (p.name, p.schema.clone())).collect();
         let required: Vec<&str> = params
             .iter()
             .filter(|p| p.required)
@@ -963,8 +1014,16 @@ fn make_click() -> RegisteredTool {
         description: "Click an element matched by CSS selector. Chromium-only.",
         method: "click",
         params: vec![
-            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: true },
-            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+            SidecarParam {
+                name: "selector",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
+            SidecarParam {
+                name: "timeout_ms",
+                schema: json!({"type": "integer"}),
+                required: false,
+            },
         ],
         success: "clicked",
     }
@@ -979,10 +1038,26 @@ fn make_type() -> RegisteredTool {
                       Chromium-only.",
         method: "type",
         params: vec![
-            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: true },
-            SidecarParam { name: "text", schema: json!({"type": "string"}), required: true },
-            SidecarParam { name: "press_sequentially", schema: json!({"type": "boolean"}), required: false },
-            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+            SidecarParam {
+                name: "selector",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
+            SidecarParam {
+                name: "text",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
+            SidecarParam {
+                name: "press_sequentially",
+                schema: json!({"type": "boolean"}),
+                required: false,
+            },
+            SidecarParam {
+                name: "timeout_ms",
+                schema: json!({"type": "integer"}),
+                required: false,
+            },
         ],
         success: "typed",
     }
@@ -995,8 +1070,16 @@ fn make_hover() -> RegisteredTool {
         description: "Hover an element matched by CSS selector. Chromium-only.",
         method: "hover",
         params: vec![
-            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: true },
-            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+            SidecarParam {
+                name: "selector",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
+            SidecarParam {
+                name: "timeout_ms",
+                schema: json!({"type": "integer"}),
+                required: false,
+            },
         ],
         success: "hovered",
     }
@@ -1009,8 +1092,16 @@ fn make_drag() -> RegisteredTool {
         description: "Drag from one CSS-selected element to another. Chromium-only.",
         method: "drag",
         params: vec![
-            SidecarParam { name: "source_selector", schema: json!({"type": "string"}), required: true },
-            SidecarParam { name: "target_selector", schema: json!({"type": "string"}), required: true },
+            SidecarParam {
+                name: "source_selector",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
+            SidecarParam {
+                name: "target_selector",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
         ],
         success: "dragged",
     }
@@ -1023,9 +1114,11 @@ fn make_press_key() -> RegisteredTool {
         description: "Press a keyboard key (Playwright key name, e.g. 'Enter', 'Control+A'). \
                       Chromium-only.",
         method: "press_key",
-        params: vec![
-            SidecarParam { name: "key", schema: json!({"type": "string"}), required: true },
-        ],
+        params: vec![SidecarParam {
+            name: "key",
+            schema: json!({"type": "string"}),
+            required: true,
+        }],
         success: "pressed",
     }
     .build()
@@ -1053,7 +1146,8 @@ fn make_wait_for() -> RegisteredTool {
 fn make_pdf_save() -> RegisteredTool {
     RegisteredTool {
         name: "browser_pdf_save".into(),
-        description: "Render the active page to PDF (base64 in `pdf_base64`). Chromium-only.".into(),
+        description: "Render the active page to PDF (base64 in `pdf_base64`). Chromium-only."
+            .into(),
         input_schema: json!({
             "type": "object",
             "properties": tab_args_schema(),
@@ -1068,7 +1162,10 @@ fn make_pdf_save() -> RegisteredTool {
                     serde_json::Map::new(),
                 )
                 .await?;
-                let b64 = v.get("pdf_base64").and_then(|s| s.as_str()).unwrap_or_default();
+                let b64 = v
+                    .get("pdf_base64")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
                 Ok(json!({
                     "content": [{
                         "type": "resource",
@@ -1102,6 +1199,9 @@ fn tab_args_with(extra: &[(&str, Value)]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
 
     /// All tools the registry exposes after `register_all`. Mirrors the
     /// registration order in `register_all`.
@@ -1141,6 +1241,79 @@ mod tests {
             .find(|t| t["name"] == name)
             .unwrap_or_else(|| panic!("tool {name} not registered"))["inputSchema"]
             .clone()
+    }
+
+    fn tool_description(name: &str) -> String {
+        let registry = ToolRegistry::new();
+        register_all(&registry);
+        registry
+            .list()
+            .into_iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} not registered"))["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    struct ScreenshotMock {
+        endpoint: String,
+        capture_params: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn spawn_screenshot_mock(selector_rect: Value) -> ScreenshotMock {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture_params = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn({
+            let capture_params = capture_params.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut next_session = 0u32;
+                let mut eval_count = 0u32;
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("");
+                    let result = match method {
+                        "Target.getTargets" => json!({
+                            "targetInfos": [{
+                                "targetId": "T1",
+                                "type": "page",
+                                "url": "https://example.com/",
+                                "title": "Example",
+                            }]
+                        }),
+                        "Target.attachToTarget" => {
+                            next_session += 1;
+                            json!({"sessionId": format!("S{next_session}")})
+                        }
+                        "Target.detachFromTarget" => json!({}),
+                        "Inspector.enable" => json!({}),
+                        "Runtime.evaluate" => {
+                            eval_count += 1;
+                            if eval_count == 1 {
+                                json!({"result": {"value": 1}})
+                            } else {
+                                json!({"result": {"value": selector_rect.clone()}})
+                            }
+                        }
+                        "Page.captureScreenshot" => {
+                            capture_params.lock().await.push(req["params"].clone());
+                            json!({"data": "PNGDATA"})
+                        }
+                        _ => json!({}),
+                    };
+                    let resp = json!({"id": id, "result": result});
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        ScreenshotMock {
+            endpoint: format!("ws://{addr}"),
+            capture_params,
+        }
     }
 
     #[test]
@@ -1289,6 +1462,14 @@ mod tests {
     }
 
     #[test]
+    fn browser_select_description_documents_failed_lock_contract() {
+        let desc = tool_description("browser_select");
+        assert!(desc.contains("committed before"));
+        assert!(desc.contains("new browser remains active"));
+        assert!(desc.contains("switch back"));
+    }
+
+    #[test]
     fn browser_list_has_no_args() {
         let schema = schema_for("browser_list");
         assert_eq!(schema["properties"], json!({}));
@@ -1384,11 +1565,78 @@ mod tests {
         };
         let typed = err.downcast_ref::<SessionError>().expect("typed error");
         match typed {
-            SessionError::EngineUnsupported { tool, .. } => {
+            SessionError::EngineUnsupported { tool, hint, .. } => {
                 assert_eq!(tool, "browser_snapshot");
+                assert!(!hint.contains(concat!("browser_", "evaluate")));
+                assert!(hint.contains("browser_get_html"));
+                assert!(hint.contains("browser_select"));
             }
             other => panic!("expected EngineUnsupported, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn screenshot_selector_sends_cdp_clip() {
+        let mock = spawn_screenshot_mock(json!({
+            "x": 12.5,
+            "y": 34.0,
+            "width": 56.0,
+            "height": 78.0,
+        }))
+        .await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        let h = handler_for("browser_take_screenshot");
+        let out = h(
+            state,
+            json!({
+                "target": "example\\.com",
+                "selector": "#main",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["content"][0]["type"], "image");
+        assert_eq!(out["content"][0]["data"], "PNGDATA");
+
+        let captures = mock.capture_params.lock().await;
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0]["format"], "png");
+        assert_eq!(captures[0]["captureBeyondViewport"], true);
+        assert_eq!(captures[0]["clip"]["x"], json!(12.5));
+        assert_eq!(captures[0]["clip"]["y"], json!(34.0));
+        assert_eq!(captures[0]["clip"]["width"], json!(56.0));
+        assert_eq!(captures[0]["clip"]["height"], json!(78.0));
+        assert_eq!(captures[0]["clip"]["scale"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn screenshot_selector_null_rect_errors_clearly() {
+        let mock = spawn_screenshot_mock(Value::Null).await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        let h = handler_for("browser_take_screenshot");
+        let err = h(
+            state,
+            json!({
+                "target": "example\\.com",
+                "selector": "#missing",
+            }),
+        )
+        .await
+        .expect_err("null selector rect must error");
+        assert!(
+            err.to_string()
+                .contains("selector matched no visible element: #missing"),
+            "got: {err:#}"
+        );
+        assert!(mock.capture_params.lock().await.is_empty());
     }
 
     // -- Behavioral handler arg-validation -----------------------------------
@@ -1430,10 +1678,7 @@ mod tests {
         let err = h(unreached_state(), json!({}))
             .await
             .expect_err("missing url must error");
-        assert!(
-            err.to_string().contains("missing 'url'"),
-            "got: {err:#}"
-        );
+        assert!(err.to_string().contains("missing 'url'"), "got: {err:#}");
     }
 
     #[tokio::test]
@@ -1442,10 +1687,7 @@ mod tests {
         let err = h(unreached_state(), json!({"method": "GET"}))
             .await
             .expect_err("missing url must error");
-        assert!(
-            err.to_string().contains("missing 'url'"),
-            "got: {err:#}"
-        );
+        assert!(err.to_string().contains("missing 'url'"), "got: {err:#}");
     }
 
     #[tokio::test]
@@ -1454,10 +1696,7 @@ mod tests {
         let err = h(unreached_state(), json!({"key": "k"}))
             .await
             .expect_err("missing value must error");
-        assert!(
-            err.to_string().contains("missing 'value'"),
-            "got: {err:#}"
-        );
+        assert!(err.to_string().contains("missing 'value'"), "got: {err:#}");
     }
 
     #[tokio::test]
@@ -1466,10 +1705,7 @@ mod tests {
         let err = h(unreached_state(), json!({}))
             .await
             .expect_err("missing key must error");
-        assert!(
-            err.to_string().contains("missing 'key'"),
-            "got: {err:#}"
-        );
+        assert!(err.to_string().contains("missing 'key'"), "got: {err:#}");
     }
 
     /// `tab` and `target` are mutually exclusive; the reject fires in

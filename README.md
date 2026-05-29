@@ -155,9 +155,10 @@ Browser resolution order:
 2. The persisted default from `browser-control set default <value>`
 3. Otherwise, exit with an error
 
-The server exposes engine-agnostic tools (`browser_navigate`, `browser_evaluate`,
-`browser_storage_get`, `browser_cookies`, …) that work on every supported
-browser including Firefox. Playwright-only interaction tools (`browser_click`,
+The server exposes engine-agnostic tools (`browser_navigate`, `browser_get_html`,
+`browser_fetch`, `browser_take_screenshot`, `browser_storage_get`,
+`browser_cookies`, …) that work on every supported browser including Firefox.
+Playwright-only interaction tools (`browser_click`,
 `browser_type`, `browser_snapshot`, `browser_press_key`, `browser_drag`,
 `browser_hover`, `browser_wait_for`, `browser_pdf_save`) route through an
 internal Node sidecar that wraps `playwright-core`. On the first call to one
@@ -165,6 +166,13 @@ of these tools the sidecar is spawned (prefers `bun`, falls back to `node`+`npm`
 against the active browser's CDP endpoint; on Firefox they return
 `EngineUnsupported`. The `--playwright-version` flag overrides the pinned
 `playwright-core` version for the sidecar.
+
+`browser_select` switches the MCP server's active browser before preparing
+engine-specific state such as the Firefox BiDi lock. If that preparation fails
+(for example, another process holds Firefox's single BiDi session), the server
+keeps the newly selected browser active and reports the failure. The caller can
+then retry the same selection after the lock clears, switch to another browser,
+or switch back explicitly.
 
 ### `set | get | unset <KEY> [VALUE]`
 

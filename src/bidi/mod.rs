@@ -215,12 +215,26 @@ impl BidiClient {
         .await
     }
 
-    pub async fn browsing_context_capture_screenshot(&self, context: &str) -> Result<String> {
+    pub async fn browsing_context_capture_screenshot(
+        &self,
+        context: &str,
+        clip: Option<Value>,
+    ) -> Result<String> {
+        let mut params = json!({ "context": context });
+        if let Some(rect) = clip {
+            // Box clip coordinates are in document space (matching
+            // `GET_CLIP_RECT_JS`), so request the "document" origin.
+            params["origin"] = json!("document");
+            params["clip"] = json!({
+                "type": "box",
+                "x": rect["x"],
+                "y": rect["y"],
+                "width": rect["width"],
+                "height": rect["height"],
+            });
+        }
         let v = self
-            .send(
-                "browsingContext.captureScreenshot",
-                json!({"context": context}),
-            )
+            .send("browsingContext.captureScreenshot", params)
             .await?;
         Ok(v["data"]
             .as_str()

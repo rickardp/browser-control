@@ -322,7 +322,10 @@ bundled with the architectural decision.
   acquires the SQLite BiDi lock lazily on first tool call via
   `ServerState::ensure_bidi_lock`, holds for its lifetime, releases on
   process exit. Closes the cross-process Firefox race for MCP-driven
-  workloads.
+  workloads. `browser_select` intentionally commits the new active
+  browser before attempting eager lock preparation; if the Firefox lock
+  is busy, the tool fails with that state left in place. Callers decide
+  whether to retry the lock, switch elsewhere, or switch back.
 
 - **MCP scratch routing + named-tab integration for tool handlers**.
   **Status:** landed. Every stateful MCP tool (`navigate`, `get_dom`,

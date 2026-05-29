@@ -71,7 +71,10 @@ pub trait Protocol: Send + Sync + 'static {
 /// Outcome of decoding one inbound frame.
 pub enum Decoded<E, Ev> {
     /// A reply correlated to a pending request `id`.
-    Reply { id: u64, result: Result<serde_json::Value, E> },
+    Reply {
+        id: u64,
+        result: Result<serde_json::Value, E>,
+    },
     /// An unsolicited event for the broadcast channel.
     Event(Ev),
     /// Nothing actionable (event/error without an id, unparseable frame, etc.).
@@ -205,8 +208,8 @@ impl<P: Protocol> WsRpc<P> {
         session_id: Option<&str>,
     ) -> std::result::Result<serde_json::Value, RequestError<P::ProtoError>> {
         let id = self.next_id().await;
-        let text = P::encode_request(id, method, params, session_id)
-            .map_err(RequestError::Transport)?;
+        let text =
+            P::encode_request(id, method, params, session_id).map_err(RequestError::Transport)?;
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);

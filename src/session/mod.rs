@@ -13,7 +13,7 @@ pub mod scratch;
 pub mod tabs;
 pub mod targets;
 
-pub use attach::PageSession;
+pub use attach::{evaluate_for_origin_with_recover_once, PageSession};
 pub use backend::{open_backend, TabBackend};
 pub use crash::evaluate_with_crash_detection;
 pub use scratch::with_scratch_recovery;

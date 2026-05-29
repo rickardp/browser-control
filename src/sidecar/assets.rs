@@ -24,9 +24,9 @@ const PACKAGE_JSON: &str = include_str!("../../assets/playwright-sidecar/package
 /// current sidecar assets written into it.
 pub async fn ensure_sidecar_dir(playwright_version: &str) -> Result<PathBuf> {
     let dir = cache_dir(playwright_version)?;
-    tokio::fs::create_dir_all(&dir).await.with_context(|| {
-        format!("creating sidecar cache directory at {dir:?}")
-    })?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating sidecar cache directory at {dir:?}"))?;
 
     // Write the JS verbatim each time so a `cargo install` upgrade picks
     // up changes to the bundled script automatically.

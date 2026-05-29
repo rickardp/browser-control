@@ -54,7 +54,9 @@ pub struct SidecarConfig {
 
 impl SidecarConfig {
     fn resolved_version(&self) -> &str {
-        self.version.as_deref().unwrap_or(DEFAULT_PLAYWRIGHT_VERSION)
+        self.version
+            .as_deref()
+            .unwrap_or(DEFAULT_PLAYWRIGHT_VERSION)
     }
 }
 
