@@ -30,6 +30,7 @@ use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::cli::cookies::{normalize_bidi, normalize_cdp, NormalCookie};
 use crate::errors::SessionError;
+use crate::session::targets::{BidiContext, CdpTarget};
 
 /// Wall-clock bound for `navigate`/`screenshot`. `evaluate` takes its
 /// timeout from the caller (op-specific budgets), but navigate/screenshot
@@ -184,51 +185,24 @@ impl TabBackend {
                     .and_then(|x| x.as_array())
                     .cloned()
                     .unwrap_or_default();
-                Ok(arr
-                    .iter()
-                    .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+                Ok(CdpTarget::pages(&arr)
                     .map(|t| LiveTarget {
-                        id: t
-                            .get("targetId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        url: t
-                            .get("url")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        title: t
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
+                        id: t.id,
+                        url: t.url,
+                        title: t.title,
                     })
                     .collect())
             }
             TabBackend::Bidi(c) => {
                 let v: Value = c.send("browsingContext.getTree", json!({})).await?;
-                let contexts = v
-                    .get("contexts")
-                    .and_then(|x| x.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                Ok(contexts
-                    .iter()
-                    .filter_map(|ctx| {
-                        let id = ctx.get("context").and_then(|v| v.as_str())?.to_string();
-                        let url = ctx
-                            .get("url")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        // BiDi getTree doesn't expose page titles directly
-                        // on the context node; leave blank for now.
-                        Some(LiveTarget {
-                            id,
-                            url,
-                            title: String::new(),
-                        })
+                // BiDi getTree doesn't expose page titles directly on the
+                // context node; leave blank for now.
+                Ok(BidiContext::from_tree(&v)
+                    .into_iter()
+                    .map(|ctx| LiveTarget {
+                        id: ctx.context,
+                        url: ctx.url,
+                        title: String::new(),
                     })
                     .collect())
             }

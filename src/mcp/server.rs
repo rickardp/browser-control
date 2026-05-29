@@ -576,56 +576,22 @@ where
             continue;
         }
 
+        // Dispatch. `initialize` / `ping` / `tools/list` are cheap synchronous
+        // frame builders; `tools/call` spawns its handler so the read loop
+        // stays responsive while a slow op runs. Each arm sends through the
+        // single writer task, preserving serialized stdout writes.
         match method {
             "initialize" => {
-                let _ = tx.send(result_frame(
-                    id,
-                    json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {
-                            "name": "browser-control",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        },
-                    }),
-                ));
+                let _ = tx.send(handle_initialize(id));
             }
             "ping" => {
-                let _ = tx.send(result_frame(id, json!({})));
+                let _ = tx.send(handle_ping(id));
             }
             "tools/list" => {
-                let _ = tx.send(result_frame(id, json!({"tools": tools.list()})));
+                let _ = tx.send(handle_tools_list(id, &tools));
             }
             "tools/call" => {
-                // Spawn the handler so the read loop stays responsive while
-                // a slow tool runs. The frame is sent to the single writer
-                // task on completion, preserving serialized stdout writes.
-                let name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let handler = tools.handler(&name);
-                let state = state.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let frame = match handler {
-                        // An unknown tool name is bad params, not a tool
-                        // failure: keep it a genuine `-32602` protocol error.
-                        None => error_frame(id, -32602, &format!("tool not found: {name}")),
-                        Some(h) => match h(state, args).await {
-                            Ok(v) => result_frame(id, v),
-                            // A tool *executing* and failing is not a protocol
-                            // fault: per the MCP spec it is a successful result
-                            // carrying `isError: true` so the agent can read
-                            // the message and recover, rather than treating it
-                            // as a transport error.
-                            Err(e) => tool_error_frame(id, &e),
-                        },
-                    };
-                    let _ = tx.send(frame);
-                });
+                handle_tools_call(id, &params, &state, &tools, &tx);
             }
             _ => {
                 let _ = tx.send(error_frame(
@@ -641,6 +607,71 @@ where
     drop(tx);
     let _ = writer.await;
     Ok(())
+}
+
+/// Build the `initialize` response frame: advertise the protocol version,
+/// the (tools-only) capability set, and server identity.
+fn handle_initialize(id: Value) -> Vec<u8> {
+    result_frame(
+        id,
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {
+                "name": "browser-control",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+        }),
+    )
+}
+
+/// Build the `ping` response frame (an empty result object).
+fn handle_ping(id: Value) -> Vec<u8> {
+    result_frame(id, json!({}))
+}
+
+/// Build the `tools/list` response frame from the registry.
+fn handle_tools_list(id: Value, tools: &ToolRegistry) -> Vec<u8> {
+    result_frame(id, json!({"tools": tools.list()}))
+}
+
+/// Dispatch a `tools/call` request. The handler is spawned on its own task
+/// so the read loop stays responsive while a slow op (30s BiDi lock,
+/// sidecar `npm install`, 30s CDP timeout) runs; the completed frame is
+/// sent to the single writer task, preserving serialized stdout writes.
+fn handle_tools_call(
+    id: Value,
+    params: &Value,
+    state: &ServerState,
+    tools: &ToolRegistry,
+    tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let handler = tools.handler(&name);
+    let state = state.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let frame = match handler {
+            // An unknown tool name is bad params, not a tool
+            // failure: keep it a genuine `-32602` protocol error.
+            None => error_frame(id, -32602, &format!("tool not found: {name}")),
+            Some(h) => match h(state, args).await {
+                Ok(v) => result_frame(id, v),
+                // A tool *executing* and failing is not a protocol
+                // fault: per the MCP spec it is a successful result
+                // carrying `isError: true` so the agent can read
+                // the message and recover, rather than treating it
+                // as a transport error.
+                Err(e) => tool_error_frame(id, &e),
+            },
+        };
+        let _ = tx.send(frame);
+    });
 }
 
 /// Serialize a JSON-RPC success response to a newline-terminated frame.

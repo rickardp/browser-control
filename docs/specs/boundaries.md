@@ -1,45 +1,82 @@
-> **Note:** This document describes the legacy TypeScript implementation. The
-> current Rust CLI is described in the project README and ADR-001. See
-> `docs/adrs/archive/` for the original ADRs.
-
 # Agent Boundaries
 
-Rules and constraints for AI agents working in this codebase.
+Rules and constraints for AI agents working in this codebase. This describes
+the current Rust CLI. The original TypeScript implementation is preserved on
+the `legacy-ts` branch (tag `v0-final-ts`); its boundaries are archived in
+`docs/adrs/archive/`. The authoritative design records are ADR-001 (Rust CLI
+rewrite) and ADR-002 (daemonless direct path).
 
 ## Code Style
 
-- TypeScript with ESM modules (`import`/`export`, not `require`)
-- No bundler — code must compile with `tsc` alone
-- Flat file structure in project root (no `src/` directory)
-- Compiled output goes to `dist/`
+- Rust 2021, builds with stable `cargo` (MSRV 1.80).
+- Source lives under `src/`, organised by subsystem (`cli`, `mcp`, `session`,
+  `registry`, `cdp`, `bidi`, `detect`, `launch`, `sidecar`, …).
+- Run `cargo fmt` and keep `cargo clippy --all-targets -- -D warnings` clean.
+- Errors use `anyhow::Result` at the edges; cross-layer failures the CLI/MCP/
+  tests must match on are typed in `src/errors.rs` (`SessionError`,
+  `BidiLockBusy`, …) — pattern-match these, don't parse strings.
 
 ## Architecture Constraints
 
-- **The coordinator is a controller + CDP proxy, not an MCP proxy.** It manages browser lifecycle and provides a stable CDP port. It does not proxy MCP tool calls or merge tool lists.
-- **Two independent MCP entries.** The coordinator and child MCP are configured as separate MCP servers in `.mcp.json`. The `wrap` subcommand bridges them via the state file.
-- **Zero config by default.** User settings are optional, never required. The server must work with `npx @anthropic-community/browser-coordinator-mcp` and no flags.
-- **Lazy browser launch.** Browsers must not spawn at server startup. They launch either when a CDP connection arrives at the proxy (lazy) or when `coordinator_launch_browser` is called (explicit).
-- **Stable CDP proxy port.** The proxy port stays the same when the browser switches (Chrome → Edge) or restarts. Child MCPs never need restarting due to port changes.
-- **Coordinator tools only.** The coordinator exposes only `coordinator_*` tools. Child MCP tools are managed by the child MCP independently.
+- **Daemonless (ADR-002).** There is no long-lived process. Every CLI
+  invocation opens a fresh upstream CDP/BiDi connection, does its work, and
+  exits. The MCP server is the only long-lived process and only while a host
+  has it open.
+- **No idle work.** Between invocations nothing runs — no held upstream
+  WebSocket, no sweep timers, no background process that could keep the
+  browser from tab-discard / sleep. Do not add heartbeats, polling loops, or
+  timers that fire while the user is idle.
+- **Always proceed.** Agent-facing tab/session ops must not surface
+  `TabHung` / `TabCrashed` / `Closed` to the caller. Detect, recreate, retry
+  once, and only then escalate with a typed error. The recover-once wrappers
+  live in `src/session/{scratch,tabs}.rs`.
+- **Bounded ops.** Every upstream call has a ceiling: 5 s connect-side
+  timeouts and per-op `evaluate_with_timeout` defaults (`eval` 10 s, `fetch`
+  60 s, `storage` 10 s). No codepath may block indefinitely on a wedged
+  renderer or dead endpoint.
+- **SQLite registry is the only shared state (ADR-001).** Browsers, named
+  tabs, scratch rows, and the BiDi lock live in a SQLite DB under the OS
+  app-data dir. Inter-process coordination is SQLite's WAL + `busy_timeout`,
+  not an in-memory owner. Keep registry SQL access inside `src/registry/`.
+- **Engine-agnostic by dispatch.** CDP (Chromium) and BiDi (Firefox) share
+  one CLI surface, one `tabs` schema, and one agent contract. Engine-specific
+  protocol lives behind `TabBackend` (`src/session/backend.rs`); the stored
+  `target_id` column is engine-opaque (CDP `targetId` or BiDi `context`).
+- **Firefox single-session lock.** Firefox allows one WebDriver-BiDi session
+  per browser. Any command that opens a BiDi session must acquire the SQLite
+  `bidi_lock` row first (`acquire_bidi_lock_if_needed`); the MCP server holds
+  it for its lifetime. HTTP-only probes (`wait`) skip the lock.
 
 ## Browser Support
 
-- **Supported:** Chrome, Edge, Chromium, Brave (all Chromium-based, CDP-compatible)
-- **Aspirational:** Firefox (lacks CDP — not currently targetable)
-- **Not supported:** Safari/WebKit
+- **Supported (CDP):** Chrome, Edge, Chromium, Brave.
+- **Supported (BiDi):** Firefox.
+- **Not supported:** Safari/WebKit.
 
-## VS Code Integration
+## MCP Integration
 
-- **Tier 1 (External Browser):** Always available, zero config. Must not require the companion extension.
-- **Tier 2 (Native CDP):** Requires companion extension. Must degrade gracefully to Tier 1 if extension is not installed.
-- **`--no-vscode` flag:** Must completely disable VS Code detection when set.
+- `browser-control mcp` is a stdio MCP server that targets a browser resolved
+  via `--browser` / `$BROWSER_CONTROL` / persisted default.
+- Engine-agnostic tools (`browser_navigate`, `browser_get_html`,
+  `browser_fetch`, `browser_take_screenshot`, `browser_storage_*`,
+  `browser_cookies`, …) work on every supported browser including Firefox.
+- Playwright-only interaction tools route through a lazily-spawned Node
+  sidecar wrapping `playwright-core`; on Firefox they return
+  `EngineUnsupported`.
+- Stateful tools route through `ServerState::ensure_active_tab` (a
+  server-owned named tab), never a blind "first page" attach.
 
 ## What Not to Do
 
-- Do not add a `src/` directory — keep the flat file structure
-- Do not add a bundler (webpack, esbuild, rollup) — `tsc` is sufficient
-- Do not proxy MCP tool calls — the coordinator only exposes its own tools
-- Do not send `tools/list_changed` notifications — hosts don't reliably support it
-- Do not eagerly connect to CDP — let the child MCP handle its own CDP connection timing
-- Do not add configuration files (YAML, TOML, JSON config) — use CLI flags and env vars only
-- Do not add database or persistence beyond the state file — this is a stateless process
+- Do not reintroduce a daemon or any process/timer that runs while idle.
+- Do not surface raw `TabHung` / `TabCrashed` / `Closed` to agents — recover
+  once first (see `src/session`).
+- Do not add an unbounded upstream call — every op needs a connect timeout
+  and a per-op ceiling.
+- Do not scatter SQLite access outside `src/registry/`, and do not change a
+  registry `pub` signature without checking its CLI/MCP/session/test callers.
+- Do not let a BiDi command open a session without acquiring the BiDi lock.
+- Do not duplicate the `<browser>/<tab>` vs `--target` routing — the CLI
+  resolver lives in `src/cli/route.rs`; reuse it.
+- The CLI surface and the `BROWSER_CONTROL` env var are the intended stable
+  contracts; treat changes to them as breaking.

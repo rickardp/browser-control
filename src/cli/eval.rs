@@ -15,21 +15,21 @@
 //!    a user tab matching the URL regex. The original behaviour, kept
 //!    for ad-hoc targeted use.
 //!
-//! All three paths share the BiDi single-session lock when the resolved
-//! browser is on the BiDi engine.
+//! The shared preamble and the named-tab arm live in [`crate::cli::route`];
+//! see that module for the routing-path overview. The bare-browser arm here is
+//! scratch-with-recover-once (the iLO fix), and the External-endpoint fallback
+//! is the legacy direct attach.
 
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::Value;
 
-use crate::cli::env_resolver::{self, Source};
-use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
-use crate::cli::routing::strip_tab;
+use crate::cli::env_resolver::Source;
+use crate::cli::route;
 use crate::cli::trace::CommandTrace;
-use crate::registry::Registry;
 use crate::session::backend::open_backend;
-use crate::session::{with_named_tab_recovery, with_scratch_recovery, PageSession};
+use crate::session::{with_scratch_recovery, PageSession};
 
 pub async fn run(
     browser: Option<String>,
@@ -62,56 +62,22 @@ async fn run_inner(
     timeout_ms: u64,
     trace: &mut CommandTrace,
 ) -> Result<()> {
-    let raw = browser.unwrap_or_default();
-    let parsed = if raw.is_empty() {
-        None
-    } else {
-        Some(env_resolver::parse_target(&raw)?)
-    };
-    let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
-    if tab_name.is_some() && target.is_some() {
-        bail!("specify the tab via either `<browser>/<name>` or `--target <regex>`, not both");
-    }
-    let browser_only = parsed
-        .as_ref()
-        .map(|p| strip_tab(&raw, p.tab.as_deref()))
-        .unwrap_or_default();
-    let resolved = resolve_browser(if browser_only.is_empty() {
-        None
-    } else {
-        Some(browser_only.clone())
-    })
-    .await?;
-    trace.browser(&browser_only).engine(resolved.engine);
     let timeout = Duration::from_millis(timeout_ms);
 
-    // Open the registry once for the function lifetime — used for the
-    // BiDi single-session lock, scratch row, and named-tab resolution.
-    // Re-opening would block on the per-process file lock.
-    let registry = Registry::open()?;
-    // Acquire the Firefox BiDi lock if applicable. RAII releases on
-    // function exit; held across whatever path we take below.
-    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+    let r = route::preamble(browser, target.as_deref(), trace).await?;
+    let resolved = &r.resolved;
 
-    let value = match (tab_name, target) {
+    let value = match (r.tab_name.clone(), target) {
         // Path 1: <browser>/<tab> — named tab, engine-agnostic, with
         // recover-once around a tab that dies between resolve and op.
         (Some(name), None) => {
             trace.route("named-tab").tab_name(&name);
-            let browser_name = match &resolved.source {
-                Source::Registered { name } => name.clone(),
-                _ => bail!(
-                    "named tabs (`<browser>/<name>`) require a registered browser; \
-                     external endpoints can't carry tab names"
-                ),
-            };
-            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
             let expr = expression.clone();
-            with_named_tab_recovery(
-                &backend,
-                &registry,
-                &browser_name,
+            route::run_named_tab(
+                &r,
                 &name,
+                "named tabs (`<browser>/<name>`) require a registered browser; \
+                 external endpoints can't carry tab names",
                 move |b, target_id| {
                     let expr = expr.clone();
                     async move { b.evaluate(&target_id, &expr, await_promise, timeout).await }
@@ -142,7 +108,7 @@ async fn run_inner(
                 };
                 let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
                 let expr = expression.clone();
-                with_scratch_recovery(&backend, &registry, &browser_name, move |b, target_id| {
+                with_scratch_recovery(&backend, &r.registry, &browser_name, move |b, target_id| {
                     let expr = expr.clone();
                     async move { b.evaluate(&target_id, &expr, await_promise, timeout).await }
                 })

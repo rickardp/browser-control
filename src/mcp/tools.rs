@@ -121,9 +121,11 @@ fn tab_args_schema() -> Value {
     })
 }
 
-/// Merge `tab_args_schema()` into `extra` (typically a tool-specific
-/// `properties` object), returning the combined `properties` map.
-fn merge_with_tab_args(extra: Value) -> Value {
+/// Canonical builder for a per-tab tool's `properties` object: the shared
+/// `tab` / `target` schema merged with tool-specific `extra` fields. The
+/// merge result is order-independent — `serde_json::Map` serializes keys
+/// sorted — so callers may pass `extra` in any shape.
+fn tab_args_properties(extra: Value) -> Value {
     let mut obj = extra.as_object().cloned().unwrap_or_default();
     if let Some(ta) = tab_args_schema().as_object() {
         for (k, v) in ta {
@@ -131,6 +133,19 @@ fn merge_with_tab_args(extra: Value) -> Value {
         }
     }
     Value::Object(obj)
+}
+
+/// Canonical extraction of the optional `tab` (named) / `target` (URL
+/// regex) routing args from a tool's `args`. Mirrors the parse in
+/// [`ServerState::resolve_target_for_args`]; used by tools that need to
+/// branch on whether explicit routing was given before resolving.
+fn extract_tab_target(args: &Value) -> (Option<String>, Option<String>) {
+    let tab = args.get("tab").and_then(|v| v.as_str()).map(String::from);
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    (tab, target)
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +158,7 @@ fn make_navigate() -> RegisteredTool {
         description: "Navigate the active page to a URL.".into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({ "url": { "type": "string" } })),
+            "properties": tab_args_properties(json!({ "url": { "type": "string" } })),
             "required": ["url"],
         }),
         handler: handler(|state, args| {
@@ -172,7 +187,7 @@ fn make_get_html() -> RegisteredTool {
             .into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({
+            "properties": tab_args_properties(json!({
                 "selector": {
                     "type": "string",
                     "description": "Optional CSS selector; defaults to the document element."
@@ -208,7 +223,7 @@ fn make_take_screenshot() -> RegisteredTool {
         description: "Capture a PNG screenshot of the active page.".into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({
+            "properties": tab_args_properties(json!({
                 "full_page": { "type": "boolean", "default": false },
                 "selector": { "type": "string" }
             })),
@@ -255,7 +270,7 @@ fn make_fetch() -> RegisteredTool {
                 .into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({
+            "properties": tab_args_properties(json!({
                 "url": { "type": "string" },
                 "method": { "type": "string" },
                 "headers": { "type": "object" },
@@ -282,8 +297,8 @@ fn make_fetch() -> RegisteredTool {
                 // server's `about:blank` active tab — an opaque-origin fetch
                 // silently drops cookies/credentials and trips CORS. Mirrors
                 // `cli::fetch`'s origin-bound default path.
-                let has_route = args.get("tab").and_then(|v| v.as_str()).is_some()
-                    || args.get("target").and_then(|v| v.as_str()).is_some();
+                let (tab, target) = extract_tab_target(&args);
+                let has_route = tab.is_some() || target.is_some();
                 let (backend, target_id) = if has_route {
                     state.resolve_target_for_args(&args).await?
                 } else {
@@ -317,7 +332,7 @@ fn make_select_element() -> RegisteredTool {
                 .into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({})),
+            "properties": tab_args_properties(json!({})),
         }),
         handler: handler(|state, args| {
             Box::pin(async move {
@@ -449,7 +464,7 @@ fn make_storage_get() -> RegisteredTool {
         description: "Read a value from localStorage or sessionStorage on the active page.".into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({
+            "properties": tab_args_properties(json!({
                 "key": { "type": "string" },
                 "namespace": {
                     "type": "string",
@@ -496,7 +511,7 @@ fn make_storage_set() -> RegisteredTool {
         description: "Write a value to localStorage or sessionStorage on the active page.".into(),
         input_schema: json!({
             "type": "object",
-            "properties": merge_with_tab_args(json!({
+            "properties": tab_args_properties(json!({
                 "key": { "type": "string" },
                 "value": { "type": "string" },
                 "namespace": {
@@ -930,7 +945,7 @@ fn make_snapshot() -> RegisteredTool {
 // click / type / hover / drag / press_key / wait_for all share one shape:
 // build a param map from a fixed set of args, forward to the sidecar, return a
 // fixed success string. Previously each tool declared its params *twice* — once
-// in the input schema (`tab_args_with`) and once in the handler (`copy_arg` per
+// in the input schema (`tab_args_properties`) and once in the handler (`copy_arg` per
 // param) — with no compiler link, so a schema param missing a matching
 // `copy_arg` was silently dropped before reaching the sidecar.
 //
@@ -972,7 +987,12 @@ impl SidecarTool {
 
         // Schema: shared tab/target args plus this tool's params, with the
         // `required` list derived from the same table.
-        let extra: Vec<(&str, Value)> = params.iter().map(|p| (p.name, p.schema.clone())).collect();
+        let extra = Value::Object(
+            params
+                .iter()
+                .map(|p| (p.name.to_string(), p.schema.clone()))
+                .collect(),
+        );
         let required: Vec<&str> = params
             .iter()
             .filter(|p| p.required)
@@ -980,7 +1000,7 @@ impl SidecarTool {
             .collect();
         let mut input_schema = json!({
             "type": "object",
-            "properties": tab_args_with(&extra),
+            "properties": tab_args_properties(extra),
         });
         if !required.is_empty() {
             input_schema["required"] = json!(required);
@@ -1182,18 +1202,6 @@ fn copy_arg(args: &Value, key: &str, dst: &mut serde_json::Map<String, Value>) {
     if let Some(v) = args.get(key) {
         dst.insert(key.into(), v.clone());
     }
-}
-
-/// Helper: build a `properties` object that combines the shared
-/// `tab` / `target` schema with tool-specific extra fields.
-fn tab_args_with(extra: &[(&str, Value)]) -> Value {
-    let mut base = tab_args_schema();
-    if let Some(obj) = base.as_object_mut() {
-        for (k, v) in extra {
-            obj.insert((*k).into(), v.clone());
-        }
-    }
-    base
 }
 
 #[cfg(test)]

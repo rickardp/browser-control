@@ -23,11 +23,28 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use thiserror::Error;
 
-use crate::registry::{now_epoch_s, pid_alive, Registry};
+use crate::registry::{db, now_epoch_s, pid_alive, Registry};
 
 /// Default poll interval while waiting on a contended lock. Short enough
 /// to feel responsive on release, long enough to avoid burning CPU.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// CAS-style release statement shared by the `Drop` path and the
+/// stale-row eviction path: delete the row only if it is still *ours*
+/// (`browser_name` + `holder_pid`), so a double-release or a release after
+/// another holder reacquired is harmless.
+const RELEASE_SQL: &str = "DELETE FROM bidi_locks WHERE browser_name = ?1 AND holder_pid = ?2";
+
+/// Issue the CAS release `DELETE` against `conn`. Errors are intentionally
+/// swallowed by callers (release is best-effort); centralising the SQL +
+/// params keeps the `Drop` path and eviction path from drifting apart.
+fn release(
+    conn: &rusqlite::Connection,
+    browser_name: &str,
+    holder_pid: u32,
+) -> rusqlite::Result<usize> {
+    conn.execute(RELEASE_SQL, rusqlite::params![browser_name, holder_pid])
+}
 
 /// Returned by [`Registry::bidi_lock_acquire`] when `timeout` elapses
 /// before the lock can be taken. Carries the holder PID for diagnostics
@@ -72,10 +89,7 @@ impl Drop for BidiLockGuard {
         // busy_timeout) covers serialisation against other writers.
         if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
             let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            let _ = conn.execute(
-                "DELETE FROM bidi_locks WHERE browser_name = ?1 AND holder_pid = ?2",
-                rusqlite::params![self.browser_name, self.holder_pid],
-            );
+            let _ = release(&conn, &self.browser_name, self.holder_pid);
         }
     }
 }
@@ -123,11 +137,7 @@ impl Registry {
                         if !pid_alive(existing.holder_pid) {
                             // Stale row — evict by CAS so we don't race
                             // with the actual holder if they came back.
-                            let _ = self.conn.execute(
-                                "DELETE FROM bidi_locks \
-                                 WHERE browser_name = ?1 AND holder_pid = ?2",
-                                rusqlite::params![browser_name, existing.holder_pid],
-                            );
+                            let _ = release(&self.conn, browser_name, existing.holder_pid);
                             continue;
                         }
                         // Still alive. If we've hit the timeout, escalate
@@ -159,20 +169,19 @@ impl Registry {
     /// Read the current lock holder for diagnostics / tests. Returns
     /// `None` if no row exists.
     pub fn bidi_lock_holder(&self, browser_name: &str) -> Result<Option<BidiLockRow>> {
-        let mut stmt = self.conn.prepare(
+        db::query_optional(
+            &self.conn,
             "SELECT browser_name, holder_pid, acquired_at_epoch_s \
              FROM bidi_locks WHERE browser_name = ?1",
-        )?;
-        let mut rows = stmt.query([browser_name])?;
-        if let Some(r) = rows.next()? {
-            Ok(Some(BidiLockRow {
-                browser_name: r.get(0)?,
-                holder_pid: r.get::<_, i64>(1)? as u32,
-                acquired_at_epoch_s: r.get(2)?,
-            }))
-        } else {
-            Ok(None)
-        }
+            [browser_name],
+            |r| {
+                Ok(BidiLockRow {
+                    browser_name: r.get(0)?,
+                    holder_pid: r.get::<_, i64>(1)? as u32,
+                    acquired_at_epoch_s: r.get(2)?,
+                })
+            },
+        )
     }
 }
 

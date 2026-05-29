@@ -17,9 +17,9 @@
 //! against the same target. JS execution in one renderer is single-threaded
 //! anyway, so concurrent evals serialize naturally — no locking needed.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::registry::{now_epoch_s, Registry};
+use crate::registry::{db, now_epoch_s, Registry};
 
 /// In-memory view of a `scratches` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,37 +32,35 @@ pub struct ScratchRow {
 impl Registry {
     /// Read the scratch row for `browser_name`. Returns `None` if no row.
     pub fn scratch_get(&self, browser_name: &str) -> Result<Option<ScratchRow>> {
-        let mut stmt = self.conn.prepare(
+        db::query_optional(
+            &self.conn,
             "SELECT browser_name, target_id, last_used_at_epoch_s \
              FROM scratches WHERE browser_name = ?1",
-        )?;
-        let mut rows = stmt.query([browser_name])?;
-        if let Some(r) = rows.next()? {
-            Ok(Some(ScratchRow {
-                browser_name: r.get(0)?,
-                target_id: r.get(1)?,
-                last_used_at_epoch_s: r.get(2)?,
-            }))
-        } else {
-            Ok(None)
-        }
+            [browser_name],
+            |r| {
+                Ok(ScratchRow {
+                    browser_name: r.get(0)?,
+                    target_id: r.get(1)?,
+                    last_used_at_epoch_s: r.get(2)?,
+                })
+            },
+        )
     }
 
     /// Insert or replace the scratch row for `browser_name`. Used both when
     /// creating the first scratch and when recovering a wedged one.
     pub fn scratch_upsert(&self, browser_name: &str, target_id: &str) -> Result<()> {
         let now = now_epoch_s();
-        self.conn
-            .execute(
-                "INSERT INTO scratches (browser_name, target_id, last_used_at_epoch_s) \
+        db::execute(
+            &self.conn,
+            "INSERT INTO scratches (browser_name, target_id, last_used_at_epoch_s) \
                  VALUES (?1, ?2, ?3) \
                  ON CONFLICT(browser_name) DO UPDATE SET \
                     target_id = excluded.target_id, \
                     last_used_at_epoch_s = excluded.last_used_at_epoch_s",
-                rusqlite::params![browser_name, target_id, now],
-            )
-            .with_context(|| format!("upsert scratch for {browser_name}"))?;
-        Ok(())
+            rusqlite::params![browser_name, target_id, now],
+            || format!("upsert scratch for {browser_name}"),
+        )
     }
 
     /// Bump `last_used_at` for the scratch row (no-op if absent). Called
@@ -70,21 +68,21 @@ impl Registry {
     /// diagnostics.
     pub fn scratch_touch(&self, browser_name: &str) -> Result<()> {
         let now = now_epoch_s();
-        self.conn.execute(
+        db::execute_bare(
+            &self.conn,
             "UPDATE scratches SET last_used_at_epoch_s = ?1 WHERE browser_name = ?2",
             rusqlite::params![now, browser_name],
-        )?;
-        Ok(())
+        )
     }
 
     /// Remove the scratch row (used by recovery to mark the prior target
     /// dead before re-creating). Idempotent.
     pub fn scratch_delete(&self, browser_name: &str) -> Result<()> {
-        self.conn.execute(
+        db::execute_bare(
+            &self.conn,
             "DELETE FROM scratches WHERE browser_name = ?1",
             [browser_name],
-        )?;
-        Ok(())
+        )
     }
 }
 

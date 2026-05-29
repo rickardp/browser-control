@@ -16,7 +16,7 @@ use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::detect::Engine;
 use crate::errors::SessionError;
-use crate::session::targets::{open_bidi, open_cdp};
+use crate::session::targets::{open_bidi, open_cdp, BidiContext, CdpTarget};
 
 /// A bound page-level session. Variants are not constructed directly outside
 /// this module; use [`PageSession::attach`].
@@ -387,10 +387,7 @@ const PICK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<String> {
     let targets = client.list_targets().await?;
-    let pages: Vec<&Value> = targets
-        .iter()
-        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-        .collect();
+    let pages: Vec<CdpTarget> = CdpTarget::pages(&targets).collect();
 
     // No regex: keep existing behaviour — take the first page. We do not
     // probe in this branch because there's typically only one candidate and
@@ -399,20 +396,13 @@ async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<St
     // handle it.
     let Some(re) = pattern else {
         return pages
-            .first()
-            .and_then(|t| t.get("targetId").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
+            .into_iter()
+            .next()
+            .map(|t| t.id)
             .ok_or_else(|| anyhow!("no page target found"));
     };
 
-    let matches: Vec<&Value> = pages
-        .into_iter()
-        .filter(|t| {
-            t.get("url")
-                .and_then(|v| v.as_str())
-                .is_some_and(|u| re.is_match(u))
-        })
-        .collect();
+    let matches: Vec<CdpTarget> = pages.into_iter().filter(|t| re.is_match(&t.url)).collect();
     if matches.is_empty() {
         return Err(anyhow!("no CDP page target matched URL regex"));
     }
@@ -424,13 +414,9 @@ async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<St
     let mut last_target: Option<String> = None;
     let mut last_url: Option<String> = None;
     for t in &matches {
-        let target_id = match t.get("targetId").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let url = t.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let target_id = t.id.clone();
         last_target = Some(target_id.clone());
-        last_url = url.clone();
+        last_url = Some(t.url.clone());
         if probe_cdp_target(client, &target_id, PICK_PROBE_TIMEOUT).await {
             return Ok(target_id);
         }
@@ -490,27 +476,20 @@ async fn probe_cdp_target(client: &CdpClient, target_id: &str, budget: Duration)
 
 async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Result<String> {
     let tree = client.send("browsingContext.getTree", json!({})).await?;
-    let contexts = tree
-        .get("contexts")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("no contexts in browsingContext.getTree"))?;
+    let contexts = BidiContext::from_tree(&tree);
 
     // No regex: existing "first top-level context" behaviour.
     let Some(re) = pattern else {
         return contexts
-            .first()
-            .and_then(|c| c.get("context").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
+            .into_iter()
+            .next()
+            .map(|c| c.context)
             .ok_or_else(|| anyhow!("no top-level browsing context"));
     };
 
-    let matches: Vec<&Value> = contexts
-        .iter()
-        .filter(|c| {
-            c.get("url")
-                .and_then(|v| v.as_str())
-                .is_some_and(|u| re.is_match(u))
-        })
+    let matches: Vec<BidiContext> = contexts
+        .into_iter()
+        .filter(|c| re.is_match(&c.url))
         .collect();
     if matches.is_empty() {
         return Err(anyhow!("no BiDi context matched URL regex"));
@@ -520,13 +499,9 @@ async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Resu
     let mut last_ctx: Option<String> = None;
     let mut last_url: Option<String> = None;
     for c in &matches {
-        let ctx = match c.get("context").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let url = c.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let ctx = c.context.clone();
         last_ctx = Some(ctx.clone());
-        last_url = url.clone();
+        last_url = Some(c.url.clone());
         if probe_bidi_context(client, &ctx, PICK_PROBE_TIMEOUT).await {
             return Ok(ctx);
         }
@@ -576,20 +551,11 @@ pub(crate) fn origin_root_url(u: &url::Url) -> String {
 
 async fn find_cdp_target_for_origin(client: &CdpClient, want: &url::Url) -> Result<Option<String>> {
     let targets = client.list_targets().await?;
-    Ok(targets
-        .iter()
-        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-        .find_map(|t| {
-            let u = t.get("url").and_then(|v| v.as_str())?;
-            let parsed = url::Url::parse(u).ok()?;
-            if same_origin(&parsed, want) {
-                t.get("targetId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            }
-        }))
+    let found = CdpTarget::pages(&targets).find_map(|t| {
+        let parsed = url::Url::parse(&t.url).ok()?;
+        same_origin(&parsed, want).then_some(t.id)
+    });
+    Ok(found)
 }
 
 async fn create_cdp_tab(client: &CdpClient, url: &str) -> Result<String> {
@@ -607,21 +573,9 @@ async fn find_bidi_context_for_origin(
     want: &url::Url,
 ) -> Result<Option<String>> {
     let tree = client.send("browsingContext.getTree", json!({})).await?;
-    let contexts = tree
-        .get("contexts")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(contexts.iter().find_map(|c| {
-        let u = c.get("url").and_then(|v| v.as_str())?;
-        let parsed = url::Url::parse(u).ok()?;
-        if same_origin(&parsed, want) {
-            c.get("context")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        }
+    Ok(BidiContext::from_tree(&tree).into_iter().find_map(|c| {
+        let parsed = url::Url::parse(&c.url).ok()?;
+        same_origin(&parsed, want).then_some(c.context)
     }))
 }
 

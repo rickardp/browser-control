@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::bidi::BidiClient;
@@ -23,6 +23,60 @@ pub struct TargetInfo {
     pub title: String,
     /// Always `"page"` for CDP; `"context"` for BiDi.
     pub kind: String,
+}
+
+/// Wire shape of a CDP `Target.getTargets` (`targetInfos`) entry. Only
+/// `target_id` is required; other fields default to empty when absent.
+/// Deserialized directly from the protocol JSON via [`serde_json`].
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CdpTarget {
+    #[serde(rename = "targetId")]
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+impl CdpTarget {
+    /// Parse the `type == "page"` entries from a `Target.getTargets` /
+    /// `list_targets` result, skipping any entry that fails to deserialize
+    /// (e.g. missing `targetId`).
+    pub(crate) fn pages(targets: &[Value]) -> impl Iterator<Item = CdpTarget> + '_ {
+        targets
+            .iter()
+            .filter_map(|t| CdpTarget::deserialize(t).ok())
+            .filter(|t| t.kind == "page")
+    }
+}
+
+/// Wire shape of a BiDi `browsingContext.getTree` context node. Only
+/// `context` is required; `url`/`title` default to empty when absent.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct BidiContext {
+    pub context: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+impl BidiContext {
+    /// Parse the top-level context nodes from a `browsingContext.getTree`
+    /// result, skipping any node that fails to deserialize. Children are not
+    /// recursed (callers only care about top-level contexts).
+    pub(crate) fn from_tree(tree: &Value) -> Vec<BidiContext> {
+        tree.get("contexts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| BidiContext::deserialize(c).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Connect to `endpoint` (per `engine`) and return the list of page targets,
@@ -48,25 +102,11 @@ async fn list_cdp(endpoint: &str) -> Result<Vec<TargetInfo>> {
     let client = open_cdp(endpoint).await?;
     let targets = client.list_targets().await?;
     client.close().await;
-    Ok(targets
-        .into_iter()
-        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+    Ok(CdpTarget::pages(&targets)
         .map(|t| TargetInfo {
-            id: t
-                .get("targetId")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            url: t
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            title: t
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            id: t.id,
+            url: t.url,
+            title: t.title,
             kind: "page".to_string(),
         })
         .collect())
@@ -78,29 +118,12 @@ async fn list_bidi(endpoint: &str) -> Result<Vec<TargetInfo>> {
     let tree = client.send("browsingContext.getTree", json!({})).await;
     let _ = client.session_end().await;
     let tree = tree?;
-    let contexts = tree
-        .get("contexts")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(contexts
+    Ok(BidiContext::from_tree(&tree)
         .into_iter()
         .map(|c| TargetInfo {
-            id: c
-                .get("context")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            url: c
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            title: c
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            id: c.context,
+            url: c.url,
+            title: c.title,
             kind: "context".to_string(),
         })
         .collect())

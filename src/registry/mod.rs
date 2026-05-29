@@ -1,6 +1,7 @@
 //! SQLite-backed registry of running browser instances.
 
 pub mod bidi_lock;
+mod db;
 pub mod naming;
 pub mod schema;
 pub mod scratches;
@@ -121,75 +122,67 @@ impl Registry {
 
     /// Insert (or replace) a row.
     pub fn insert(&self, row: &BrowserRow) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO browsers
+        db::execute(
+            &self.conn,
+            "INSERT OR REPLACE INTO browsers
                     (name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    row.name,
-                    kind_to_str(row.kind),
-                    engine_to_str(row.engine),
-                    row.pid as i64,
-                    row.endpoint,
-                    row.port as i64,
-                    row.profile_dir.to_string_lossy(),
-                    row.executable.to_string_lossy(),
-                    row.headless as i64,
-                    row.started_at,
-                ],
-            )
-            .with_context(|| format!("inserting registry row {}", row.name))?;
-        Ok(())
+            params![
+                row.name,
+                kind_to_str(row.kind),
+                engine_to_str(row.engine),
+                row.pid as i64,
+                row.endpoint,
+                row.port as i64,
+                row.profile_dir.to_string_lossy(),
+                row.executable.to_string_lossy(),
+                row.headless as i64,
+                row.started_at,
+            ],
+            || format!("inserting registry row {}", row.name),
+        )
     }
 
     /// Delete a row by name. No error if it does not exist.
     pub fn delete(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM browsers WHERE name = ?1", params![name])
-            .with_context(|| format!("deleting registry row {name}"))?;
-        Ok(())
+        db::execute(
+            &self.conn,
+            "DELETE FROM browsers WHERE name = ?1",
+            params![name],
+            || format!("deleting registry row {name}"),
+        )
     }
 
     /// Look up a row by name.
     pub fn get_by_name(&self, name: &str) -> Result<Option<BrowserRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at FROM browsers WHERE name = ?1")?;
-        let mut rows = stmt.query(params![name])?;
-        if let Some(r) = rows.next()? {
-            Ok(Some(row_from_sqlite(r)?))
-        } else {
-            Ok(None)
-        }
+        db::query_optional(
+            &self.conn,
+            "SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at FROM browsers WHERE name = ?1",
+            params![name],
+            row_from_sqlite,
+        )
     }
 
     /// All rows, no liveness check, ordered by started_at DESC.
     pub fn list_all(&self) -> Result<Vec<BrowserRow>> {
-        let mut stmt = self.conn.prepare(
+        db::query_vec(
+            &self.conn,
             "SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at
              FROM browsers ORDER BY started_at DESC",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            out.push(row_from_sqlite(r)?);
-        }
-        Ok(out)
+            [],
+            row_from_sqlite,
+        )
     }
 
     /// All rows of a given kind ordered by started_at DESC, without liveness check.
     pub(crate) fn list_by_kind_all(&self, kind: Kind) -> Result<Vec<BrowserRow>> {
-        let mut stmt = self.conn.prepare(
+        db::query_vec(
+            &self.conn,
             "SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at
              FROM browsers WHERE kind = ?1 ORDER BY started_at DESC",
-        )?;
-        let mut rows = stmt.query(params![kind_to_str(kind)])?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            out.push(row_from_sqlite(r)?);
-        }
-        Ok(out)
+            params![kind_to_str(kind)],
+            row_from_sqlite,
+        )
     }
 
     /// All alive rows. Stale rows are deleted as a side-effect.

@@ -12,20 +12,18 @@
 //! Transport errors (script failure, attach failure) exit non-zero; HTTP
 //! status is reported verbatim and does not change the exit code.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::cli::env_resolver::{self, Source};
-use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
-use crate::cli::routing::strip_tab;
+use crate::cli::route;
 use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
-use crate::registry::Registry;
-use crate::session::backend::open_backend;
-use crate::session::{evaluate_for_origin_with_recover_once, with_named_tab_recovery, PageSession};
+use crate::session::{evaluate_for_origin_with_recover_once, PageSession};
 
 // The default fetch timeout (60 000 ms) is set on the CLI flag in
 // `main.rs`. Bounded so a wedged renderer fails fast instead of dragging
@@ -71,49 +69,21 @@ async fn run_inner(
 
     // Path-syntax parsing: `<browser>` or `<browser>/<tab>` in the
     // positional. `--target <regex>` and `/<tab>` are mutually exclusive.
-    let raw = browser.unwrap_or_default();
-    let parsed = if raw.is_empty() {
-        None
-    } else {
-        Some(env_resolver::parse_target(&raw)?)
-    };
-    let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
-    if tab_name.is_some() && target.is_some() {
-        bail!("specify the tab via either `<browser>/<name>` or `--target <regex>`, not both");
-    }
-    let browser_only = parsed
-        .as_ref()
-        .map(|p| strip_tab(&raw, p.tab.as_deref()))
-        .unwrap_or_default();
-    let resolved = resolve_browser(if browser_only.is_empty() {
-        None
-    } else {
-        Some(browser_only.clone())
-    })
-    .await?;
-    trace.browser(&browser_only).engine(resolved.engine);
+    // The preamble (parse, mutual-exclusion, resolve, registry, BiDi lock) is
+    // shared with `eval`/`storage`; see `crate::cli::route`.
+    let r = route::preamble(browser, target.as_deref(), trace).await?;
+    let resolved = &r.resolved;
 
-    // Single Registry handle for the function lifetime: BiDi lock and
-    // named-tab resolution share it.
-    let registry = Registry::open()?;
-    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
-
-    let result = match (tab_name, target.as_deref()) {
+    let result = match (r.tab_name.clone(), target.as_deref()) {
         // Path 1: <browser>/<tab> — fetch against the named tab.
         // Engine-agnostic via TabBackend + recover-once on dead tabs.
         (Some(name), None) => {
             trace.route("named-tab").tab_name(&name);
-            let browser_name = match &resolved.source {
-                Source::Registered { name } => name.clone(),
-                _ => bail!("named tabs (`<browser>/<name>`) require a registered browser"),
-            };
-            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
             let expr = expr.clone();
-            with_named_tab_recovery(
-                &backend,
-                &registry,
-                &browser_name,
+            route::run_named_tab(
+                &r,
                 &name,
+                "named tabs (`<browser>/<name>`) require a registered browser",
                 move |b, target_id| {
                     let expr = expr.clone();
                     async move { b.evaluate(&target_id, &expr, true, fetch_timeout).await }
@@ -192,6 +162,20 @@ struct FetchEnvelope {
     body: String,
 }
 
+/// Wire shape of the `FETCH_JS` envelope. Deserialized directly; only `status`
+/// is required. `headers` is a `BTreeMap` so iteration is key-sorted, matching
+/// the previous `serde_json::Map` iteration order.
+#[derive(Deserialize)]
+struct RawFetchEnvelope {
+    status: u16,
+    #[serde(default, rename = "statusText")]
+    status_text: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: String,
+}
+
 fn parse_headers(headers: &[String]) -> Result<Map<String, Value>> {
     let mut map = Map::new();
     for raw in headers {
@@ -239,36 +223,13 @@ fn parse_envelope(v: &Value) -> Result<FetchEnvelope> {
     let s = v
         .as_str()
         .ok_or_else(|| anyhow!("fetch script returned non-string value: {v}"))?;
-    let inner: Value = serde_json::from_str(s)
+    let raw: RawFetchEnvelope = serde_json::from_str(s)
         .with_context(|| format!("fetch script returned invalid JSON: {s}"))?;
-    let status = inner
-        .get("status")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| anyhow!("fetch envelope missing `status`"))? as u16;
-    let status_text = inner
-        .get("statusText")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let headers = inner
-        .get("headers")
-        .and_then(|x| x.as_object())
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let body = inner
-        .get("body")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
     Ok(FetchEnvelope {
-        status,
-        status_text,
-        headers,
-        body,
+        status: raw.status,
+        status_text: raw.status_text,
+        headers: raw.headers.into_iter().collect(),
+        body: raw.body,
     })
 }
 

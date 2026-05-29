@@ -5,6 +5,7 @@ pub mod fetch;
 pub mod list;
 pub mod mcp;
 pub mod output;
+pub mod route;
 pub mod routing;
 pub mod set;
 pub mod start;

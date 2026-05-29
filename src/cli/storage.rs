@@ -18,13 +18,11 @@ use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use serde_json::Value;
 
-use crate::cli::env_resolver::{self, Source};
-use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
-use crate::cli::routing::strip_tab;
+use crate::cli::env_resolver::Source;
+use crate::cli::route;
 use crate::cli::trace::CommandTrace;
-use crate::registry::Registry;
 use crate::session::backend::open_backend;
-use crate::session::{with_named_tab_recovery, with_scratch_recovery, PageSession};
+use crate::session::{with_scratch_recovery, PageSession};
 
 /// Per-call timeout for storage probes. The expressions injected here are
 /// trivial (`localStorage.getItem`, `JSON.stringify(Object.entries(...))`,
@@ -129,49 +127,21 @@ async fn evaluate_routed(
     expr: &str,
     trace: &mut CommandTrace,
 ) -> Result<Value> {
-    let raw = browser.unwrap_or_default();
-    let parsed = if raw.is_empty() {
-        None
-    } else {
-        Some(env_resolver::parse_target(&raw)?)
-    };
-    let tab_name = parsed.as_ref().and_then(|p| p.tab.clone());
-    if tab_name.is_some() && target.is_some() {
-        bail!("specify the tab via either `<browser>/<name>` or `--target <regex>`, not both");
-    }
-    let browser_only = parsed
-        .as_ref()
-        .map(|p| strip_tab(&raw, p.tab.as_deref()))
-        .unwrap_or_default();
-    let resolved = resolve_browser(if browser_only.is_empty() {
-        None
-    } else {
-        Some(browser_only.clone())
-    })
-    .await?;
-    trace.browser(&browser_only).engine(resolved.engine);
+    // Preamble (parse, mutual-exclusion, resolve, registry, BiDi lock) is
+    // shared with `eval`/`fetch`; see `crate::cli::route`.
+    let r = route::preamble(browser, target.as_deref(), trace).await?;
+    let resolved = &r.resolved;
 
-    let registry = Registry::open()?;
-    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
-
-    match (tab_name, target) {
+    match (r.tab_name.clone(), target) {
         // Path 1: <browser>/<tab> — named tab with recover-once.
         (Some(name), None) => {
             trace.route("named-tab").tab_name(&name);
-            let browser_name = match &resolved.source {
-                Source::Registered { name } => name.clone(),
-                _ => bail!(
-                    "named tabs (`<browser>/<name>`) require a registered browser; \
-                     external endpoints can't carry tab names"
-                ),
-            };
-            let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
             let expr = expr.to_string();
-            with_named_tab_recovery(
-                &backend,
-                &registry,
-                &browser_name,
+            route::run_named_tab(
+                &r,
                 &name,
+                "named tabs (`<browser>/<name>`) require a registered browser; \
+                 external endpoints can't carry tab names",
                 move |b, target_id| {
                     let expr = expr.clone();
                     async move { b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await }
@@ -201,7 +171,7 @@ async fn evaluate_routed(
                 };
                 let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
                 let expr = expr.to_string();
-                with_scratch_recovery(&backend, &registry, &browser_name, move |b, target_id| {
+                with_scratch_recovery(&backend, &r.registry, &browser_name, move |b, target_id| {
                     let expr = expr.clone();
                     async move { b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await }
                 })
@@ -436,6 +406,7 @@ mod tests {
 
     #[test]
     fn strip_tab_removes_suffix_when_present() {
+        use crate::cli::routing::strip_tab;
         assert_eq!(strip_tab("brave/cart", Some("cart")), "brave");
         assert_eq!(strip_tab("brave", None), "brave");
         // If `tab` is `Some` but does not in fact match the suffix, the
