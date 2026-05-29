@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::routing::strip_tab;
 use crate::cli::trace::CommandTrace;
 use crate::registry::Registry;
 use crate::session::backend::open_backend;
@@ -83,13 +84,9 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             json,
         } => {
             let mut trace = CommandTrace::new("storage-get");
-            match run_get(browser, key, key_regex, target, namespace, json, &mut trace).await {
-                Ok(()) => {
-                    trace.ok(());
-                    Ok(())
-                }
-                Err(e) => Err(trace.err(e)),
-            }
+            let result =
+                run_get(browser, key, key_regex, target, namespace, json, &mut trace).await;
+            trace.finish(result)
         }
         StorageCmd::Set {
             browser,
@@ -99,13 +96,8 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             namespace,
         } => {
             let mut trace = CommandTrace::new("storage-set");
-            match run_set(browser, key, value, target, namespace, &mut trace).await {
-                Ok(()) => {
-                    trace.ok(());
-                    Ok(())
-                }
-                Err(e) => Err(trace.err(e)),
-            }
+            let result = run_set(browser, key, value, target, namespace, &mut trace).await;
+            trace.finish(result)
         }
         StorageCmd::List {
             browser,
@@ -115,13 +107,8 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             json,
         } => {
             let mut trace = CommandTrace::new("storage-list");
-            match run_list(browser, key_regex, target, namespace, json, &mut trace).await {
-                Ok(()) => {
-                    trace.ok(());
-                    Ok(())
-                }
-                Err(e) => Err(trace.err(e)),
-            }
+            let result = run_list(browser, key_regex, target, namespace, json, &mut trace).await;
+            trace.finish(result)
         }
     }
 }
@@ -233,17 +220,6 @@ async fn evaluate_routed(
             value
         }
         _ => unreachable!("mutex was checked above"),
-    }
-}
-
-/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
-fn strip_tab(raw: &str, tab: Option<&str>) -> String {
-    match tab {
-        Some(name) => raw
-            .strip_suffix(&format!("/{name}"))
-            .unwrap_or(raw)
-            .to_string(),
-        None => raw.to_string(),
     }
 }
 

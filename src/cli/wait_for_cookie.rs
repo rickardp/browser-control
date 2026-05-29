@@ -97,7 +97,7 @@ pub async fn run(
         eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
 
         if let Some(url) = validate_url {
-            run_validate_url(&resolved, &registry, None, &url, &mut trace).await?;
+            run_validate_url(&resolved, &registry, &url, &mut trace).await?;
         } else {
             // No validate-url; only the cookie poll ran (browser-wide).
             trace.route("poll");
@@ -107,13 +107,7 @@ pub async fn run(
         Ok(())
     }
     .await;
-    match result {
-        Ok(()) => {
-            trace.ok(());
-            Ok(())
-        }
-        Err(e) => Err(trace.err(e)),
-    }
+    trace.finish(result)
 }
 
 /// Drive the `--validate-url` fetch through scratch (with recover-once)
@@ -121,7 +115,6 @@ pub async fn run(
 async fn run_validate_url(
     resolved: &crate::cli::env_resolver::ResolvedBrowser,
     registry: &Registry,
-    _tab_name: Option<&str>,
     url: &str,
     trace: &mut CommandTrace,
 ) -> Result<()> {

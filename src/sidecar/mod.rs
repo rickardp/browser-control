@@ -107,6 +107,23 @@ struct SidecarInner {
     writer_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Truncate a stdout line to a bounded prefix for logging, so a large payload
+/// never floods the diagnostics.
+fn truncate_line(line: &str) -> std::borrow::Cow<'_, str> {
+    const MAX: usize = 200;
+    if line.len() <= MAX {
+        std::borrow::Cow::Borrowed(line)
+    } else {
+        let end = line
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        std::borrow::Cow::Owned(format!("{}… ({} bytes total)", &line[..end], line.len()))
+    }
+}
+
 impl Drop for SidecarInner {
     fn drop(&mut self) {
         // Best-effort: kill the child and abort the IO tasks. Reader/writer
@@ -217,11 +234,27 @@ impl Sidecar {
                 }
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    // Unparseable NDJSON line: can't route it, so it's dropped —
+                    // log (truncated) so the request it would have answered has
+                    // a breadcrumb instead of hanging in silence.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            line = %truncate_line(&line),
+                            "sidecar: dropping unparseable stdout line"
+                        );
+                        continue;
+                    }
                 };
                 let id = match v.get("id").and_then(|x| x.as_u64()) {
                     Some(i) => i,
-                    None => continue,
+                    None => {
+                        tracing::debug!(
+                            line = %truncate_line(&line),
+                            "sidecar: dropping idless stdout line"
+                        );
+                        continue;
+                    }
                 };
                 let result = if let Some(err) = v.get("error") {
                     let msg = err

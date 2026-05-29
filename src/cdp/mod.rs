@@ -1,33 +1,19 @@
 //! Minimal Chrome DevTools Protocol (CDP) WebSocket client.
-
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+//!
+//! The socket / reader-task / writer-task / pending-correlation / timeout
+//! machinery lives in the shared [`crate::transport`] (`WsRpc`); this module
+//! supplies only the CDP-specific framing/typing via the [`CdpProtocol`]
+//! adapter and the convenience methods.
 
 use anyhow::{anyhow, Result};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::broadcast;
 
 pub mod protocol;
 use protocol::{CdpError, Request, Response};
 
 use crate::errors::{is_cdp_target_gone, SessionError, TargetKind};
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const EVENT_CHANNEL_CAPACITY: usize = 256;
-
-/// Bound on `connect_async` / HTTP discovery during initial CDP bringup.
-///
-/// A dead browser process or a stale `/devtools/browser/<GUID>` can otherwise
-/// stall the WebSocket upgrade (or the underlying TCP connect) for the OS's
-/// connect timeout — multiple seconds to over a minute on macOS/Linux. Five
-/// seconds matches the `--version` probe in `crate::detect` and is short
-/// enough that agents don't perceive a hang.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>;
+use crate::transport::{Decoded, Protocol, RequestError, WsRpc, CONNECT_TIMEOUT, REQUEST_TIMEOUT};
 
 #[derive(Debug, Clone)]
 pub struct CdpEvent {
@@ -36,94 +22,68 @@ pub struct CdpEvent {
     pub session_id: Option<String>,
 }
 
+/// CDP framing/typing adapter for the shared transport.
+pub struct CdpProtocol;
+
+impl Protocol for CdpProtocol {
+    type ProtoError = CdpError;
+    type Event = CdpEvent;
+
+    fn encode_request(
+        id: u64,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> Result<String> {
+        let req = Request {
+            id,
+            method,
+            params,
+            session_id: session_id.map(|s| s.to_string()),
+        };
+        Ok(serde_json::to_string(&req)?)
+    }
+
+    fn decode_frame(text: &str) -> Decoded<CdpError, CdpEvent> {
+        let resp: Response = match serde_json::from_str(text) {
+            Ok(r) => r,
+            Err(_) => return Decoded::Ignore,
+        };
+        if let Some(id) = resp.id {
+            let result = if let Some(err) = resp.error {
+                Err(err)
+            } else {
+                Ok(resp.result)
+            };
+            Decoded::Reply { id, result }
+        } else if let Some(method) = resp.method {
+            Decoded::Event(CdpEvent {
+                method,
+                params: resp.params,
+                session_id: resp.session_id,
+            })
+        } else {
+            Decoded::Ignore
+        }
+    }
+
+    fn closed_error() -> CdpError {
+        CdpError {
+            code: -1,
+            message: "connection closed".into(),
+        }
+    }
+}
+
 pub struct CdpClient {
-    next_id: Mutex<u64>,
-    pending: Arc<Mutex<PendingMap>>,
-    events_tx: broadcast::Sender<CdpEvent>,
-    write_tx: mpsc::UnboundedSender<String>,
-    reader_handle: tokio::task::JoinHandle<()>,
-    writer_handle: tokio::task::JoinHandle<()>,
+    rpc: WsRpc<CdpProtocol>,
 }
 
 impl CdpClient {
     /// Connect by full WebSocket URL (ws:// or wss://).
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws_stream, _) =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "CDP WebSocket connect to {ws_url} timed out after {:?}",
-                        CONNECT_TIMEOUT
-                    )
-                })??;
-        let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
-        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
-
-        let writer_handle = tokio::spawn(async move {
-            while let Some(text) = write_rx.recv().await {
-                if ws_sink.send(Message::Text(text)).await.is_err() {
-                    break;
-                }
-            }
-            let _ = ws_sink.close().await;
-        });
-
-        let pending_r = pending.clone();
-        let events_r = events_tx.clone();
-        let reader_handle = tokio::spawn(async move {
-            while let Some(msg) = ws_stream.next().await {
-                let text = match msg {
-                    Ok(Message::Text(t)) => t,
-                    Ok(Message::Binary(b)) => match String::from_utf8(b) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    Ok(_) => continue,
-                };
-                let resp: Response = match serde_json::from_str(&text) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if let Some(id) = resp.id {
-                    let mut p = pending_r.lock().await;
-                    if let Some(tx) = p.remove(&id) {
-                        let res = if let Some(err) = resp.error {
-                            Err(err)
-                        } else {
-                            Ok(resp.result)
-                        };
-                        let _ = tx.send(res);
-                    }
-                } else if let Some(method) = resp.method {
-                    let _ = events_r.send(CdpEvent {
-                        method,
-                        params: resp.params,
-                        session_id: resp.session_id,
-                    });
-                }
-            }
-            // Reader closed: fail all pending requests.
-            let mut p = pending_r.lock().await;
-            for (_, tx) in p.drain() {
-                let _ = tx.send(Err(CdpError {
-                    code: -1,
-                    message: "connection closed".into(),
-                }));
-            }
-        });
-
         Ok(Self {
-            next_id: Mutex::new(1),
-            pending,
-            events_tx,
-            write_tx,
-            reader_handle,
-            writer_handle,
+            rpc: WsRpc::connect(ws_url, "CDP").await?,
         })
     }
 
@@ -135,7 +95,16 @@ impl CdpClient {
             .timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| anyhow!("building reqwest client: {e}"))?;
-        let resp: Value = client.get(&url).send().await?.json().await?;
+        // Check the HTTP status before parsing: a non-2xx (wrong port / a
+        // non-CDP server answering) otherwise surfaces as a confusing serde
+        // error or "webSocketDebuggerUrl missing" instead of the real cause.
+        let http_resp = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|e| anyhow!("fetching {url}: {e}"))?;
+        let resp: Value = http_resp.json().await?;
         let ws_url = resp
             .get("webSocketDebuggerUrl")
             .and_then(|v| v.as_str())
@@ -155,48 +124,26 @@ impl CdpClient {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value> {
-        let id = {
-            let mut n = self.next_id.lock().await;
-            let id = *n;
-            *n += 1;
-            id
-        };
-
-        let req = Request {
-            id,
-            method,
-            params,
-            session_id: session_id.map(|s| s.to_string()),
-        };
-        let text = serde_json::to_string(&req)?;
-
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut p = self.pending.lock().await;
-            p.insert(id, tx);
-        }
-
-        if self.write_tx.send(text).is_err() {
-            let mut p = self.pending.lock().await;
-            p.remove(&id);
-            return Err(anyhow!("writer task closed"));
-        }
-
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(classify_cdp_error(e, session_id.is_some())),
-            Ok(Err(_)) => Err(anyhow!("response channel dropped")),
-            Err(_) => {
-                let mut p = self.pending.lock().await;
-                p.remove(&id);
-                Err(anyhow!("CDP request timed out after {:?}", REQUEST_TIMEOUT))
-            }
+        match self.rpc.request(method, params, session_id).await {
+            Ok(v) => Ok(v),
+            Err(RequestError::Protocol(e)) => Err(classify_cdp_error(e, session_id.is_some())),
+            Err(RequestError::Timeout) => match session_id {
+                Some(sid) => Err(anyhow!(
+                    "CDP request {method} (session {sid}) timed out after {:?}",
+                    REQUEST_TIMEOUT
+                )),
+                None => Err(anyhow!(
+                    "CDP request {method} timed out after {:?}",
+                    REQUEST_TIMEOUT
+                )),
+            },
+            Err(RequestError::Transport(e)) => Err(e),
         }
     }
 
     /// Subscribe to all events. Drop the receiver to unsubscribe.
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
-        self.events_tx.subscribe()
+        self.rpc.subscribe()
     }
 
     /// Attach to a target via Target.attachToTarget(flatten=true) and return the session id.
@@ -222,12 +169,10 @@ impl CdpClient {
         }
     }
 
-    /// Gracefully shut down.
+    /// Gracefully shut down. Dropping the client also aborts the tasks via
+    /// `WsRpc`'s `Drop`, so this is the explicit-flush path.
     pub async fn close(self) {
-        drop(self.write_tx);
-        let _ = self.writer_handle.await;
-        self.reader_handle.abort();
-        let _ = self.reader_handle.await;
+        self.rpc.close().await;
     }
 }
 
@@ -251,6 +196,8 @@ fn classify_cdp_error(err: CdpError, attached: bool) -> anyhow::Error {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
 
     #[tokio::test]

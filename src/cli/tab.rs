@@ -68,23 +68,13 @@ pub async fn run(cmd: TabCmd) -> Result<()> {
     match cmd {
         TabCmd::Open { browser, url, json } => {
             let mut trace = CommandTrace::new("tab-open");
-            match open(&browser, &url, json, &mut trace).await {
-                Ok(()) => {
-                    trace.ok(());
-                    Ok(())
-                }
-                Err(e) => Err(trace.err(e)),
-            }
+            let result = open(&browser, &url, json, &mut trace).await;
+            trace.finish(result)
         }
         TabCmd::List { browser, all, json } => {
             let mut trace = CommandTrace::new("tab-list");
-            match list(&browser, all, json, &mut trace).await {
-                Ok(()) => {
-                    trace.ok(());
-                    Ok(())
-                }
-                Err(e) => Err(trace.err(e)),
-            }
+            let result = list(&browser, all, json, &mut trace).await;
+            trace.finish(result)
         }
         TabCmd::Adopt {
             browser,
@@ -92,13 +82,8 @@ pub async fn run(cmd: TabCmd) -> Result<()> {
             json,
         } => {
             let mut trace = CommandTrace::new("tab-adopt");
-            match adopt(&browser, &target_id, json, &mut trace).await {
-                Ok(()) => {
-                    trace.ok(());
-                    Ok(())
-                }
-                Err(e) => Err(trace.err(e)),
-            }
+            let result = adopt(&browser, &target_id, json, &mut trace).await;
+            trace.finish(result)
         }
     }
 }

@@ -105,15 +105,15 @@ async fn watch_for_crash(
             // Lagged: an old event we'd care about may have been dropped.
             // Keep listening rather than fabricating a crash.
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            // Channel closed — the connection is dead. Let the in-flight
-            // future surface the underlying I/O error; we don't have a
-            // crash signal to report.
+            // Channel closed — the connection is dead. We have no crash
+            // signal to report, and synthesising `TabCrashed` here would
+            // mislabel a normal disconnect as a crash and (via the biased
+            // select in `evaluate_with_crash_detection`) beat the real I/O
+            // error. Instead, never resolve: let the in-flight future lose
+            // its transport and surface the underlying error itself.
             Err(broadcast::error::RecvError::Closed) => {
-                return SessionError::TabCrashed {
-                    target_id: target_id.clone(),
-                    reason: "event stream closed".into(),
-                }
-                .into();
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves");
             }
         }
     }

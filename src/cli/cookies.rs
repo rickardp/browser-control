@@ -145,13 +145,7 @@ pub async fn run(
         Ok(())
     }
     .await;
-    match result {
-        Ok(()) => {
-            trace.ok(());
-            Ok(())
-        }
-        Err(e) => Err(trace.err(e)),
-    }
+    trace.finish(result)
 }
 
 async fn fetch_cdp(endpoint: &str) -> Result<Vec<NormalCookie>> {

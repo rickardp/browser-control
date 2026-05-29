@@ -237,6 +237,56 @@ mod tests {
     }
 
     #[test]
+    fn blocks_until_granted_on_release() {
+        // The central grant-on-release transition: a holder takes the lock,
+        // a contender blocks waiting for it, the holder drops (releasing the
+        // row), and the contender then acquires. Both threads share this
+        // process's PID, so the INSERT genuinely conflicts until the guard's
+        // `Drop` DELETEs the row — exercising the poll-then-grant path that
+        // the timeout/eviction tests don't reach.
+        //
+        // File-backed (not `:memory:`) because `BidiLockGuard::drop` releases
+        // by opening a *fresh* connection at `db_path`; an in-memory registry
+        // would hand the guard a separate empty DB and the release would be a
+        // no-op.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let reg = fresh_at(&path);
+        let guard = reg.bidi_lock_acquire("b", Duration::from_secs(1)).unwrap();
+
+        // Hold the lock for a beat on a background thread, then drop it.
+        const HOLD: Duration = Duration::from_millis(300);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            drop(guard); // releases the row via Drop's fresh connection
+        });
+
+        // Contend from a second connection with a timeout comfortably longer
+        // than the hold. The first poll fails (row present), we sleep
+        // POLL_INTERVAL, retry until the holder releases, then succeed.
+        let reg2 = fresh_at(&path);
+        let start = Instant::now();
+        let g2 = reg2
+            .bidi_lock_acquire("b", Duration::from_secs(5))
+            .expect("must eventually acquire after release");
+        let elapsed = start.elapsed();
+
+        holder.join().unwrap();
+
+        assert_eq!(g2.holder_pid(), std::process::id());
+        // It can only have succeeded after the holder dropped — i.e. at least
+        // the hold duration must have elapsed.
+        assert!(
+            elapsed >= HOLD,
+            "acquired before release: elapsed {elapsed:?} < hold {HOLD:?}"
+        );
+        // And it must have actually been granted (row now ours).
+        let holder_row = reg2.bidi_lock_holder("b").unwrap().unwrap();
+        assert_eq!(holder_row.holder_pid, std::process::id());
+    }
+
+    #[test]
     fn stale_pid_holder_is_evicted_on_acquire() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let reg = fresh_at(tmp.path());

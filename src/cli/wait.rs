@@ -36,13 +36,7 @@ pub async fn run(browser: Option<String>, _ready: bool, timeout: u64) -> Result<
         Ok(())
     }
     .await;
-    match result {
-        Ok(()) => {
-            trace.ok(());
-            Ok(())
-        }
-        Err(e) => Err(trace.err(e)),
-    }
+    trace.finish(result)
 }
 
 /// Convert a raw browser endpoint (which may be a `ws://host:port/...` URL or

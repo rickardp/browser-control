@@ -136,9 +136,18 @@ impl ServerState {
         use crate::registry::Registry;
         let mut guard = self.bidi_lock.lock().await;
         if matches!(*guard, BidiLockState::Pending) {
-            let registry = Registry::open()?;
             let resolved = self.browser_snapshot().await;
-            *guard = match acquire_bidi_lock_if_needed(&registry, &resolved)? {
+            // `bidi_lock_acquire` polls with a blocking `std::thread::sleep`
+            // for up to 30s under contention. Run it on a blocking thread so
+            // we never park a tokio worker (mirrors `resolve_browser_send`).
+            // `Registry` is opened fresh inside and `resolved` is an owned
+            // clone, so both move into the closure.
+            let acquired = tokio::task::spawn_blocking(move || {
+                let registry = Registry::open()?;
+                acquire_bidi_lock_if_needed(&registry, &resolved)
+            })
+            .await??;
+            *guard = match acquired {
                 Some(lock) => BidiLockState::Acquired(lock),
                 None => BidiLockState::NotApplicable,
             };
@@ -228,7 +237,10 @@ impl ServerState {
                 // Mimic `session::tabs::resolve_tab` here so we never hold
                 // a `!Send` `Registry` across `.await`: sync registry-read,
                 // async liveness probe, sync registry-mutate.
-                let row = sync_registry_op(|reg| reg.tab_get(&browser_name, &name))?
+                let bn = browser_name.clone();
+                let n = name.clone();
+                let row = sync_registry_op(move |reg| reg.tab_get(&bn, &n))
+                    .await?
                     .ok_or_else(|| crate::errors::SessionError::TabNotFound {
                         browser: browser_name.clone(),
                         name: name.clone(),
@@ -238,7 +250,7 @@ impl ServerState {
                     // Stale — sweep, then error.
                     let bn = browser_name.clone();
                     let n = name.clone();
-                    sync_registry_op(move |reg| reg.tab_delete(&bn, &n))?;
+                    sync_registry_op(move |reg| reg.tab_delete(&bn, &n)).await?;
                     return Err(crate::errors::SessionError::TabNotFound {
                         browser: browser_name,
                         name,
@@ -247,7 +259,7 @@ impl ServerState {
                 }
                 let bn = browser_name.clone();
                 let n = name.clone();
-                sync_registry_op(move |reg| reg.tab_touch(&bn, &n))?;
+                sync_registry_op(move |reg| reg.tab_touch(&bn, &n)).await?;
                 Ok((backend, row.target_id))
             }
             (None, Some(regex)) => {
@@ -328,14 +340,23 @@ impl ServerState {
 /// Helper that opens a fresh `Registry` and runs a closure against it,
 /// returning the result. Used by the MCP layer to keep `!Send`
 /// `rusqlite::Connection` references off of `.await`-crossing scopes.
-/// The closure runs synchronously inside the helper; the registry is
-/// dropped before the function returns.
-pub(crate) fn sync_registry_op<T, F>(f: F) -> Result<T>
+///
+/// The closure runs on a blocking thread via `tokio::task::spawn_blocking`
+/// (mirroring `resolve_browser_send`) so the synchronous `rusqlite` work
+/// and the blocking exclusive `flock` taken across schema migration in
+/// `Registry::open` never park a tokio worker. The `!Send` `Registry` is
+/// created and dropped entirely inside the closure, so it never crosses an
+/// `.await`.
+pub(crate) async fn sync_registry_op<T, F>(f: F) -> Result<T>
 where
-    F: FnOnce(&crate::registry::Registry) -> Result<T>,
+    F: FnOnce(&crate::registry::Registry) -> Result<T> + Send + 'static,
+    T: Send + 'static,
 {
-    let reg = crate::registry::Registry::open()?;
-    f(&reg)
+    tokio::task::spawn_blocking(move || {
+        let reg = crate::registry::Registry::open()?;
+        f(&reg)
+    })
+    .await?
 }
 
 /// Resolve a `BrowserSelector` to a `ResolvedBrowser` from a `Send`
@@ -498,6 +519,18 @@ pub async fn run(state: ServerState, tools: ToolRegistry) -> Result<()> {
 }
 
 /// Run the server with injected I/O streams (used by tests).
+///
+/// Requests are dispatched concurrently: `tools/call` handlers are spawned
+/// on their own tasks so a slow op (30s BiDi lock, sidecar `npm install`,
+/// 30s CDP timeout) never blocks `ping`, `tools/list`, or other calls on
+/// the connection. The read loop keeps pulling lines while handlers run.
+///
+/// Stdout is owned by a single writer task fed over an mpsc channel, so
+/// all response frames are serialized to the wire one at a time even though
+/// they are produced concurrently — no interleaved partial writes. Per
+/// JSON-RPC, response ordering is correlated by `id`, so out-of-order
+/// completion is sound. Correctness of shared backend access is unchanged:
+/// it is still serialized by the `ServerState` locks.
 pub async fn run_with_streams<I, O>(
     state: ServerState,
     tools: ToolRegistry,
@@ -506,8 +539,23 @@ pub async fn run_with_streams<I, O>(
 ) -> Result<()>
 where
     I: tokio::io::AsyncRead + Unpin,
-    O: tokio::io::AsyncWrite + Unpin,
+    O: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // Single writer task owns stdout; every response frame (already
+    // serialized to bytes incl. trailing newline) flows through here so
+    // concurrent handlers can never interleave their writes.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if stdout.write_all(&frame).await.is_err() {
+                break;
+            }
+            if stdout.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut lines = BufReader::new(stdin).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -516,13 +564,11 @@ where
         let req: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                write_error(
-                    &mut stdout,
+                let _ = tx.send(error_frame(
                     Value::Null,
                     -32700,
                     &format!("parse error: {e}"),
-                )
-                .await?;
+                ));
                 continue;
             }
         };
@@ -535,74 +581,124 @@ where
             continue;
         }
 
-        let result = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "browser-control",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-            })),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tools.list()})),
+        match method {
+            "initialize" => {
+                let _ = tx.send(result_frame(
+                    id,
+                    json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {
+                            "name": "browser-control",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                    }),
+                ));
+            }
+            "ping" => {
+                let _ = tx.send(result_frame(id, json!({})));
+            }
+            "tools/list" => {
+                let _ = tx.send(result_frame(id, json!({"tools": tools.list()})));
+            }
             "tools/call" => {
-                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                // Spawn the handler so the read loop stays responsive while
+                // a slow tool runs. The frame is sent to the single writer
+                // task on completion, preserving serialized stdout writes.
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                match tools.handler(name) {
-                    Some(h) => h(state.clone(), args).await,
-                    None => Err(anyhow::anyhow!("tool not found: {name}")),
-                }
+                let handler = tools.handler(&name);
+                let state = state.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let frame = match handler {
+                        // An unknown tool name is bad params, not a tool
+                        // failure: keep it a genuine `-32602` protocol error.
+                        None => error_frame(id, -32602, &format!("tool not found: {name}")),
+                        Some(h) => match h(state, args).await {
+                            Ok(v) => result_frame(id, v),
+                            // A tool *executing* and failing is not a protocol
+                            // fault: per the MCP spec it is a successful result
+                            // carrying `isError: true` so the agent can read
+                            // the message and recover, rather than treating it
+                            // as a transport error.
+                            Err(e) => tool_error_frame(id, &e),
+                        },
+                    };
+                    let _ = tx.send(frame);
+                });
             }
             _ => {
-                write_error(
-                    &mut stdout,
+                let _ = tx.send(error_frame(
                     id,
                     -32601,
                     &format!("method not found: {method}"),
-                )
-                .await?;
-                continue;
+                ));
             }
-        };
-
-        match result {
-            Ok(v) => write_result(&mut stdout, id, v).await?,
-            Err(e) => write_error(&mut stdout, id, -32000, &e.to_string()).await?,
         }
     }
+    // stdin closed: drop our sender so the writer drains and exits, then
+    // wait for it so all buffered responses reach the wire before returning.
+    drop(tx);
+    let _ = writer.await;
     Ok(())
 }
 
-async fn write_result<O: tokio::io::AsyncWrite + Unpin>(
-    out: &mut O,
-    id: Value,
-    result: Value,
-) -> Result<()> {
+/// Serialize a JSON-RPC success response to a newline-terminated frame.
+fn result_frame(id: Value, result: Value) -> Vec<u8> {
     let resp = json!({"jsonrpc": "2.0", "id": id, "result": result});
-    let mut s = serde_json::to_vec(&resp)?;
+    let mut s = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
     s.push(b'\n');
-    out.write_all(&s).await?;
-    out.flush().await?;
-    Ok(())
+    s
 }
 
-async fn write_error<O: tokio::io::AsyncWrite + Unpin>(
-    out: &mut O,
-    id: Value,
-    code: i64,
-    message: &str,
-) -> Result<()> {
+/// Serialize a *tool-execution* failure as a successful JSON-RPC result with
+/// `isError: true`, per the MCP spec (tool failures are not protocol faults —
+/// the agent reads the content and recovers). Typed errors are downcast so the
+/// content message carries their structure (e.g. the recover-once hint, or the
+/// BiDi lock holder PID) instead of an opaque flattened string.
+fn tool_error_frame(id: Value, err: &anyhow::Error) -> Vec<u8> {
+    let message = tool_error_message(err);
+    result_frame(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+        }),
+    )
+}
+
+/// Build the human/agent-readable message for a failed tool call. Downcasts
+/// the typed error variants the agent can act on so their machine-relevant
+/// fields survive (rather than relying on `Display` alone), falling back to the
+/// full `anyhow` chain otherwise.
+fn tool_error_message(err: &anyhow::Error) -> String {
+    use crate::errors::SessionError;
+    use crate::registry::bidi_lock::BidiLockBusy;
+
+    if let Some(se) = err.downcast_ref::<SessionError>() {
+        // SessionError's Display already encodes target/url/hint and the
+        // EngineUnsupported recovery hint, so reuse it verbatim.
+        return se.to_string();
+    }
+    if let Some(busy) = err.downcast_ref::<BidiLockBusy>() {
+        return busy.to_string();
+    }
+    // Unknown failure: surface the whole context chain ("{:#}") so causes
+    // aren't lost.
+    format!("{err:#}")
+}
+
+/// Serialize a JSON-RPC error response to a newline-terminated frame.
+fn error_frame(id: Value, code: i64, message: &str) -> Vec<u8> {
     let resp = json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {"code": code, "message": message},
     });
-    let mut s = serde_json::to_vec(&resp)?;
+    let mut s = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
     s.push(b'\n');
-    out.write_all(&s).await?;
-    out.flush().await?;
-    Ok(())
+    s
 }
 
 #[cfg(test)]
@@ -665,6 +761,24 @@ mod tests {
         }
     }
 
+    fn failing_tool() -> RegisteredTool {
+        RegisteredTool {
+            name: "boom".to_string(),
+            description: "Always fails with a typed SessionError".to_string(),
+            input_schema: json!({"type": "object"}),
+            handler: std::sync::Arc::new(|_state, _args| {
+                Box::pin(async move {
+                    Err(anyhow::Error::new(crate::errors::SessionError::TabHung {
+                        target_id: Some("T1".into()),
+                        url: Some("https://example.test".into()),
+                        timeout_ms: 20_000,
+                        hint: "renderer wedged",
+                    }))
+                })
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn initialize_round_trip() {
         let resp = send_recv(
@@ -712,11 +826,35 @@ mod tests {
             })],
         )
         .await;
-        assert!(resp[0]["error"].is_object());
+        // Unknown tool name is bad params — a genuine protocol fault.
+        assert_eq!(resp[0]["error"]["code"], -32602);
         assert!(resp[0]["error"]["message"]
             .as_str()
             .unwrap()
             .contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn tool_failure_returns_iserror_result_not_protocol_error() {
+        let tools = ToolRegistry::new();
+        tools.register(failing_tool());
+        let resp = send_recv(
+            tools,
+            &[json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name":"boom","arguments":{}}
+            })],
+        )
+        .await;
+        // Spec-compliant: a tool that executes and fails is a *successful*
+        // JSON-RPC result carrying `isError: true`, not a `-32xxx` fault.
+        assert!(resp[0]["error"].is_null());
+        assert_eq!(resp[0]["result"]["isError"], true);
+        let text = resp[0]["result"]["content"][0]["text"].as_str().unwrap();
+        // Typed SessionError structure survives (target id + hint).
+        assert!(text.contains("tab hung"), "got: {text}");
+        assert!(text.contains("renderer wedged"), "got: {text}");
+        assert!(text.contains("T1"), "got: {text}");
     }
 
     #[tokio::test]
@@ -752,6 +890,233 @@ mod tests {
         )
         .await;
         assert_eq!(resp[0]["result"], json!({}));
+    }
+
+    // -- resolve_target_for_args + concurrent ensure_backend ----------------
+    //
+    // These drive the real `ServerState` against an in-process mock CDP
+    // WebSocket server (no browser) and a temp-dir registry (via
+    // `BROWSER_CONTROL_DATA_DIR`). The mock counts accepted connections so we
+    // can assert `ensure_backend`'s double-checked locking opens exactly one
+    // backend under concurrency.
+
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// A CDP mock that reports a fixed set of live targets via
+    /// `Target.getTargets` and counts how many WebSocket connections it
+    /// accepts. Returns `(ws_url, connections_accepted, stop_tx)`.
+    async fn spawn_counting_cdp_mock(
+        live: Vec<String>,
+    ) -> (String, Arc<AtomicUsize>, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns_srv = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let accept = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    a = listener.accept() => a,
+                };
+                let (stream, _) = match accept {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                conns_srv.fetch_add(1, Ordering::SeqCst);
+                let live = live.clone();
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if let Message::Text(t) = msg {
+                            let req: Value = match serde_json::from_str(&t) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let id = req["id"].as_u64().unwrap_or(0);
+                            let method = req["method"].as_str().unwrap_or("");
+                            let result = match method {
+                                "Target.getTargets" => {
+                                    let infos: Vec<Value> = live
+                                        .iter()
+                                        .map(|tid| {
+                                            json!({"targetId": tid, "type": "page", "url": ""})
+                                        })
+                                        .collect();
+                                    json!({"targetInfos": infos})
+                                }
+                                "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                                "Runtime.evaluate" => json!({"result": {"value": 1}}),
+                                _ => json!({}),
+                            };
+                            let resp = json!({"id": id, "result": result});
+                            if ws.send(Message::Text(resp.to_string())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), conns, stop_tx)
+    }
+
+    /// Build a `ServerState` for a *registered* browser (named-tab routing
+    /// requires a stable identity) pointing at `endpoint`.
+    fn registered_state(name: &str, endpoint: &str) -> ServerState {
+        ServerState::new(ResolvedBrowser {
+            endpoint: endpoint.to_string(),
+            engine: Engine::Cdp,
+            source: Source::Registered { name: name.into() },
+        })
+    }
+
+    // Holds the synchronous ENV_LOCK across awaits on purpose: it serializes
+    // the whole env-mutating test against the rest of the suite.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_named_tab_live_resolves_and_touches() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
+
+        // Register a named tab whose target is live in the mock.
+        {
+            let reg = crate::registry::Registry::open().unwrap();
+            reg.tab_upsert("bx", "work", "T1", "about:blank", true)
+                .unwrap();
+        }
+
+        let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        let state = registered_state("bx", &url);
+
+        let target_id = match state.resolve_target_for_args(&json!({"tab": "work"})).await {
+            Ok((_backend, tid)) => tid,
+            Err(e) => panic!("named tab should resolve: {e:#}"),
+        };
+        assert_eq!(target_id, "T1");
+
+        std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+    }
+
+    // See note above: ENV_LOCK is intentionally held across awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_named_tab_stale_sweeps_and_errors() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
+
+        // Register a named tab whose target is NOT among the mock's live
+        // targets — the resolve must sweep the stale row and return
+        // TabNotFound.
+        {
+            let reg = crate::registry::Registry::open().unwrap();
+            reg.tab_upsert("bx", "gone", "T_DEAD", "about:blank", true)
+                .unwrap();
+        }
+
+        let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        let state = registered_state("bx", &url);
+
+        let err = match state.resolve_target_for_args(&json!({"tab": "gone"})).await {
+            Ok(_) => panic!("stale named tab must error"),
+            Err(e) => e,
+        };
+        let typed = err
+            .downcast_ref::<crate::errors::SessionError>()
+            .expect("typed SessionError");
+        assert!(
+            matches!(typed, crate::errors::SessionError::TabNotFound { .. }),
+            "expected TabNotFound, got {typed:?}"
+        );
+
+        // The stale row must have been swept.
+        let reg = crate::registry::Registry::open().unwrap();
+        assert!(reg.tab_get("bx", "gone").unwrap().is_none(), "row not swept");
+
+        std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+    }
+
+    // See note above: ENV_LOCK is intentionally held across awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_named_tab_missing_row_errors() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
+
+        let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        let state = registered_state("bx", &url);
+
+        let err = match state.resolve_target_for_args(&json!({"tab": "nope"})).await {
+            Ok(_) => panic!("unknown named tab must error"),
+            Err(e) => e,
+        };
+        let typed = err
+            .downcast_ref::<crate::errors::SessionError>()
+            .expect("typed SessionError");
+        assert!(
+            matches!(typed, crate::errors::SessionError::TabNotFound { .. }),
+            "expected TabNotFound, got {typed:?}"
+        );
+
+        std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn resolve_tab_and_target_mutually_exclusive() {
+        // No registry / backend needed: the guard fires first.
+        let state = dummy_state();
+        let err = match state
+            .resolve_target_for_args(&json!({"tab": "a", "target": "b"}))
+            .await
+        {
+            Ok(_) => panic!("tab+target must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_backend_opens_one_backend() {
+        // Fire many concurrent `ensure_backend` calls against a state whose
+        // double-checked lock must open exactly one backend (one WS
+        // connection to the mock). Guards future refactors of the lock.
+        let (url, conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        let state = ServerState::new(ResolvedBrowser {
+            endpoint: url,
+            engine: Engine::Cdp,
+            source: Source::External,
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = state.clone();
+            handles.push(tokio::spawn(async move { s.ensure_backend().await }));
+        }
+        for h in handles {
+            h.await.unwrap().expect("ensure_backend should succeed");
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "expected exactly one backend (one WS connection) under concurrency"
+        );
     }
 
     #[tokio::test]

@@ -870,164 +870,184 @@ fn make_snapshot() -> RegisteredTool {
     }
 }
 
-fn make_click() -> RegisteredTool {
-    RegisteredTool {
-        name: "browser_click".into(),
-        description: "Click an element matched by CSS selector. Chromium-only.".into(),
-        input_schema: json!({
+// ---------------------------------------------------------------------------
+// Table-driven sidecar interaction tools.
+//
+// click / type / hover / drag / press_key / wait_for all share one shape:
+// build a param map from a fixed set of args, forward to the sidecar, return a
+// fixed success string. Previously each tool declared its params *twice* — once
+// in the input schema (`tab_args_with`) and once in the handler (`copy_arg` per
+// param) — with no compiler link, so a schema param missing a matching
+// `copy_arg` was silently dropped before reaching the sidecar.
+//
+// `SidecarTool` is the single source of truth: each param's name + schema +
+// required-ness is declared once in `params`, and BOTH the input schema and the
+// param-forwarding are derived from it, so a param can't be in the schema but
+// missing from the wire (or vice versa).
+// ---------------------------------------------------------------------------
+
+/// One sidecar-forwarded parameter, declared once. Drives both the JSON schema
+/// (`schema`, `required`) and the runtime forwarding (`name`).
+struct SidecarParam {
+    name: &'static str,
+    schema: Value,
+    required: bool,
+}
+
+/// Declarative spec for a sidecar interaction tool. Both the input schema and
+/// the param-forwarding are derived from the single `params` slice.
+struct SidecarTool {
+    name: &'static str,
+    description: &'static str,
+    /// The sidecar RPC method (e.g. `"click"`).
+    method: &'static str,
+    params: Vec<SidecarParam>,
+    /// Fixed success message returned as text content.
+    success: &'static str,
+}
+
+impl SidecarTool {
+    fn build(self) -> RegisteredTool {
+        let SidecarTool {
+            name,
+            description,
+            method,
+            params,
+            success,
+        } = self;
+
+        // Schema: shared tab/target args plus this tool's params, with the
+        // `required` list derived from the same table.
+        let extra: Vec<(&str, Value)> = params
+            .iter()
+            .map(|p| (p.name, p.schema.clone()))
+            .collect();
+        let required: Vec<&str> = params
+            .iter()
+            .filter(|p| p.required)
+            .map(|p| p.name)
+            .collect();
+        let mut input_schema = json!({
             "type": "object",
-            "properties": tab_args_with(&[
-                ("selector", json!({"type": "string"})),
-                ("timeout_ms", json!({"type": "integer"})),
-            ]),
-            "required": ["selector"],
-        }),
-        handler: handler(|state, args| {
-            Box::pin(async move {
-                let mut params = serde_json::Map::new();
-                copy_arg(&args, "selector", &mut params);
-                copy_arg(&args, "timeout_ms", &mut params);
-                forward_to_sidecar(&state, "browser_click", &args, "click", params).await?;
-                Ok(text_content("clicked"))
-            })
-        }),
+            "properties": tab_args_with(&extra),
+        });
+        if !required.is_empty() {
+            input_schema["required"] = json!(required);
+        }
+
+        // Forwarding: copy exactly the params declared above — no second list
+        // to drift out of sync.
+        let param_names: Vec<&'static str> = params.iter().map(|p| p.name).collect();
+        RegisteredTool {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            handler: handler(move |state, args| {
+                let param_names = param_names.clone();
+                Box::pin(async move {
+                    let mut params = serde_json::Map::new();
+                    for key in &param_names {
+                        copy_arg(&args, key, &mut params);
+                    }
+                    forward_to_sidecar(&state, name, &args, method, params).await?;
+                    Ok(text_content(success))
+                })
+            }),
+        }
     }
+}
+
+fn make_click() -> RegisteredTool {
+    SidecarTool {
+        name: "browser_click",
+        description: "Click an element matched by CSS selector. Chromium-only.",
+        method: "click",
+        params: vec![
+            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: true },
+            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+        ],
+        success: "clicked",
+    }
+    .build()
 }
 
 fn make_type() -> RegisteredTool {
-    RegisteredTool {
-        name: "browser_type".into(),
+    SidecarTool {
+        name: "browser_type",
         description: "Type text into an input matched by CSS selector. \
                       `press_sequentially=true` simulates keystrokes; default uses fast `fill`. \
-                      Chromium-only."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": tab_args_with(&[
-                ("selector", json!({"type": "string"})),
-                ("text", json!({"type": "string"})),
-                ("press_sequentially", json!({"type": "boolean"})),
-                ("timeout_ms", json!({"type": "integer"})),
-            ]),
-            "required": ["selector", "text"],
-        }),
-        handler: handler(|state, args| {
-            Box::pin(async move {
-                let mut params = serde_json::Map::new();
-                copy_arg(&args, "selector", &mut params);
-                copy_arg(&args, "text", &mut params);
-                copy_arg(&args, "press_sequentially", &mut params);
-                copy_arg(&args, "timeout_ms", &mut params);
-                forward_to_sidecar(&state, "browser_type", &args, "type", params).await?;
-                Ok(text_content("typed"))
-            })
-        }),
+                      Chromium-only.",
+        method: "type",
+        params: vec![
+            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: true },
+            SidecarParam { name: "text", schema: json!({"type": "string"}), required: true },
+            SidecarParam { name: "press_sequentially", schema: json!({"type": "boolean"}), required: false },
+            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+        ],
+        success: "typed",
     }
+    .build()
 }
 
 fn make_hover() -> RegisteredTool {
-    RegisteredTool {
-        name: "browser_hover".into(),
-        description: "Hover an element matched by CSS selector. Chromium-only.".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": tab_args_with(&[
-                ("selector", json!({"type": "string"})),
-                ("timeout_ms", json!({"type": "integer"})),
-            ]),
-            "required": ["selector"],
-        }),
-        handler: handler(|state, args| {
-            Box::pin(async move {
-                let mut params = serde_json::Map::new();
-                copy_arg(&args, "selector", &mut params);
-                copy_arg(&args, "timeout_ms", &mut params);
-                forward_to_sidecar(&state, "browser_hover", &args, "hover", params).await?;
-                Ok(text_content("hovered"))
-            })
-        }),
+    SidecarTool {
+        name: "browser_hover",
+        description: "Hover an element matched by CSS selector. Chromium-only.",
+        method: "hover",
+        params: vec![
+            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: true },
+            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+        ],
+        success: "hovered",
     }
+    .build()
 }
 
 fn make_drag() -> RegisteredTool {
-    RegisteredTool {
-        name: "browser_drag".into(),
-        description: "Drag from one CSS-selected element to another. Chromium-only.".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": tab_args_with(&[
-                ("source_selector", json!({"type": "string"})),
-                ("target_selector", json!({"type": "string"})),
-            ]),
-            "required": ["source_selector", "target_selector"],
-        }),
-        handler: handler(|state, args| {
-            Box::pin(async move {
-                let mut params = serde_json::Map::new();
-                copy_arg(&args, "source_selector", &mut params);
-                copy_arg(&args, "target_selector", &mut params);
-                forward_to_sidecar(&state, "browser_drag", &args, "drag", params).await?;
-                Ok(text_content("dragged"))
-            })
-        }),
+    SidecarTool {
+        name: "browser_drag",
+        description: "Drag from one CSS-selected element to another. Chromium-only.",
+        method: "drag",
+        params: vec![
+            SidecarParam { name: "source_selector", schema: json!({"type": "string"}), required: true },
+            SidecarParam { name: "target_selector", schema: json!({"type": "string"}), required: true },
+        ],
+        success: "dragged",
     }
+    .build()
 }
 
 fn make_press_key() -> RegisteredTool {
-    RegisteredTool {
-        name: "browser_press_key".into(),
+    SidecarTool {
+        name: "browser_press_key",
         description: "Press a keyboard key (Playwright key name, e.g. 'Enter', 'Control+A'). \
-                      Chromium-only."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": tab_args_with(&[
-                ("key", json!({"type": "string"})),
-            ]),
-            "required": ["key"],
-        }),
-        handler: handler(|state, args| {
-            Box::pin(async move {
-                let mut params = serde_json::Map::new();
-                copy_arg(&args, "key", &mut params);
-                forward_to_sidecar(&state, "browser_press_key", &args, "press_key", params)
-                    .await?;
-                Ok(text_content("pressed"))
-            })
-        }),
+                      Chromium-only.",
+        method: "press_key",
+        params: vec![
+            SidecarParam { name: "key", schema: json!({"type": "string"}), required: true },
+        ],
+        success: "pressed",
     }
+    .build()
 }
 
 fn make_wait_for() -> RegisteredTool {
-    RegisteredTool {
-        name: "browser_wait_for".into(),
+    SidecarTool {
+        name: "browser_wait_for",
         description: "Wait for a condition: a selector reaching `state`, a URL matching \
                       `url_regex`, or the page reaching `load_state` (`load` / \
-                      `domcontentloaded` / `networkidle`). Chromium-only."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": tab_args_with(&[
-                ("selector", json!({"type": "string"})),
-                ("state", json!({"type": "string", "enum": ["attached", "detached", "visible", "hidden"]})),
-                ("url_regex", json!({"type": "string"})),
-                ("load_state", json!({"type": "string", "enum": ["load", "domcontentloaded", "networkidle"]})),
-                ("timeout_ms", json!({"type": "integer"})),
-            ]),
-        }),
-        handler: handler(|state, args| {
-            Box::pin(async move {
-                let mut params = serde_json::Map::new();
-                copy_arg(&args, "selector", &mut params);
-                copy_arg(&args, "state", &mut params);
-                copy_arg(&args, "url_regex", &mut params);
-                copy_arg(&args, "load_state", &mut params);
-                copy_arg(&args, "timeout_ms", &mut params);
-                forward_to_sidecar(&state, "browser_wait_for", &args, "wait_for", params).await?;
-                Ok(text_content("ok"))
-            })
-        }),
+                      `domcontentloaded` / `networkidle`). Chromium-only.",
+        method: "wait_for",
+        params: vec![
+            SidecarParam { name: "selector", schema: json!({"type": "string"}), required: false },
+            SidecarParam { name: "state", schema: json!({"type": "string", "enum": ["attached", "detached", "visible", "hidden"]}), required: false },
+            SidecarParam { name: "url_regex", schema: json!({"type": "string"}), required: false },
+            SidecarParam { name: "load_state", schema: json!({"type": "string", "enum": ["load", "domcontentloaded", "networkidle"]}), required: false },
+            SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
+        ],
+        success: "ok",
     }
+    .build()
 }
 
 fn make_pdf_save() -> RegisteredTool {
@@ -1369,5 +1389,103 @@ mod tests {
             }
             other => panic!("expected EngineUnsupported, got {other:?}"),
         }
+    }
+
+    // -- Behavioral handler arg-validation -----------------------------------
+    //
+    // These invoke the real handler closures (not just the static schema)
+    // against a `ServerState` whose endpoint is never reached, because the
+    // arg-validation / mutual-exclusion checks fire *before* any backend
+    // connection. No browser required.
+
+    use crate::cli::env_resolver::{ResolvedBrowser, Source};
+    use crate::detect::Engine;
+
+    /// Fetch a registered tool's handler by name.
+    fn handler_for(name: &str) -> ToolHandler {
+        let registry = ToolRegistry::new();
+        register_all(&registry);
+        registry
+            .handler(name)
+            .unwrap_or_else(|| panic!("tool {name} not registered"))
+    }
+
+    /// A `ServerState` bound to an endpoint that is never reached (the
+    /// handler errors during validation first). Marked CDP so we don't
+    /// trip the BiDi-lock path.
+    fn unreached_state() -> ServerState {
+        ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            // Port 0 never accepts; any attempt to open a backend would
+            // fail, but these tests assert the *validation* error fires
+            // first.
+            endpoint: "ws://127.0.0.1:0".into(),
+            source: Source::External,
+        })
+    }
+
+    #[tokio::test]
+    async fn navigate_missing_url_errors_before_backend() {
+        let h = handler_for("browser_navigate");
+        let err = h(unreached_state(), json!({}))
+            .await
+            .expect_err("missing url must error");
+        assert!(
+            err.to_string().contains("missing 'url'"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_missing_url_errors_before_backend() {
+        let h = handler_for("browser_fetch");
+        let err = h(unreached_state(), json!({"method": "GET"}))
+            .await
+            .expect_err("missing url must error");
+        assert!(
+            err.to_string().contains("missing 'url'"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_set_missing_value_errors_before_backend() {
+        let h = handler_for("browser_storage_set");
+        let err = h(unreached_state(), json!({"key": "k"}))
+            .await
+            .expect_err("missing value must error");
+        assert!(
+            err.to_string().contains("missing 'value'"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_get_missing_key_errors_before_backend() {
+        let h = handler_for("browser_storage_get");
+        let err = h(unreached_state(), json!({}))
+            .await
+            .expect_err("missing key must error");
+        assert!(
+            err.to_string().contains("missing 'key'"),
+            "got: {err:#}"
+        );
+    }
+
+    /// `tab` and `target` are mutually exclusive; the reject fires in
+    /// `resolve_target_for_args` before any backend connection.
+    #[tokio::test]
+    async fn navigate_tab_and_target_mutually_exclusive() {
+        let h = handler_for("browser_navigate");
+        let err = h(
+            unreached_state(),
+            json!({"url": "https://e.test/", "tab": "a", "target": "b"}),
+        )
+        .await
+        .expect_err("tab+target must error");
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "got: {err:#}"
+        );
     }
 }

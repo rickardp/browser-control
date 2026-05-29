@@ -62,23 +62,38 @@ pub async fn tab_open(
     // Fast path: named tab exists and is alive → maybe navigate, return.
     if let Some(requested_name) = name {
         if let Some(existing) = registry.tab_get(browser_name, requested_name)? {
+            let mut died_mid_navigate = false;
             if target_alive(backend, &existing.target_id).await? {
                 if !want_url.is_empty() && want_url != existing.last_url && url.is_some() {
-                    backend
-                        .navigate(&existing.target_id, want_url)
-                        .await
-                        .with_context(|| {
-                            format!("navigating {browser_name}/{requested_name} to {want_url}")
-                        })?;
-                    registry.tab_set_url(browser_name, requested_name, want_url)?;
+                    // Navigate-on-mismatch. The target was alive a moment
+                    // ago, but a probe-then-act race means it may have died
+                    // (crash/hang) between `target_alive` and here. A
+                    // recoverable tab failure must NOT surface raw at the
+                    // caller — fall through to the stale-row close+delete+
+                    // create path below, mirroring the eval/fetch/storage
+                    // contract enforced by `with_named_tab_recovery`.
+                    match backend.navigate(&existing.target_id, want_url).await {
+                        Ok(()) => {
+                            registry.tab_set_url(browser_name, requested_name, want_url)?;
+                        }
+                        Err(e) if is_tab_failure(&e) => died_mid_navigate = true,
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!("navigating {browser_name}/{requested_name} to {want_url}")
+                            });
+                        }
+                    }
                 } else {
                     registry.tab_touch(browser_name, requested_name)?;
                 }
-                return registry
-                    .tab_get(browser_name, requested_name)?
-                    .ok_or_else(|| anyhow!("tab row vanished between lookups"));
+                if !died_mid_navigate {
+                    return registry
+                        .tab_get(browser_name, requested_name)?
+                        .ok_or_else(|| anyhow!("tab row vanished between lookups"));
+                }
             }
-            // Stale row → close best-effort + delete + fall through to create.
+            // Stale row (probe failed) or the tab died mid-navigate → close
+            // best-effort + delete + fall through to create.
             let _ = backend.close_tab(&existing.target_id).await;
             registry.tab_delete(browser_name, requested_name)?;
         }

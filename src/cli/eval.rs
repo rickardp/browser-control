@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::routing::strip_tab;
 use crate::cli::trace::CommandTrace;
 use crate::registry::Registry;
 use crate::session::backend::open_backend;
@@ -39,7 +40,7 @@ pub async fn run(
     timeout_ms: u64,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("eval");
-    match run_inner(
+    let result = run_inner(
         browser,
         expression,
         target,
@@ -48,14 +49,8 @@ pub async fn run(
         timeout_ms,
         &mut trace,
     )
-    .await
-    {
-        Ok(()) => {
-            trace.ok(());
-            Ok(())
-        }
-        Err(e) => Err(trace.err(e)),
-    }
+    .await;
+    trace.finish(result)
 }
 
 async fn run_inner(
@@ -179,17 +174,6 @@ fn format_output(v: &Value, json: bool) -> String {
         s.to_string()
     } else {
         serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
-    }
-}
-
-/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
-fn strip_tab(raw: &str, tab: Option<&str>) -> String {
-    match tab {
-        Some(name) => raw
-            .strip_suffix(&format!("/{name}"))
-            .unwrap_or(raw)
-            .to_string(),
-        None => raw.to_string(),
     }
 }
 

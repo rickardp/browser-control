@@ -108,6 +108,20 @@ impl CommandTrace {
         err
     }
 
+    /// Combinator collapsing the `match result { Ok => ok; Err => err }`
+    /// boilerplate every command's entry point used to repeat. Emits the
+    /// closing line with the matching outcome and returns `result`
+    /// unchanged: `trace.finish(run_inner(...).await)`.
+    pub fn finish(self, result: anyhow::Result<()>) -> anyhow::Result<()> {
+        match result {
+            Ok(()) => {
+                self.ok(());
+                Ok(())
+            }
+            Err(e) => Err(self.err(e)),
+        }
+    }
+
     fn emit(&self, outcome: &'static str, err_msg: Option<&str>) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         tracing::info!(

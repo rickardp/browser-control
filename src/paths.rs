@@ -21,6 +21,13 @@ pub fn data_dir() -> Result<PathBuf> {
         if p.as_os_str().is_empty() {
             return Err(anyhow!("{} is set but empty", ENV_OVERRIDE));
         }
+        if !p.is_absolute() {
+            return Err(anyhow!(
+                "{} must be an absolute path (got {})",
+                ENV_OVERRIDE,
+                p.display()
+            ));
+        }
         return Ok(p);
     }
 
@@ -49,6 +56,13 @@ pub fn config_dir() -> Result<PathBuf> {
         let p = PathBuf::from(v);
         if p.as_os_str().is_empty() {
             return Err(anyhow!("{} is set but empty", CONFIG_ENV_OVERRIDE));
+        }
+        if !p.is_absolute() {
+            return Err(anyhow!(
+                "{} must be an absolute path (got {})",
+                CONFIG_ENV_OVERRIDE,
+                p.display()
+            ));
         }
         return Ok(p);
     }

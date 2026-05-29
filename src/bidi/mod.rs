@@ -1,25 +1,19 @@
 //! Minimal WebDriver BiDi WebSocket client.
+//!
+//! The socket / reader-task / writer-task / pending-correlation / timeout
+//! machinery lives in the shared [`crate::transport`] (`WsRpc`); this module
+//! supplies only the BiDi-specific framing/typing via the [`BidiProtocol`]
+//! adapter and the convenience methods.
 
 pub mod protocol;
 
 use anyhow::{anyhow, Result};
-use futures_util::{SinkExt, StreamExt};
 use protocol::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::errors::{is_bidi_target_gone, SessionError, TargetKind};
-
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const EVENT_CHANNEL_CAPACITY: usize = 256;
-
-/// Bound on `connect_async` during initial BiDi bringup; see the matching
-/// constant in `crate::cdp` for rationale.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::transport::{Decoded, Protocol, RequestError, WsRpc, REQUEST_TIMEOUT};
 
 /// Recognise the BiDi error returned when a fresh `session.new` is rejected
 /// because a session already exists on the browser. Firefox reports this as
@@ -34,128 +28,94 @@ fn is_session_already_active(err: &anyhow::Error) -> bool {
     false
 }
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, BidiError>>>>>;
-
 #[derive(Debug, Clone)]
 pub struct BidiEvent {
     pub method: String,
     pub params: Value,
 }
 
+/// BiDi framing/typing adapter for the shared transport.
+pub struct BidiProtocol;
+
+impl Protocol for BidiProtocol {
+    type ProtoError = BidiError;
+    type Event = BidiEvent;
+
+    fn encode_request(
+        id: u64,
+        method: &str,
+        params: Value,
+        _session_id: Option<&str>,
+    ) -> Result<String> {
+        let cmd = Command { id, method, params };
+        Ok(serde_json::to_string(&cmd)?)
+    }
+
+    fn decode_frame(text: &str) -> Decoded<BidiError, BidiEvent> {
+        match serde_json::from_str::<IncomingMessage>(text) {
+            Ok(IncomingMessage::Success { id, result }) => Decoded::Reply {
+                id,
+                result: Ok(result),
+            },
+            Ok(IncomingMessage::Error { id, error, message }) => match id {
+                Some(id) => Decoded::Reply {
+                    id,
+                    result: Err(BidiError {
+                        code: error,
+                        message,
+                    }),
+                },
+                // Id-less error frames can't be correlated to a request.
+                None => Decoded::Ignore,
+            },
+            Ok(IncomingMessage::Event { method, params }) => {
+                Decoded::Event(BidiEvent { method, params })
+            }
+            Err(_) => Decoded::Ignore,
+        }
+    }
+
+    fn closed_error() -> BidiError {
+        BidiError {
+            code: "connection closed".into(),
+            message: "BiDi connection closed".into(),
+        }
+    }
+}
+
 pub struct BidiClient {
-    next_id: Mutex<u64>,
-    pending: PendingMap,
-    events_tx: broadcast::Sender<BidiEvent>,
-    write_tx: mpsc::UnboundedSender<String>,
+    rpc: WsRpc<BidiProtocol>,
     session_id: Mutex<Option<String>>,
 }
 
 impl BidiClient {
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws, _resp) =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "BiDi WebSocket connect to {ws_url} timed out after {:?}",
-                        CONNECT_TIMEOUT
-                    )
-                })??;
-        let (mut sink, mut stream) = ws.split();
-
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
-        let (events_tx, _) = broadcast::channel::<BidiEvent>(EVENT_CHANNEL_CAPACITY);
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-
-        // Writer task.
-        tokio::spawn(async move {
-            while let Some(msg) = write_rx.recv().await {
-                if sink.send(Message::Text(msg)).await.is_err() {
-                    break;
-                }
-            }
-            let _ = sink.close().await;
-        });
-
-        // Reader task.
-        let pending_reader = pending.clone();
-        let events_reader = events_tx.clone();
-        tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                let text = match msg {
-                    Message::Text(t) => t,
-                    Message::Binary(b) => match String::from_utf8(b) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Message::Close(_) => break,
-                    _ => continue,
-                };
-                let parsed: Result<IncomingMessage, _> = serde_json::from_str(&text);
-                match parsed {
-                    Ok(IncomingMessage::Success { id, result }) => {
-                        if let Some(tx) = pending_reader.lock().await.remove(&id) {
-                            let _ = tx.send(Ok(result));
-                        }
-                    }
-                    Ok(IncomingMessage::Error { id, error, message }) => {
-                        if let Some(id) = id {
-                            if let Some(tx) = pending_reader.lock().await.remove(&id) {
-                                let _ = tx.send(Err(BidiError {
-                                    code: error,
-                                    message,
-                                }));
-                            }
-                        }
-                    }
-                    Ok(IncomingMessage::Event { method, params }) => {
-                        let _ = events_reader.send(BidiEvent { method, params });
-                    }
-                    Err(_) => continue,
-                }
-            }
-            pending_reader.lock().await.clear();
-        });
-
         Ok(Self {
-            next_id: Mutex::new(1),
-            pending,
-            events_tx,
-            write_tx,
+            rpc: WsRpc::connect(ws_url, "BiDi").await?,
             session_id: Mutex::new(None),
         })
     }
 
     pub async fn send(&self, method: &str, params: Value) -> Result<Value> {
-        let id = {
-            let mut guard = self.next_id.lock().await;
-            let id = *guard;
-            *guard += 1;
-            id
-        };
-        let cmd = Command { id, method, params };
-        let text = serde_json::to_string(&cmd)?;
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
-        self.write_tx
-            .send(text)
-            .map_err(|_| anyhow!("BiDi connection closed"))?;
-
-        match tokio::time::timeout(SEND_TIMEOUT, rx).await {
-            Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(classify_bidi_error(e)),
-            Ok(Err(_)) => Err(anyhow!("BiDi response channel cancelled")),
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                Err(anyhow!("BiDi send timed out after {:?}", SEND_TIMEOUT))
-            }
+        match self.rpc.request(method, params, None).await {
+            Ok(v) => Ok(v),
+            Err(RequestError::Protocol(e)) => Err(classify_bidi_error(e)),
+            Err(RequestError::Timeout) => Err(anyhow!(
+                "BiDi request {method} timed out after {:?}",
+                REQUEST_TIMEOUT
+            )),
+            Err(RequestError::Transport(e)) => Err(e),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BidiEvent> {
-        self.events_tx.subscribe()
+        self.rpc.subscribe()
+    }
+
+    /// Gracefully shut down the transport (flush writer, abort/join reader).
+    /// Dropping the client also aborts the tasks via `WsRpc`'s `Drop`.
+    pub async fn close(self) {
+        self.rpc.close().await;
     }
 
     pub async fn session_new(&self) -> Result<String> {
@@ -288,8 +248,10 @@ fn classify_bidi_error(err: BidiError) -> anyhow::Error {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
 
     async fn spawn_echo_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

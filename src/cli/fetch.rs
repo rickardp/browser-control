@@ -20,6 +20,7 @@ use serde_json::{json, Map, Value};
 
 use crate::cli::env_resolver::{self, Source};
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::routing::strip_tab;
 use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
@@ -44,17 +45,11 @@ pub async fn run(
     timeout_ms: u64,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("fetch");
-    match run_inner(
+    let result = run_inner(
         browser, url, method, headers, data, target, include, output, timeout_ms, &mut trace,
     )
-    .await
-    {
-        Ok(()) => {
-            trace.ok(());
-            Ok(())
-        }
-        Err(e) => Err(trace.err(e)),
-    }
+    .await;
+    trace.finish(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,17 +312,6 @@ fn write_file(path: &Path, body: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to chmod 600 {}", path.display()))?;
     }
     Ok(())
-}
-
-/// Strip `/<tab>` suffix from a raw `<browser>[/<tab>]` positional.
-fn strip_tab(raw: &str, tab: Option<&str>) -> String {
-    match tab {
-        Some(name) => raw
-            .strip_suffix(&format!("/{name}"))
-            .unwrap_or(raw)
-            .to_string(),
-        None => raw.to_string(),
-    }
 }
 
 #[cfg(test)]

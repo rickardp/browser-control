@@ -45,7 +45,9 @@ pub struct BrowserRow {
 /// `CREATE TABLE` / `CREATE INDEX` against a concurrent first open.
 pub struct Registry {
     conn: rusqlite::Connection,
-    #[allow(dead_code)]
+    /// Path the registry was opened at. Read by `bidi_lock_acquire` to
+    /// stamp the `BidiLockGuard`, whose `Drop` reopens a fresh connection
+    /// here to release the row (the guard outlives the borrowing handle).
     db_path: PathBuf,
 }
 
@@ -309,9 +311,13 @@ fn parse_engine(s: &str) -> Result<Engine> {
 
 /// Liveness check: PID exists AND a TCP connect to the local port succeeds.
 pub fn is_alive(row: &BrowserRow) -> bool {
+    let pid = sysinfo::Pid::from_u32(row.pid);
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    if sys.process(sysinfo::Pid::from_u32(row.pid)).is_none() {
+    // Refresh only the target PID rather than the whole process table:
+    // these run per-row in `list_alive`/`first_alive_by_kind`/etc., and we
+    // only ever query this one PID below.
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    if sys.process(pid).is_none() {
         return false;
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], row.port));
@@ -322,9 +328,12 @@ pub fn is_alive(row: &BrowserRow) -> bool {
 /// stale-row eviction in `scratches`, `tabs`, and `bidi_locks` to avoid
 /// keeping rows registered to a crashed CLI process.
 pub fn pid_alive(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+    // Refresh only this PID, not the entire process table — this is hit
+    // per-row by stale-row eviction across scratches/tabs/bidi_locks.
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).is_some()
 }
 
 /// Current Unix epoch seconds.

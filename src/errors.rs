@@ -2,18 +2,6 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-pub enum BrowserControlError {
-    #[error("browser not found: {0}")]
-    NotFound(String),
-    #[error("no running browser matches the selector")]
-    NoRunningMatch,
-    #[error("invalid BROWSER_CONTROL value: {0}")]
-    InvalidSelector(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
 /// Typed errors raised from the page-session layer so callers (and tests) can
 /// pattern-match on the failure category — in particular, `TabHung` is the
 /// catch-all for the alive-but-unresponsive renderer case that has no

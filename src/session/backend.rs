@@ -30,6 +30,15 @@ use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::errors::SessionError;
 
+/// Wall-clock bound for `navigate`/`screenshot`. `evaluate` takes its
+/// timeout from the caller (op-specific budgets), but navigate/screenshot
+/// have no caller-supplied budget, so they default to this. Picked below
+/// the 30s CDP `REQUEST_TIMEOUT` so a wedged op surfaces as a typed,
+/// *recoverable* `TabHung`/`TabCrashed` before the client's generic
+/// "CDP request timed out" string (which is not in the recoverable needle
+/// list) can fire and defeat recover-once.
+const NAV_OP_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Engine-agnostic tab operations. Two variants because CDP and BiDi
 /// have different protocols and clients; the methods abstract over the
 /// difference.
@@ -98,9 +107,27 @@ impl TabBackend {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("attachToTarget returned no sessionId"))?
                     .to_string();
-                let result = c
-                    .send_with_session("Page.navigate", json!({ "url": url }), Some(&session_id))
+                // Enable the Inspector domain so `Inspector.targetCrashed`
+                // is delivered while the navigate is in flight. Best-effort,
+                // same rationale as `evaluate`.
+                let _ = c
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
                     .await;
+                let inner = async {
+                    c.send_with_session("Page.navigate", json!({ "url": url }), Some(&session_id))
+                        .await
+                };
+                // Bound by timeout + renderer-crash detection so a wedged
+                // navigate surfaces as recoverable `TabHung`/`TabCrashed`
+                // (recover-once), not a 30s non-recoverable client timeout.
+                let result = crate::session::crash::evaluate_with_crash_detection(
+                    c,
+                    target_id,
+                    Some(&session_id),
+                    inner,
+                    Some(NAV_OP_TIMEOUT),
+                )
+                .await;
                 let _ = c
                     .send(
                         "Target.detachFromTarget",
@@ -111,8 +138,22 @@ impl TabBackend {
                 Ok(())
             }
             TabBackend::Bidi(c) => {
-                c.browsing_context_navigate(target_id, url).await?;
-                Ok(())
+                // BiDi has no crash event; a wedged navigate must still be
+                // bounded so it surfaces as recoverable `TabHung` rather
+                // than the 30s client `SEND_TIMEOUT`. A dead context comes
+                // back as `no such context` which the `TargetGone`
+                // classifier already treats as recoverable.
+                let fut = c.browsing_context_navigate(target_id, url);
+                match tokio::time::timeout(NAV_OP_TIMEOUT, fut).await {
+                    Ok(r) => r.map(|_| ()),
+                    Err(_) => Err(SessionError::TabHung {
+                        target_id: Some(target_id.to_string()),
+                        url: Some(url.to_string()),
+                        timeout_ms: NAV_OP_TIMEOUT.as_millis() as u64,
+                        hint: "op-timeout",
+                    }
+                    .into()),
+                }
             }
         }
     }
@@ -300,8 +341,14 @@ impl TabBackend {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("attachToTarget returned no sessionId"))?
                     .to_string();
-                let v = c
-                    .send_with_session(
+                // Enable the Inspector domain so `Inspector.targetCrashed`
+                // is delivered while the capture is in flight. Best-effort,
+                // same rationale as `evaluate`.
+                let _ = c
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
+                    .await;
+                let inner = async {
+                    c.send_with_session(
                         "Page.captureScreenshot",
                         json!({
                             "format": "png",
@@ -309,7 +356,19 @@ impl TabBackend {
                         }),
                         Some(&session_id),
                     )
-                    .await;
+                    .await
+                };
+                // Bound by timeout + renderer-crash detection so a wedged
+                // capture surfaces as recoverable `TabHung`/`TabCrashed`,
+                // not a 30s non-recoverable client timeout.
+                let v = crate::session::crash::evaluate_with_crash_detection(
+                    c,
+                    target_id,
+                    Some(&session_id),
+                    inner,
+                    Some(NAV_OP_TIMEOUT),
+                )
+                .await;
                 let _ = c
                     .send(
                         "Target.detachFromTarget",
@@ -324,7 +383,17 @@ impl TabBackend {
             }
             TabBackend::Bidi(c) => {
                 let _ = full_page; // BiDi captures the viewport by default
-                c.browsing_context_capture_screenshot(target_id).await
+                let fut = c.browsing_context_capture_screenshot(target_id);
+                match tokio::time::timeout(NAV_OP_TIMEOUT, fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(SessionError::TabHung {
+                        target_id: Some(target_id.to_string()),
+                        url: None,
+                        timeout_ms: NAV_OP_TIMEOUT.as_millis() as u64,
+                        hint: "op-timeout",
+                    }
+                    .into()),
+                }
             }
         }
     }
