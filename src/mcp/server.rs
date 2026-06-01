@@ -61,6 +61,16 @@ pub struct ServerState {
     /// Sidecar config (Playwright version override etc.) — set once at
     /// server startup from CLI args, read on each sidecar spawn.
     pub sidecar_config: crate::sidecar::SidecarConfig,
+    /// Operation barrier. Non-exclusive tool calls acquire a **read**
+    /// guard so they can run concurrently; `switch_browser` acquires a
+    /// **write** guard which waits for all in-flight tool operations to
+    /// finish, preventing the old backend / BiDi session from being
+    /// torn down while another tool is still using it.
+    ///
+    /// `browser_select` is the only tool that needs exclusive access
+    /// (via `switch_browser`); `handle_tools_call` skips the read
+    /// guard for it to avoid deadlocking with its own write guard.
+    pub op_barrier: Arc<RwLock<()>>,
 }
 
 /// Three-state cache: `Pending` until first tool call attempts acquire;
@@ -93,6 +103,7 @@ impl ServerState {
             active_target_id: Arc::new(Mutex::new(None)),
             sidecar: Arc::new(Mutex::new(None)),
             sidecar_config,
+            op_barrier: Arc::new(RwLock::new(())),
         }
     }
 
@@ -285,6 +296,12 @@ impl ServerState {
     /// then installs the new browser and re-acquires the BiDi lock if
     /// the new one needs it. The next stateful tool call lazy-opens the
     /// new backend.
+    ///
+    /// # Concurrency
+    /// The caller must hold a **write** guard on [`Self::op_barrier`] to
+    /// ensure no concurrent tool call is still using the old backend.
+    /// [`handle_tools_call`] acquires the write guard for `browser_select`
+    /// before invoking this method.
     pub async fn switch_browser(&self, new_browser: ResolvedBrowser) -> Result<()> {
         // Close the cached BiDi session if any (best-effort).
         {
@@ -639,6 +656,12 @@ fn handle_tools_list(id: Value, tools: &ToolRegistry) -> Vec<u8> {
 /// so the read loop stays responsive while a slow op (30s BiDi lock,
 /// sidecar `npm install`, 30s CDP timeout) runs; the completed frame is
 /// sent to the single writer task, preserving serialized stdout writes.
+///
+/// Concurrency guard: `browser_select` (which calls `switch_browser`)
+/// acquires a **write** guard on `state.op_barrier`, blocking until all
+/// concurrent tool calls finish. Every other tool acquires a **read**
+/// guard, ensuring they cannot overlap with the destructive browser
+/// switch.
 fn handle_tools_call(
     id: Value,
     params: &Value,
@@ -655,20 +678,32 @@ fn handle_tools_call(
     let handler = tools.handler(&name);
     let state = state.clone();
     let tx = tx.clone();
+    let barrier = state.op_barrier.clone();
+    let is_exclusive = name == "browser_select";
     tokio::spawn(async move {
         let frame = match handler {
             // An unknown tool name is bad params, not a tool
             // failure: keep it a genuine `-32602` protocol error.
             None => error_frame(id, -32602, &format!("tool not found: {name}")),
-            Some(h) => match h(state, args).await {
-                Ok(v) => result_frame(id, v),
-                // A tool *executing* and failing is not a protocol
-                // fault: per the MCP spec it is a successful result
-                // carrying `isError: true` so the agent can read
-                // the message and recover, rather than treating it
-                // as a transport error.
-                Err(e) => tool_error_frame(id, &e),
-            },
+            Some(h) => {
+                if is_exclusive {
+                    // Wait for every in-flight non-exclusive tool call
+                    // to finish, then hold the write guard for the
+                    // entire handler so no new tool call can start
+                    // until the switch is complete.
+                    let _guard = barrier.write().await;
+                    match h(state, args).await {
+                        Ok(v) => result_frame(id, v),
+                        Err(e) => tool_error_frame(id, &e),
+                    }
+                } else {
+                    let _guard = barrier.read().await;
+                    match h(state, args).await {
+                        Ok(v) => result_frame(id, v),
+                        Err(e) => tool_error_frame(id, &e),
+                    }
+                }
+            }
         };
         let _ = tx.send(frame);
     });

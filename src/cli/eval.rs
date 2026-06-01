@@ -56,6 +56,7 @@ pub async fn run(
     trace.finish(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     browser: Option<String>,
     expression: String,

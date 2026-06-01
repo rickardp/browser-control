@@ -931,8 +931,12 @@ async fn forward_to_sidecar(
     sidecar_method: &str,
     mut params: serde_json::Map<String, Value>,
 ) -> Result<Value> {
-    let (_, target_id) = state.resolve_target_for_args(args).await?;
+    // Preflight: check engine support before resolving the target.
+    // `ensure_sidecar` returns `EngineUnsupported` on BiDi browsers;
+    // calling it first avoids opening a backend / creating a tab
+    // only to discard it.
     let sc = state.ensure_sidecar(tool_name).await?;
+    let (_, target_id) = state.resolve_target_for_args(args).await?;
     params.insert("target_id".into(), Value::String(target_id));
     sc.call(sidecar_method, Value::Object(params)).await
 }

@@ -224,6 +224,7 @@ async fn evaluate_routed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_get(
     browser: Option<String>,
     key: Option<String>,
