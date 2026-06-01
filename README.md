@@ -250,6 +250,12 @@ full values and is `chmod 0600` on Unix. `--format netscape` produces a file
 byte-compatible with the Mozilla `cookies.txt` format (see
 [docs/session-ops.md](docs/session-ops.md)).
 
+Page-context reads that commonly surface auth state (`fetch`, `eval`,
+`storage get`, `storage list`, and `wait-for-cookie --validate-url`) reload
+HTTP(S) pages whose document is older than 10 minutes before evaluating, so
+SSO has a chance to refresh tokens. Override with `--max-age 1h`, `--max-age
+30s`, etc.
+
 ### `fetch`
 
 Run an HTTP request from inside the page's JavaScript context. Cookies,

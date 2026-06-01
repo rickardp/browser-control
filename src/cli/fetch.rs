@@ -23,6 +23,7 @@ use serde_json::{json, Map, Value};
 use crate::cli::route;
 use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
+use crate::session::freshness;
 use crate::session::{evaluate_for_origin_with_recover_once, PageSession};
 
 // The default fetch timeout (60 000 ms) is set on the CLI flag in
@@ -41,10 +42,12 @@ pub async fn run(
     include: bool,
     output: Option<PathBuf>,
     timeout_ms: u64,
+    max_age: String,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("fetch");
     let result = run_inner(
-        browser, url, method, headers, data, target, include, output, timeout_ms, &mut trace,
+        browser, url, method, headers, data, target, include, output, timeout_ms, max_age,
+        &mut trace,
     )
     .await;
     trace.finish(result)
@@ -61,11 +64,13 @@ async fn run_inner(
     include: bool,
     output: Option<PathBuf>,
     timeout_ms: u64,
+    max_age: String,
     trace: &mut CommandTrace,
 ) -> Result<()> {
     let header_map = parse_headers(&headers)?;
     let expr = build_fetch_expr(&url, &method, &header_map, data.as_deref())?;
     let fetch_timeout = Duration::from_millis(timeout_ms);
+    let max_age = freshness::parse_max_age(&max_age)?;
 
     // Path-syntax parsing: `<browser>` or `<browser>/<tab>` in the
     // positional. `--target <regex>` and `/<tab>` are mutually exclusive.
@@ -86,7 +91,10 @@ async fn run_inner(
                 "named tabs (`<browser>/<name>`) require a registered browser",
                 move |b, target_id| {
                     let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, true, fetch_timeout).await }
+                    async move {
+                        b.ensure_fresh(&target_id, max_age).await?;
+                        b.evaluate(&target_id, &expr, true, fetch_timeout).await
+                    }
                 },
             )
             .await?
@@ -96,6 +104,7 @@ async fn run_inner(
             trace.route("target-regex");
             let session =
                 PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?;
+            session.ensure_fresh(max_age).await?;
             let value = session
                 .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
                 .await;
@@ -119,6 +128,7 @@ async fn run_inner(
                 &expr,
                 true,
                 fetch_timeout,
+                max_age,
             )
             .await?
         }

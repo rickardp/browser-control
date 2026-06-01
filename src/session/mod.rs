@@ -9,6 +9,7 @@
 pub mod attach;
 pub mod backend;
 pub mod crash;
+pub mod freshness;
 pub mod scratch;
 pub mod tabs;
 pub mod targets;

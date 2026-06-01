@@ -3,7 +3,7 @@ status: Active
 date: 2026-05-22
 ---
 
-# ADR-002: Stay daemonless — bound the direct CLI path instead
+# ADR-002: CLI lifecycle with bounded browser operations
 
 ## Context
 
@@ -107,7 +107,7 @@ and the costs (IPC, capnp toolchain, bringup state machine, upgrade
 dance, lifetime-cross-platform-daemon-care) plus the "no idle work"
 product rule rule it out.
 
-### Option B — Daemonless direct-CLI path
+### Option B — Short-lived CLI lifecycle
 
 No long-lived process. Every CLI invocation opens a fresh upstream
 connection, does its work, and exits. Address the three motivating

@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -30,6 +30,7 @@ use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::cli::cookies::{normalize_bidi, normalize_cdp, NormalCookie};
 use crate::errors::SessionError;
+use crate::session::freshness;
 use crate::session::targets::{BidiContext, CdpTarget};
 
 /// Wall-clock bound for `navigate`/`screenshot`. `evaluate` takes its
@@ -157,6 +158,62 @@ impl TabBackend {
                     .into()),
                 }
             }
+        }
+    }
+
+    /// Reload an old HTTP(S) tab before reading auth-sensitive page state.
+    ///
+    /// The age is measured from the document's `performance.timeOrigin`.
+    /// Non-web pages such as `about:blank` are left untouched.
+    pub async fn ensure_fresh(&self, target_id: &str, max_age: Duration) -> Result<()> {
+        let info_value = self
+            .evaluate(
+                target_id,
+                freshness::PAGE_FRESHNESS_EXPR,
+                false,
+                freshness::CHECK_TIMEOUT,
+            )
+            .await?;
+        let info = freshness::parse_page_freshness(info_value)?;
+        if !info.should_reload(max_age) {
+            return Ok(());
+        }
+
+        tracing::info!(
+            target = "session",
+            target_id = %target_id,
+            url = %info.href,
+            age_ms = info.age_ms,
+            max_age_ms = max_age.as_millis(),
+            "reloading stale tab before reading page context"
+        );
+        self.navigate(target_id, &info.href).await?;
+        self.wait_until_ready(target_id).await
+    }
+
+    async fn wait_until_ready(&self, target_id: &str) -> Result<()> {
+        let deadline = Instant::now() + freshness::RELOAD_READY_TIMEOUT;
+        loop {
+            let value = self
+                .evaluate(
+                    target_id,
+                    freshness::READY_STATE_EXPR,
+                    false,
+                    freshness::CHECK_TIMEOUT,
+                )
+                .await?;
+            if freshness::is_ready(&value) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target = "session",
+                    target_id = %target_id,
+                    "tab reload did not reach document.readyState=complete before continuing"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(freshness::READY_POLL_INTERVAL).await;
         }
     }
 
@@ -493,7 +550,8 @@ pub async fn open_backend(endpoint: &str, engine: crate::detect::Engine) -> Resu
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
-    use tokio::sync::oneshot;
+    use std::sync::Arc;
+    use tokio::sync::{oneshot, Mutex};
     use tokio_tungstenite::tungstenite::Message;
 
     // CDP and BiDi each have their own mock-server tests in lower-level
@@ -654,6 +712,60 @@ mod tests {
         (format!("ws://{addr}"), stop_tx)
     }
 
+    async fn spawn_cdp_freshness_mock() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let navigations = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn({
+            let navigations = navigations.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("");
+                    let result = match method {
+                        "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                        "Target.detachFromTarget" => json!({}),
+                        "Inspector.enable" => json!({}),
+                        "Runtime.evaluate" => {
+                            let expression = req
+                                .pointer("/params/expression")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let value = if expression == freshness::PAGE_FRESHNESS_EXPR {
+                                json!({
+                                    "href": "https://example.com/app",
+                                    "ageMs": 700_000.0,
+                                    "readyState": "complete"
+                                })
+                            } else if expression == freshness::READY_STATE_EXPR {
+                                json!("complete")
+                            } else {
+                                json!(7)
+                            };
+                            json!({"result": {"value": value}})
+                        }
+                        "Page.navigate" => {
+                            let url = req
+                                .pointer("/params/url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            navigations.lock().await.push(url);
+                            json!({})
+                        }
+                        _ => json!({}),
+                    };
+                    let resp = json!({"id": id, "result": result});
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        (format!("ws://{addr}"), navigations)
+    }
+
     #[tokio::test]
     async fn cdp_backend_create_close_navigate_list_evaluate() {
         let (url, _stop) = spawn_cdp_mock().await;
@@ -673,6 +785,22 @@ mod tests {
         backend.close_tab(&t1).await.unwrap();
         let live = backend.live_target_ids().await.unwrap();
         assert!(!live.contains(&t1));
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_reloads_old_http_page() {
+        let (url, navigations) = spawn_cdp_freshness_mock().await;
+        let backend = open_backend(&url, crate::detect::Engine::Cdp)
+            .await
+            .unwrap();
+        backend
+            .ensure_fresh("T1", Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(
+            *navigations.lock().await,
+            vec!["https://example.com/app".to_string()]
+        );
     }
 
     #[tokio::test]

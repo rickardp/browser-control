@@ -6,7 +6,7 @@
 //! by a long-lived BiDi client via [`PageSession::from_bidi_cache`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
@@ -16,6 +16,7 @@ use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::detect::Engine;
 use crate::errors::SessionError;
+use crate::session::freshness;
 use crate::session::targets::{open_bidi, open_cdp, BidiContext, CdpTarget};
 
 /// A bound page-level session. Variants are not constructed directly outside
@@ -263,6 +264,59 @@ impl PageSession {
         }
     }
 
+    /// Reload an old HTTP(S) page before reading auth-sensitive page state.
+    ///
+    /// The age is measured from the document's `performance.timeOrigin`.
+    /// `about:blank`, `chrome://`, `devtools://`, and other non-web pages are
+    /// left untouched.
+    pub async fn ensure_fresh(&self, max_age: Duration) -> Result<()> {
+        let info_value = self
+            .evaluate_with_timeout(
+                freshness::PAGE_FRESHNESS_EXPR,
+                false,
+                Some(freshness::CHECK_TIMEOUT),
+            )
+            .await?;
+        let info = freshness::parse_page_freshness(info_value)?;
+        if !info.should_reload(max_age) {
+            return Ok(());
+        }
+
+        tracing::info!(
+            target = "session",
+            url = %info.href,
+            age_ms = info.age_ms,
+            max_age_ms = max_age.as_millis(),
+            "reloading stale page before reading page context"
+        );
+        tokio::time::timeout(freshness::RELOAD_READY_TIMEOUT, self.navigate(&info.href)).await??;
+        self.wait_until_ready().await
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + freshness::RELOAD_READY_TIMEOUT;
+        loop {
+            let value = self
+                .evaluate_with_timeout(
+                    freshness::READY_STATE_EXPR,
+                    false,
+                    Some(freshness::CHECK_TIMEOUT),
+                )
+                .await?;
+            if freshness::is_ready(&value) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target = "session",
+                    "page reload did not reach document.readyState=complete before continuing"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(freshness::READY_POLL_INTERVAL).await;
+        }
+    }
+
     /// Capture a PNG screenshot of the current page; returns base64 data.
     pub async fn screenshot(&self, full_page: bool) -> Result<String> {
         match self {
@@ -329,6 +383,7 @@ pub async fn evaluate_for_origin_with_recover_once(
     expression: &str,
     await_promise: bool,
     timeout: Duration,
+    max_age: Duration,
 ) -> Result<Value> {
     let first = evaluate_for_origin_once(
         endpoint,
@@ -337,6 +392,7 @@ pub async fn evaluate_for_origin_with_recover_once(
         expression,
         await_promise,
         timeout,
+        max_age,
     )
     .await;
     match first {
@@ -353,6 +409,7 @@ pub async fn evaluate_for_origin_with_recover_once(
                 expression,
                 await_promise,
                 timeout,
+                max_age,
             )
             .await
         }
@@ -367,8 +424,10 @@ async fn evaluate_for_origin_once(
     expression: &str,
     await_promise: bool,
     timeout: Duration,
+    max_age: Duration,
 ) -> Result<Value> {
     let session = PageSession::attach_for_origin(endpoint, engine, origin_url).await?;
+    session.ensure_fresh(max_age).await?;
     let result = session
         .evaluate_with_timeout(expression, await_promise, Some(timeout))
         .await;
@@ -699,7 +758,24 @@ mod tests {
                                 }
                                 "Target.detachFromTarget" => json!({}),
                                 "Inspector.enable" => json!({}),
-                                "Runtime.evaluate" => json!({"result": {"value": "ok"}}),
+                                "Runtime.evaluate" => {
+                                    let expression = req
+                                        .pointer("/params/expression")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let value = if expression == freshness::READY_STATE_EXPR {
+                                        json!("complete")
+                                    } else if expression == freshness::PAGE_FRESHNESS_EXPR {
+                                        json!({
+                                            "href": "https://example.com/login",
+                                            "ageMs": 0.0,
+                                            "readyState": "complete"
+                                        })
+                                    } else {
+                                        json!("ok")
+                                    };
+                                    json!({"result": {"value": value}})
+                                }
                                 _ => json!({}),
                             };
                             let resp = json!({"id": id, "result": result});
@@ -777,6 +853,7 @@ mod tests {
             "1+1",
             true,
             Duration::from_secs(1),
+            freshness::DEFAULT_MAX_AGE,
         )
         .await
         .unwrap();
@@ -802,6 +879,7 @@ mod tests {
             "1+1",
             true,
             Duration::from_secs(1),
+            freshness::DEFAULT_MAX_AGE,
         )
         .await
         .unwrap();

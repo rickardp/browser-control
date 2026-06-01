@@ -149,6 +149,30 @@ fn help_lists_all_subcommands() {
     ] {
         assert!(s.contains(cmd), "missing subcommand {cmd} in:\n{s}");
     }
+    assert!(
+        s.contains("--agent-instructions"),
+        "missing --agent-instructions in:\n{s}"
+    );
+}
+
+#[test]
+fn agent_instructions_print_canonical_guidance() {
+    let out = Command::new(assert_cmd::cargo::cargo_bin("browser-control"))
+        .args(["--agent-instructions"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "failed: {:?}", out);
+    let s = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "browser-control agent instructions",
+        "prefer them over shell commands",
+        "browser_tab_list",
+        "browser-control tab open",
+        "browser_fetch",
+        "wait-for-cookie",
+    ] {
+        assert!(s.contains(expected), "missing {expected} in:\n{s}");
+    }
 }
 
 #[test]

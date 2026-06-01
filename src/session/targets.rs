@@ -41,14 +41,19 @@ pub(crate) struct CdpTarget {
 }
 
 impl CdpTarget {
-    /// Parse the `type == "page"` entries from a `Target.getTargets` /
-    /// `list_targets` result, skipping any entry that fails to deserialize
-    /// (e.g. missing `targetId`).
+    /// Parse user-facing `type == "page"` entries from a `Target.getTargets`
+    /// / `list_targets` result, skipping any entry that fails to deserialize
+    /// (e.g. missing `targetId`) and Chromium DevTools frontend pages.
     pub(crate) fn pages(targets: &[Value]) -> impl Iterator<Item = CdpTarget> + '_ {
         targets
             .iter()
             .filter_map(|t| CdpTarget::deserialize(t).ok())
             .filter(|t| t.kind == "page")
+            .filter(|t| !t.is_devtools_frontend())
+    }
+
+    fn is_devtools_frontend(&self) -> bool {
+        self.url.starts_with("devtools://") || self.url.starts_with("chrome-devtools://")
     }
 }
 
@@ -197,6 +202,20 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].id, "a");
         assert_eq!(out[1].id, "c");
+    }
+
+    #[tokio::test]
+    async fn list_cdp_filters_devtools_frontend_pages() {
+        let url = spawn_cdp_mock(vec![
+            json!({"targetId":"devtools","type":"page","url":"devtools://devtools/bundled/devtools_app.html?remoteBase=https://devtools.example/serve_file/very-long","title":"DevTools - 127.0.0.1:5174/pages"}),
+            json!({"targetId":"chrome-devtools","type":"page","url":"chrome-devtools://devtools/bundled/inspector.html","title":"DevTools"}),
+            json!({"targetId":"app","type":"page","url":"https://example.com/","title":"Example"}),
+        ])
+        .await;
+        let out = list(&url, Engine::Cdp, None).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "app");
+        assert_eq!(out[0].url, "https://example.com/");
     }
 
     #[tokio::test]

@@ -29,6 +29,7 @@ use crate::cli::env_resolver::Source;
 use crate::cli::route;
 use crate::cli::trace::CommandTrace;
 use crate::session::backend::open_backend;
+use crate::session::freshness;
 use crate::session::{with_scratch_recovery, PageSession};
 
 pub async fn run(
@@ -38,6 +39,7 @@ pub async fn run(
     json: bool,
     await_promise: bool,
     timeout_ms: u64,
+    max_age: String,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("eval");
     let result = run_inner(
@@ -47,6 +49,7 @@ pub async fn run(
         json,
         await_promise,
         timeout_ms,
+        max_age,
         &mut trace,
     )
     .await;
@@ -60,9 +63,11 @@ async fn run_inner(
     json: bool,
     await_promise: bool,
     timeout_ms: u64,
+    max_age: String,
     trace: &mut CommandTrace,
 ) -> Result<()> {
     let timeout = Duration::from_millis(timeout_ms);
+    let max_age = freshness::parse_max_age(&max_age)?;
 
     let r = route::preamble(browser, target.as_deref(), trace).await?;
     let resolved = &r.resolved;
@@ -80,7 +85,10 @@ async fn run_inner(
                  external endpoints can't carry tab names",
                 move |b, target_id| {
                     let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, await_promise, timeout).await }
+                    async move {
+                        b.ensure_fresh(&target_id, max_age).await?;
+                        b.evaluate(&target_id, &expr, await_promise, timeout).await
+                    }
                 },
             )
             .await?
@@ -95,6 +103,7 @@ async fn run_inner(
                 trace.route("direct");
                 let session =
                     PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+                session.ensure_fresh(max_age).await?;
                 let value = session
                     .evaluate_with_timeout(&expression, await_promise, Some(timeout))
                     .await;
@@ -110,7 +119,10 @@ async fn run_inner(
                 let expr = expression.clone();
                 with_scratch_recovery(&backend, &r.registry, &browser_name, move |b, target_id| {
                     let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, await_promise, timeout).await }
+                    async move {
+                        b.ensure_fresh(&target_id, max_age).await?;
+                        b.evaluate(&target_id, &expr, await_promise, timeout).await
+                    }
                 })
                 .await?
             }
@@ -120,6 +132,7 @@ async fn run_inner(
             trace.route("target-regex");
             let session =
                 PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
+            session.ensure_fresh(max_age).await?;
             let value = session
                 .evaluate_with_timeout(&expression, await_promise, Some(timeout))
                 .await;

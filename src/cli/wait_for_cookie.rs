@@ -24,6 +24,7 @@ use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
 use crate::registry::Registry;
 use crate::session::evaluate_for_origin_with_recover_once;
+use crate::session::freshness;
 
 /// Per-fetch timeout when `--validate-url` drives a `fetch()` from the
 /// page context. 30 s catches a wedged renderer; the outer polling loop
@@ -37,6 +38,7 @@ pub async fn run(
     timeout: u64,
     poll_interval: u64,
     validate_url: Option<String>,
+    max_age: String,
 ) -> Result<()> {
     let mut trace = CommandTrace::new("wait-for-cookie");
     let result: Result<()> = async {
@@ -96,7 +98,8 @@ pub async fn run(
         eprintln!("cookie {} appeared on {}", matched.name, matched.domain);
 
         if let Some(url) = validate_url {
-            run_validate_url(&resolved, &url, &mut trace).await?;
+            let max_age = freshness::parse_max_age(&max_age)?;
+            run_validate_url(&resolved, &url, max_age, &mut trace).await?;
         } else {
             // No validate-url; only the cookie poll ran (browser-wide).
             trace.route("poll");
@@ -115,6 +118,7 @@ pub async fn run(
 async fn run_validate_url(
     resolved: &crate::cli::env_resolver::ResolvedBrowser,
     url: &str,
+    max_age: Duration,
     trace: &mut CommandTrace,
 ) -> Result<()> {
     let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
@@ -128,6 +132,7 @@ async fn run_validate_url(
         &expr,
         true,
         VALIDATE_TIMEOUT,
+        max_age,
     )
     .await?;
 
@@ -216,7 +221,22 @@ mod tests {
                         "Target.detachFromTarget" => json!({}),
                         "Inspector.enable" => json!({}),
                         "Runtime.evaluate" => {
-                            json!({"result": {"value": json!({"status": 204}).to_string()}})
+                            let expression = req
+                                .pointer("/params/expression")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let value = if expression == freshness::PAGE_FRESHNESS_EXPR {
+                                json!({
+                                    "href": "https://example.com/",
+                                    "ageMs": 0.0,
+                                    "readyState": "complete"
+                                })
+                            } else if expression == freshness::READY_STATE_EXPR {
+                                json!("complete")
+                            } else {
+                                json!(json!({"status": 204}).to_string())
+                            };
+                            json!({"result": {"value": value}})
                         }
                         _ => json!({}),
                     };
@@ -239,9 +259,14 @@ mod tests {
             },
         };
         let mut trace = CommandTrace::new("wait-for-cookie");
-        run_validate_url(&resolved, "https://example.com/api/check", &mut trace)
-            .await
-            .unwrap();
+        run_validate_url(
+            &resolved,
+            "https://example.com/api/check",
+            freshness::DEFAULT_MAX_AGE,
+            &mut trace,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             *created_urls.lock().await,
             vec!["https://example.com/".to_string()]

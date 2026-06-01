@@ -22,6 +22,7 @@ use crate::cli::env_resolver::Source;
 use crate::cli::route;
 use crate::cli::trace::CommandTrace;
 use crate::session::backend::open_backend;
+use crate::session::freshness;
 use crate::session::{with_scratch_recovery, PageSession};
 
 /// Per-call timeout for storage probes. The expressions injected here are
@@ -44,6 +45,9 @@ pub enum StorageCmd {
         namespace: String,
         #[arg(long)]
         json: bool,
+        /// Reload the page first if its document is older than this duration.
+        #[arg(long, default_value = freshness::DEFAULT_MAX_AGE_STR)]
+        max_age: String,
     },
     /// Write a single storage entry.
     Set {
@@ -68,6 +72,9 @@ pub enum StorageCmd {
         namespace: String,
         #[arg(long)]
         json: bool,
+        /// Reload the page first if its document is older than this duration.
+        #[arg(long, default_value = freshness::DEFAULT_MAX_AGE_STR)]
+        max_age: String,
     },
 }
 
@@ -80,10 +87,13 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             target,
             namespace,
             json,
+            max_age,
         } => {
             let mut trace = CommandTrace::new("storage-get");
-            let result =
-                run_get(browser, key, key_regex, target, namespace, json, &mut trace).await;
+            let result = run_get(
+                browser, key, key_regex, target, namespace, json, max_age, &mut trace,
+            )
+            .await;
             trace.finish(result)
         }
         StorageCmd::Set {
@@ -103,9 +113,13 @@ pub async fn run(cmd: StorageCmd) -> Result<()> {
             target,
             namespace,
             json,
+            max_age,
         } => {
             let mut trace = CommandTrace::new("storage-list");
-            let result = run_list(browser, key_regex, target, namespace, json, &mut trace).await;
+            let result = run_list(
+                browser, key_regex, target, namespace, json, max_age, &mut trace,
+            )
+            .await;
             trace.finish(result)
         }
     }
@@ -125,6 +139,7 @@ async fn evaluate_routed(
     browser: Option<String>,
     target: Option<String>,
     expr: &str,
+    max_age: Option<Duration>,
     trace: &mut CommandTrace,
 ) -> Result<Value> {
     // Preamble (parse, mutual-exclusion, resolve, registry, BiDi lock) is
@@ -144,7 +159,12 @@ async fn evaluate_routed(
                  external endpoints can't carry tab names",
                 move |b, target_id| {
                     let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await }
+                    async move {
+                        if let Some(max_age) = max_age {
+                            b.ensure_fresh(&target_id, max_age).await?;
+                        }
+                        b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await
+                    }
                 },
             )
             .await
@@ -158,6 +178,9 @@ async fn evaluate_routed(
                 trace.route("direct");
                 let session =
                     PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+                if let Some(max_age) = max_age {
+                    session.ensure_fresh(max_age).await?;
+                }
                 let value = session
                     .evaluate_with_timeout(expr, true, Some(STORAGE_TIMEOUT))
                     .await;
@@ -173,7 +196,12 @@ async fn evaluate_routed(
                 let expr = expr.to_string();
                 with_scratch_recovery(&backend, &r.registry, &browser_name, move |b, target_id| {
                     let expr = expr.clone();
-                    async move { b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await }
+                    async move {
+                        if let Some(max_age) = max_age {
+                            b.ensure_fresh(&target_id, max_age).await?;
+                        }
+                        b.evaluate(&target_id, &expr, true, STORAGE_TIMEOUT).await
+                    }
                 })
                 .await
             }
@@ -183,6 +211,9 @@ async fn evaluate_routed(
             trace.route("target-regex");
             let session =
                 PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
+            if let Some(max_age) = max_age {
+                session.ensure_fresh(max_age).await?;
+            }
             let value = session
                 .evaluate_with_timeout(expr, true, Some(STORAGE_TIMEOUT))
                 .await;
@@ -200,15 +231,17 @@ async fn run_get(
     target: Option<String>,
     namespace: String,
     json: bool,
+    max_age: String,
     trace: &mut CommandTrace,
 ) -> Result<()> {
+    let max_age = freshness::parse_max_age(&max_age)?;
     let ns = ns_global(&namespace)?;
     match (key.as_deref(), key_regex.as_deref()) {
         (Some(_), Some(_)) => bail!("specify either KEY or --key-regex, not both"),
         (None, None) => bail!("specify a KEY or --key-regex"),
         (Some(k), None) => {
             let expr = build_get_expr(ns, k);
-            let value = evaluate_routed(browser, target, &expr, trace).await?;
+            let value = evaluate_routed(browser, target, &expr, Some(max_age), trace).await?;
             if value.is_null() {
                 bail!("key not found: {k}");
             }
@@ -223,7 +256,7 @@ async fn run_get(
         }
         (None, Some(pat)) => {
             let expr = build_get_by_regex_expr(ns, pat);
-            let value = evaluate_routed(browser, target, &expr, trace).await?;
+            let value = evaluate_routed(browser, target, &expr, Some(max_age), trace).await?;
             if value.is_null() {
                 bail!("no key matches regex");
             }
@@ -252,7 +285,7 @@ async fn run_set(
 ) -> Result<()> {
     let ns = ns_global(&namespace)?;
     let expr = build_set_expr(ns, &key, &value);
-    evaluate_routed(browser, target, &expr, trace).await?;
+    evaluate_routed(browser, target, &expr, None, trace).await?;
     Ok(())
 }
 
@@ -262,11 +295,13 @@ async fn run_list(
     target: Option<String>,
     namespace: String,
     json: bool,
+    max_age: String,
     trace: &mut CommandTrace,
 ) -> Result<()> {
+    let max_age = freshness::parse_max_age(&max_age)?;
     let ns = ns_global(&namespace)?;
     let expr = build_list_expr(ns, key_regex.as_deref());
-    let value = evaluate_routed(browser, target, &expr, trace).await?;
+    let value = evaluate_routed(browser, target, &expr, Some(max_age), trace).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -422,6 +457,7 @@ mod tests {
             Some("brave/cart".to_string()),
             Some(".*".to_string()),
             "1",
+            None,
             &mut trace,
         )
         .await

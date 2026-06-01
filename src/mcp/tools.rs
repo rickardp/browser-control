@@ -22,6 +22,7 @@ use crate::cli::wait_for_cookie::cookie_matches;
 use crate::detect::Engine;
 use crate::dom::scripts::{FETCH_JS, GET_CLIP_RECT_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
 use crate::mcp::server::{RegisteredTool, ServerState, ToolHandler, ToolRegistry};
+use crate::session::freshness;
 use crate::session::targets::TargetInfo;
 
 /// Per-op timeout for read tools (`browser_get_html`,
@@ -146,6 +147,20 @@ fn extract_tab_target(args: &Value) -> (Option<String>, Option<String>) {
         .and_then(|v| v.as_str())
         .map(String::from);
     (tab, target)
+}
+
+fn max_age_arg(args: &Value) -> Result<Duration> {
+    match args.get("max_age") {
+        None | Some(Value::Null) => Ok(freshness::DEFAULT_MAX_AGE),
+        Some(Value::String(s)) => freshness::parse_max_age(s),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map(Duration::from_secs)
+            .ok_or_else(|| anyhow!("`max_age` number must be non-negative seconds")),
+        Some(_) => Err(anyhow!(
+            "`max_age` must be a duration string, e.g. `10m` or `1h`"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +289,11 @@ fn make_fetch() -> RegisteredTool {
                 "url": { "type": "string" },
                 "method": { "type": "string" },
                 "headers": { "type": "object" },
-                "body": { "type": "string" }
+                "body": { "type": "string" },
+                "max_age": {
+                    "type": "string",
+                    "description": "Reload the page first if its document is older than this duration (default 10m)."
+                }
             })),
             "required": ["url"],
         }),
@@ -288,7 +307,9 @@ fn make_fetch() -> RegisteredTool {
                 if let Some(obj) = for_js.as_object_mut() {
                     obj.remove("tab");
                     obj.remove("target");
+                    obj.remove("max_age");
                 }
+                let max_age = max_age_arg(&args)?;
                 let args_json = serde_json::to_string(&for_js)?;
                 let args_literal = serde_json::to_string(&args_json)?;
                 let expr = format!("({FETCH_JS})({args_literal})");
@@ -307,6 +328,7 @@ fn make_fetch() -> RegisteredTool {
                     let target_id = backend.resolve_or_create_for_origin(url).await?;
                     (backend, target_id)
                 };
+                backend.ensure_fresh(&target_id, max_age).await?;
                 let value = backend
                     .evaluate(&target_id, &expr, true, MCP_FETCH_TIMEOUT)
                     .await?;
@@ -470,6 +492,10 @@ fn make_storage_get() -> RegisteredTool {
                     "type": "string",
                     "enum": ["local", "session"],
                     "default": "local"
+                },
+                "max_age": {
+                    "type": "string",
+                    "description": "Reload the page first if its document is older than this duration (default 10m)."
                 }
             })),
             "required": ["key"],
@@ -487,7 +513,9 @@ fn make_storage_get() -> RegisteredTool {
                     .unwrap_or("local");
                 let ns = ns_global(namespace)?;
                 let expr = build_get_expr(ns, &key);
+                let max_age = max_age_arg(&args)?;
                 let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                backend.ensure_fresh(&target_id, max_age).await?;
                 let value = backend
                     .evaluate(&target_id, &expr, true, MCP_OP_TIMEOUT)
                     .await?;

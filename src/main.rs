@@ -1,14 +1,18 @@
 use anyhow::Result;
 use browser_control::cli::{
-    cookies, eval, fetch, list, set, storage, targets as cli_targets, wait, wait_for_cookie,
+    agent_instructions, cookies, eval, fetch, list, set, storage, targets as cli_targets, wait,
+    wait_for_cookie,
 };
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "browser-control", version, about, long_about = None)]
+#[command(name = "browser-control", version, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
+    /// Print canonical instructions for agents using browser-control.
+    #[arg(long)]
+    agent_instructions: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -107,6 +111,9 @@ enum Command {
         /// renderers faster.
         #[arg(long, default_value_t = 60_000)]
         timeout_ms: u64,
+        /// Reload the page first if its document is older than this duration.
+        #[arg(long, default_value = browser_control::session::freshness::DEFAULT_MAX_AGE_STR)]
+        max_age: String,
     },
     /// Read or write localStorage / sessionStorage.
     Storage {
@@ -133,6 +140,9 @@ enum Command {
         /// instead of dragging through the upstream 30 s protocol timeout.
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
+        /// Reload the page first if its document is older than this duration.
+        #[arg(long, default_value = browser_control::session::freshness::DEFAULT_MAX_AGE_STR)]
+        max_age: String,
     },
     /// Wait until the browser endpoint is reachable.
     Wait {
@@ -160,6 +170,9 @@ enum Command {
         /// After the cookie appears, GET this URL through the page and require 2xx.
         #[arg(long)]
         validate_url: Option<String>,
+        /// Reload the validation page first if its document is older than this duration.
+        #[arg(long, default_value = browser_control::session::freshness::DEFAULT_MAX_AGE_STR)]
+        max_age: String,
     },
     /// Set a persistent setting (e.g. `set default firefox`).
     Set {
@@ -205,7 +218,16 @@ fn init_tracing() {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    match cli.command {
+    if cli.agent_instructions {
+        agent_instructions::print();
+        return Ok(());
+    }
+
+    let Some(command) = cli.command else {
+        return Ok(());
+    };
+
+    match command {
         Command::ListInstalled { json } => list::run_list_installed(json),
         Command::ListRunning { json } => list::run_list_running(json).await,
         Command::Start {
@@ -242,9 +264,10 @@ async fn main() -> Result<()> {
             include,
             output,
             timeout_ms,
+            max_age,
         } => {
             fetch::run(
-                browser, url, method, headers, data, target, include, output, timeout_ms,
+                browser, url, method, headers, data, target, include, output, timeout_ms, max_age,
             )
             .await
         }
@@ -256,7 +279,19 @@ async fn main() -> Result<()> {
             json,
             await_promise,
             timeout_ms,
-        } => eval::run(browser, expression, target, json, await_promise, timeout_ms).await,
+            max_age,
+        } => {
+            eval::run(
+                browser,
+                expression,
+                target,
+                json,
+                await_promise,
+                timeout_ms,
+                max_age,
+            )
+            .await
+        }
         Command::Wait {
             browser,
             ready,
@@ -269,8 +304,18 @@ async fn main() -> Result<()> {
             timeout,
             poll_interval,
             validate_url,
+            max_age,
         } => {
-            wait_for_cookie::run(browser, domain, name, timeout, poll_interval, validate_url).await
+            wait_for_cookie::run(
+                browser,
+                domain,
+                name,
+                timeout,
+                poll_interval,
+                validate_url,
+                max_age,
+            )
+            .await
         }
         Command::Tab { cmd } => browser_control::cli::tab::run(cmd).await,
     }

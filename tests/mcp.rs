@@ -7,6 +7,7 @@ use browser_control::cli::env_resolver::{ResolvedBrowser, Source};
 use browser_control::detect::Engine;
 use browser_control::mcp::server::{run_with_streams, ServerState, ToolRegistry};
 use browser_control::mcp::tools::register_all;
+use browser_control::session::freshness;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -307,18 +308,35 @@ async fn spawn_recording_cdp_mock(
                                         .and_then(|sid| sessions.get(sid))
                                         .cloned()
                                         .unwrap_or_default();
-                                    recorded
-                                        .lock()
-                                        .await
-                                        .evaluations
-                                        .push(RecordedEvaluate { target_id });
-                                    let payload = json!({
-                                        "ok": true,
-                                        "status": 200,
-                                        "body": "ok"
-                                    })
-                                    .to_string();
-                                    json!({"result": {"value": payload}})
+                                    let expression = req
+                                        .pointer("/params/expression")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let value = if expression == freshness::PAGE_FRESHNESS_EXPR {
+                                        json!({
+                                            "href": live
+                                                .get(&target_id)
+                                                .cloned()
+                                                .unwrap_or_else(|| "about:blank".to_string()),
+                                            "ageMs": 0.0,
+                                            "readyState": "complete"
+                                        })
+                                    } else if expression == freshness::READY_STATE_EXPR {
+                                        json!("complete")
+                                    } else {
+                                        recorded
+                                            .lock()
+                                            .await
+                                            .evaluations
+                                            .push(RecordedEvaluate { target_id });
+                                        json!(json!({
+                                            "ok": true,
+                                            "status": 200,
+                                            "body": "ok"
+                                        })
+                                        .to_string())
+                                    };
+                                    json!({"result": {"value": value}})
                                 }
                                 _ => json!({}),
                             };
