@@ -151,11 +151,17 @@ impl ServerState {
     /// Lazy + idempotent: called by each tool handler before opening a
     /// BiDi session, returns immediately on second+ calls.
     pub async fn ensure_bidi_lock(&self) -> Result<()> {
+        use crate::cli::env_resolver::Source;
         use crate::cli::mcp::acquire_bidi_lock_if_needed;
+        use crate::detect::Engine;
         use crate::registry::Registry;
         let mut guard = self.bidi_lock.lock().await;
         if matches!(*guard, BidiLockState::Pending) {
             let resolved = self.browser_snapshot().await;
+            if resolved.engine != Engine::Bidi || matches!(resolved.source, Source::External) {
+                *guard = BidiLockState::NotApplicable;
+                return Ok(());
+            }
             // `bidi_lock_acquire` polls with a blocking `std::thread::sleep`
             // for up to 30s under contention. Run it on a blocking thread so
             // we never park a tokio worker (mirrors `resolve_browser_send`).
@@ -1237,6 +1243,31 @@ mod tests {
             1,
             "expected exactly one backend (one WS connection) under concurrency"
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn external_cdp_backend_does_not_open_registry() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stale_path = {
+            let tmp = tempfile::TempDir::new().unwrap();
+            tmp.path().to_path_buf()
+        };
+        std::env::set_var("BROWSER_CONTROL_DATA_DIR", &stale_path);
+
+        let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        let state = ServerState::new(ResolvedBrowser {
+            endpoint: url,
+            engine: Engine::Cdp,
+            source: Source::External,
+        });
+
+        let result = state.ensure_backend().await;
+
+        std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+        result.expect("external CDP backend must not depend on registry env");
     }
 
     #[tokio::test]

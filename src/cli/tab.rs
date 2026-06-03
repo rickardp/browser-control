@@ -28,7 +28,10 @@ pub enum TabCmd {
         /// `<browser>` or `<browser>/<name>`. With no `/<name>`, the
         /// daemon assigns a cute name (`tab-<word>`) and creates fresh.
         browser: String,
-        /// Optional initial URL. Defaults to `about:blank`.
+        /// URL to open or navigate to. Passing a url for an existing named
+        /// tab navigates it (when the url differs from its `last_url`); this
+        /// is the way to navigate — do not eval `location.href`. Omit to
+        /// create a fresh tab at `about:blank`.
         #[arg(default_value = "")]
         url: String,
         /// Emit JSON instead of the one-line text summary.

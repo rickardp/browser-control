@@ -197,8 +197,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Named-tab lifecycle: `tab open`, `tab list`, `tab adopt`.
-    /// Addressable as `--browser <browser>/<name>` in page-context commands.
+    /// Open or navigate tabs: `tab open <browser>/<name> <url>` (re-running
+    /// with a new url navigates the existing tab), `tab list`, `tab adopt`.
+    /// This is the way to go to a URL — do not navigate by evaling
+    /// `location.href`. Addressable as `--browser <browser>/<name>` in
+    /// page-context commands.
     Tab {
         #[command(subcommand)]
         cmd: browser_control::cli::tab::TabCmd,
