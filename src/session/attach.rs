@@ -427,10 +427,13 @@ async fn evaluate_for_origin_once(
     max_age: Duration,
 ) -> Result<Value> {
     let session = PageSession::attach_for_origin(endpoint, engine, origin_url).await?;
-    session.ensure_fresh(max_age).await?;
-    let result = session
-        .evaluate_with_timeout(expression, await_promise, Some(timeout))
-        .await;
+    let result = async {
+        session.ensure_fresh(max_age).await?;
+        session
+            .evaluate_with_timeout(expression, await_promise, Some(timeout))
+            .await
+    }
+    .await;
     session.close().await;
     result
 }

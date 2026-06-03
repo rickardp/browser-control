@@ -181,15 +181,13 @@ async fn target_alive(backend: &TabBackend, target_id: &str) -> Result<bool> {
 /// 2. Run `op` against the live `target_id`.
 /// 3. If `op` returns a recoverable failure (`TabHung`, `TabCrashed`, or a
 ///    CDP/BiDi "no target / no context" protocol error), the tab died
-///    between resolve and op. **Leave the dead tab in the browser** — the
-///    agent named it, the corpse is human-inspectable. Create a fresh
-///    tab, navigate it to the row's `last_url` (best-effort; falls back
-///    to `about:blank` if the rehydration navigation itself fails), and
-///    re-point the registry row at it under the **same name**, then
-///    retry `op` once. After recovery, `<browser>/<name>` resolves to
-///    the new live tab pointing at the same URL the agent last saw it
-///    at; the dead tab is no longer addressable by name (and `tab list`
-///    won't show it, since sweep-on-read checks against `live_target_ids`).
+///    between resolve and op. For daemon-created rows, close the failed
+///    target so repeated recovery cannot orphan unbounded browser tabs.
+///    User-adopted tabs are left alone because closing a tab the user
+///    explicitly adopted would be surprising. Create a fresh tab, navigate
+///    it to the row's `last_url` (best-effort; falls back to `about:blank`
+///    if the rehydration navigation itself fails), and re-point the registry
+///    row at it under the **same name**, then retry `op` once.
 /// 4. If the retry also fails, escalate the typed error to the caller.
 pub async fn with_named_tab_recovery<F, T, Fut>(
     backend: &TabBackend,
@@ -227,13 +225,18 @@ where
         Err(e) if is_tab_failure(&e) => {
             // Step 3: recover. Tab died between resolve and op.
             //
-            // Do NOT close the dead tab. The agent named it; the corpse
-            // stays in the browser so the human can inspect it. The
-            // registry row gets re-pointed at a fresh tab under the
-            // same name — addressing-by-name now resolves to the new
-            // live tab, the dead tab is no longer reachable via
-            // `<browser>/<name>` and falls off `tab list` (sweep-on-read
-            // checks the row's target_id against live_target_ids).
+            // Daemon-created tabs are owned by browser-control, so close
+            // the failed target before replacing it. Leaving these targets
+            // around creates unbounded orphan tabs during repeated
+            // recoveries, and the registry LRU cannot see them once the row
+            // is re-pointed. User-adopted tabs are not closed here because
+            // they were not created by the daemon.
+            if row.daemon_created {
+                let _ = backend.close_tab(&row.target_id).await;
+            }
+            // The registry row gets re-pointed at a fresh tab under the
+            // same name — addressing-by-name now resolves to the new live
+            // tab.
             //
             // Rehydrate `last_url`: if the dead tab was at a real URL,
             // navigate the new tab there before retrying so the agent
@@ -691,10 +694,9 @@ mod tests {
         assert!(reg.tab_get("b", "ghost").unwrap().is_none(), "swept");
     }
 
-    /// First op call wedges (returns `TabHung`); wrapper leaves the dead
-    /// tab alone, recreates a fresh blank under the same name, retries;
-    /// second attempt succeeds. Caller sees a value, dead tab persists
-    /// in the browser for inspection.
+    /// First op call wedges (returns `TabHung`); wrapper closes the failed
+    /// daemon-created tab, recreates a fresh blank under the same name, and
+    /// retries. Caller sees the retry value.
     #[tokio::test]
     async fn recover_after_op_returns_tab_hung() {
         let (backend, _stop) = cdp_backend().await;
@@ -739,12 +741,11 @@ mod tests {
         assert_eq!(result, serde_json::json!(format!("ok:{}", row.target_id)));
     }
 
-    /// Recovery must NOT close the dead tab: the corpse stays in the
-    /// browser so the human can inspect it. The mock tracks live targets
-    /// via `Target.createTarget` / `Target.closeTarget`; if recovery
-    /// closes the dead one, `live_target_ids` will drop it.
+    /// Recovery closes daemon-created failed tabs before replacing the row.
+    /// Otherwise repeated recoveries orphan live targets that the registry
+    /// cap cannot see once the row has been re-pointed.
     #[tokio::test]
-    async fn recovery_leaves_dead_named_tab_in_browser() {
+    async fn recovery_closes_daemon_named_tab_in_browser() {
         let (backend, _stop) = cdp_backend().await;
         let reg = Registry::open_in_memory().unwrap();
         let opened = tab_open(&backend, &reg, "b", Some("doomed"), None)
@@ -774,18 +775,73 @@ mod tests {
         .await
         .expect("recover succeeded");
 
-        // Two live targets after recovery: the dead one + the fresh blank.
-        // (Recovery left the dead one alone instead of closing it.)
+        // One live target after recovery: the fresh replacement. The failed
+        // daemon-created target was closed.
         let live = backend.live_target_ids().await.unwrap();
         assert!(
-            live.contains(&original_target),
-            "dead tab must persist; live = {live:?}, original = {original_target}"
+            !live.contains(&original_target),
+            "daemon-created failed tab must be closed; live = {live:?}, original = {original_target}"
         );
-        assert_eq!(live.len(), 2, "expected dead + fresh; got {live:?}");
+        assert_eq!(
+            live.len(),
+            1,
+            "expected only fresh replacement; got {live:?}"
+        );
 
         // The registry row points at the fresh tab, not the dead one.
         let row = reg.tab_get("b", "doomed").unwrap().unwrap();
         assert_ne!(row.target_id, original_target);
+    }
+
+    /// Adopted tabs are user-owned. Recovery still re-points the name to a
+    /// fresh daemon-created replacement, but it must not close the original
+    /// user tab.
+    #[tokio::test]
+    async fn recovery_leaves_user_adopted_tab_in_browser() {
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        let original_target = backend.create_tab("https://example.com/app").await.unwrap();
+        reg.tab_upsert(
+            "b",
+            "adopted",
+            &original_target,
+            "https://example.com/app",
+            false,
+        )
+        .unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let _ = with_named_tab_recovery(&backend, &reg, "b", "adopted", move |_, target_id| {
+            let calls = calls_clone.clone();
+            async move {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(SessionError::TabHung {
+                        target_id: Some(target_id),
+                        url: None,
+                        timeout_ms: 100,
+                        hint: "test",
+                    }
+                    .into())
+                } else {
+                    Ok::<_, anyhow::Error>(serde_json::json!("ok"))
+                }
+            }
+        })
+        .await
+        .expect("recover succeeded");
+
+        let live = backend.live_target_ids().await.unwrap();
+        assert!(
+            live.contains(&original_target),
+            "adopted user tab must not be closed; live = {live:?}, original = {original_target}"
+        );
+        assert_eq!(live.len(), 2, "expected user tab + fresh replacement");
+
+        let row = reg.tab_get("b", "adopted").unwrap().unwrap();
+        assert_ne!(row.target_id, original_target);
+        assert!(row.daemon_created, "replacement is daemon-owned");
     }
 
     /// `is_tab_failure` matches the typed `TargetGone` variant first

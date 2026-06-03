@@ -323,10 +323,8 @@ fn make_fetch() -> RegisteredTool {
                 let (backend, target_id) = if has_route {
                     state.resolve_target_for_args(&args).await?
                 } else {
-                    let backend = state.ensure_backend().await?;
                     let url = args.get("url").and_then(|v| v.as_str()).unwrap();
-                    let target_id = backend.resolve_or_create_for_origin(url).await?;
-                    (backend, target_id)
+                    state.resolve_or_create_for_origin(url).await?
                 };
                 backend.ensure_fresh(&target_id, max_age).await?;
                 let value = backend

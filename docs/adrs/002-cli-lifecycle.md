@@ -220,13 +220,14 @@ bundled with the architectural decision.
   `--target`) routes through the scratch tab with one-shot recovery
   on `TabHung` / `TabCrashed` / "no target" protocol errors. **Named
   tabs** got the same recover-once contract via
-  `with_named_tab_recovery` in `src/session/tabs.rs`: a tab that dies
-  between `resolve_tab` and the op is **left in place** in the browser
-  (corpse stays human-inspectable), the registry row is re-pointed at a
-  fresh tab under the same name, the fresh tab is navigated to the
-  dead row's `last_url` (best-effort rehydration; falls back to
-  `about:blank` only if rehydration navigation itself fails), and the
-  op retries once. Otherwise typed `SessionError::TabNotFound` /
+  `with_named_tab_recovery` in `src/session/tabs.rs`: a daemon-created tab
+  that dies between `resolve_tab` and the op is closed before the registry
+  row is re-pointed at a fresh tab under the same name, preventing repeated
+  recoveries from orphaning unbounded browser tabs. User-adopted tabs are
+  not closed by recovery. The fresh tab is navigated to the dead row's
+  `last_url` (best-effort rehydration; falls back to `about:blank` only if
+  rehydration navigation itself fails), and the op retries once. Otherwise
+  typed `SessionError::TabNotFound` /
   `TabHung` / `TabCrashed` is surfaced. **Bare-browser `fetch`**
   (origin-bound, no explicit tab) gets the same one-shot recovery
   around `attach_for_origin` — auth-inheritance is preserved because

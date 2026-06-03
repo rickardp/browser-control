@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
@@ -51,6 +52,12 @@ pub struct ServerState {
     /// `browser_tab_new`. Cleared on `browser_tab_close` (when closing
     /// the active tab) and on `browser_select`.
     pub active_target_id: Arc<Mutex<Option<String>>>,
+    /// MCP-owned origin tabs created by bare `browser_fetch`, keyed by
+    /// requested origin root (`https://example.com/`). This supplements
+    /// URL-based live-target matching so a tab that redirects to a login
+    /// origin after token expiry is still reused on later fetches instead
+    /// of creating one new tab per retry.
+    pub origin_target_ids: Arc<Mutex<HashMap<String, String>>>,
     /// Lazy-spawned Playwright sidecar for the Chromium-only interaction
     /// tools (`browser_click`, `browser_snapshot`, etc.). One sidecar
     /// per server-per-browser; `browser_select` disposes the old one
@@ -101,6 +108,7 @@ impl ServerState {
             bidi_lock: Arc::new(Mutex::new(BidiLockState::Pending)),
             backend: Arc::new(Mutex::new(None)),
             active_target_id: Arc::new(Mutex::new(None)),
+            origin_target_ids: Arc::new(Mutex::new(HashMap::new())),
             sidecar: Arc::new(Mutex::new(None)),
             sidecar_config,
             op_barrier: Arc::new(RwLock::new(())),
@@ -215,6 +223,45 @@ impl ServerState {
         Ok((backend, new_tid))
     }
 
+    /// Resolve or create an MCP-owned tab for a fetch URL's origin.
+    ///
+    /// `TabBackend::resolve_or_create_for_origin` can only reuse targets
+    /// whose current browser URL still has the requested origin. During auth
+    /// expiry, an origin tab may redirect to an identity provider or login
+    /// route; if we only inspect current URLs, each retry can create another
+    /// tab. This cache records the target originally allocated for each
+    /// requested origin and reuses it while it is still live.
+    pub async fn resolve_or_create_for_origin(&self, url: &str) -> Result<(TabBackend, String)> {
+        let want =
+            url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid fetch URL `{url}`: {e}"))?;
+        let origin_root = crate::session::attach::origin_root_url(&want);
+        let backend = self.ensure_backend().await?;
+        let mut origin_targets = self.origin_target_ids.lock().await;
+        let live_targets = backend.live_targets().await?;
+        let live_ids: std::collections::HashSet<&str> =
+            live_targets.iter().map(|t| t.id.as_str()).collect();
+
+        if let Some(cached) = origin_targets.get(&origin_root) {
+            if live_ids.contains(cached.as_str()) {
+                return Ok((backend, cached.clone()));
+            }
+            origin_targets.remove(&origin_root);
+        }
+
+        if let Some(existing) = live_targets.iter().find(|t| {
+            url::Url::parse(&t.url)
+                .map(|parsed| crate::session::attach::same_origin(&parsed, &want))
+                .unwrap_or(false)
+        }) {
+            origin_targets.insert(origin_root, existing.id.clone());
+            return Ok((backend, existing.id.clone()));
+        }
+
+        let new_tid = backend.create_tab(&origin_root).await?;
+        origin_targets.insert(origin_root, new_tid.clone());
+        Ok((backend, new_tid))
+    }
+
     /// Route a stateful tool call to a backend + target id based on the
     /// optional `tab` (named) and `target` (URL regex) args. `tab` and
     /// `target` are mutually exclusive. Falls through to `current_tab()`
@@ -325,6 +372,11 @@ impl ServerState {
         {
             let mut pointer = self.active_target_id.lock().await;
             *pointer = None;
+        }
+        // Clear origin-bound fetch target cache.
+        {
+            let mut origins = self.origin_target_ids.lock().await;
+            origins.clear();
         }
         // Dispose the Playwright sidecar — different browser means
         // different CDP endpoint; the next sidecar tool spawns a fresh

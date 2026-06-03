@@ -222,10 +222,18 @@ struct RecordingCdpState {
 async fn spawn_recording_cdp_mock(
     initial_targets: Vec<(&str, &str)>,
 ) -> (String, oneshot::Sender<()>, Arc<Mutex<RecordingCdpState>>) {
+    spawn_recording_cdp_mock_with_fetch_redirect(initial_targets, None).await
+}
+
+async fn spawn_recording_cdp_mock_with_fetch_redirect(
+    initial_targets: Vec<(&str, &str)>,
+    redirect_after_fetch: Option<&str>,
+) -> (String, oneshot::Sender<()>, Arc<Mutex<RecordingCdpState>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let recorded = Arc::new(Mutex::new(RecordingCdpState::default()));
+    let redirect_after_fetch = redirect_after_fetch.map(|s| s.to_string());
     tokio::spawn({
         let recorded = recorded.clone();
         let initial_targets: Vec<(String, String)> = initial_targets
@@ -328,7 +336,12 @@ async fn spawn_recording_cdp_mock(
                                             .lock()
                                             .await
                                             .evaluations
-                                            .push(RecordedEvaluate { target_id });
+                                            .push(RecordedEvaluate {
+                                                target_id: target_id.clone(),
+                                            });
+                                        if let Some(url) = redirect_after_fetch.as_ref() {
+                                            live.insert(target_id, url.clone());
+                                        }
                                         json!(json!({
                                             "ok": true,
                                             "status": 200,
@@ -723,6 +736,48 @@ async fn browser_fetch_without_route_reuses_matching_origin_tab_without_setting_
         vec![RecordedEvaluate {
             target_id: "EXISTING".to_string()
         }]
+    );
+    drop(rec);
+    assert!(state.active_target_id.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn browser_fetch_without_route_reuses_cached_origin_tab_after_redirect() {
+    let (url, _stop, recorded) = spawn_recording_cdp_mock_with_fetch_redirect(
+        vec![],
+        Some("https://login.example.test/session-expired"),
+    )
+    .await;
+    let state = state_for_mock(&url);
+
+    for _ in 0..2 {
+        let out = call_tool(
+            state.clone(),
+            "browser_fetch",
+            json!({"url": "https://example.com/api/data"}),
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
+        assert_eq!(parsed["ok"], true);
+    }
+
+    let rec = recorded.lock().await;
+    assert_eq!(
+        rec.created_targets,
+        vec![("NEW1".to_string(), "https://example.com/".to_string())],
+        "redirected origin tab should be cached instead of creating NEW2"
+    );
+    assert_eq!(
+        rec.evaluations,
+        vec![
+            RecordedEvaluate {
+                target_id: "NEW1".to_string()
+            },
+            RecordedEvaluate {
+                target_id: "NEW1".to_string()
+            }
+        ]
     );
     drop(rec);
     assert!(state.active_target_id.lock().await.is_none());
