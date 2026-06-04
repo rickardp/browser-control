@@ -3,6 +3,44 @@
 use serde::Serialize;
 use std::io::Write;
 
+const FALLBACK_TERMINAL_WIDTH: usize = 120;
+
+/// Best-effort terminal width for human table formatting.
+pub fn terminal_width() -> usize {
+    if let Some(width) = terminal_width_from_env() {
+        return width;
+    }
+    terminal_width_from_stdout().unwrap_or(FALLBACK_TERMINAL_WIDTH)
+}
+
+fn terminal_width_from_env() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|w| *w > 0)
+}
+
+#[cfg(unix)]
+fn terminal_width_from_stdout() -> Option<usize> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+    if rc == 0 && size.ws_col > 0 {
+        Some(size.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_width_from_stdout() -> Option<usize> {
+    None
+}
+
 /// Print rows as a simple aligned table.
 ///
 /// Column widths are computed from the headers plus all cell contents.

@@ -1,3 +1,4 @@
+pub mod agent_instructions;
 pub mod cookies;
 pub mod env_resolver;
 pub mod eval;
@@ -5,9 +6,13 @@ pub mod fetch;
 pub mod list;
 pub mod mcp;
 pub mod output;
+pub mod route;
+pub mod routing;
 pub mod set;
 pub mod start;
 pub mod storage;
+pub mod tab;
 pub mod targets;
+pub mod trace;
 pub mod wait;
 pub mod wait_for_cookie;

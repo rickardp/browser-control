@@ -1,14 +1,22 @@
 //! SQLite-backed registry of running browser instances.
 
+pub mod bidi_lock;
+mod db;
 pub mod naming;
 pub mod schema;
+pub mod scratches;
+pub mod tabs;
 pub mod words;
+
+pub use bidi_lock::{BidiLockBusy, BidiLockGuard, BidiLockRow};
+pub use scratches::ScratchRow;
+pub use tabs::TabRow;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
 use rusqlite::{params, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,15 +38,18 @@ pub struct BrowserRow {
     pub started_at: String,
 }
 
-/// SQLite registry handle. Holds an advisory exclusive file lock for its lifetime
-/// (except for in-memory registries).
+/// SQLite registry handle. SQLite-level WAL + `busy_timeout` handles
+/// concurrent reader/writer coordination across processes; we no longer
+/// hold a long-lived exclusive file lock for the lifetime of the
+/// handle. A short exclusive lock is taken only across the
+/// schema-migration window in `open_at` to serialise initial
+/// `CREATE TABLE` / `CREATE INDEX` against a concurrent first open.
 pub struct Registry {
     conn: rusqlite::Connection,
-    #[allow(dead_code)]
+    /// Path the registry was opened at. Read by `bidi_lock_acquire` to
+    /// stamp the `BidiLockGuard`, whose `Drop` reopens a fresh connection
+    /// here to release the row (the guard outlives the borrowing handle).
     db_path: PathBuf,
-    // Held to keep the advisory lock alive; dropped releases the lock.
-    #[allow(dead_code)]
-    lock: Option<File>,
 }
 
 impl Registry {
@@ -57,6 +68,13 @@ impl Registry {
             }
         }
 
+        // Hold an exclusive file lock only across the initial schema
+        // migration. SQLite's own `CREATE TABLE IF NOT EXISTS` is
+        // idempotent and safe under concurrent execution, but
+        // narrowing the lock to this window keeps the historical
+        // serialisation guarantee for any future schema-altering
+        // change while letting steady-state CLI invocations proceed
+        // in parallel.
         let lock_path = lock_path_for(path);
         let lock_file = OpenOptions::new()
             .create(true)
@@ -77,10 +95,16 @@ impl Registry {
         configure_conn(&conn)?;
         schema::apply(&conn)?;
 
+        // Release the migration lock. From here on, SQLite's
+        // WAL + busy_timeout handles inter-process coordination
+        // for both reads and writes; CLI invocations no longer
+        // serialise on browser I/O.
+        let _ = FileExt::unlock(&lock_file);
+        drop(lock_file);
+
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
-            lock: Some(lock_file),
         })
     }
 
@@ -93,81 +117,72 @@ impl Registry {
         Ok(Self {
             conn,
             db_path: PathBuf::from(":memory:"),
-            lock: None,
         })
     }
 
     /// Insert (or replace) a row.
     pub fn insert(&self, row: &BrowserRow) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO browsers
+        db::execute(
+            &self.conn,
+            "INSERT OR REPLACE INTO browsers
                     (name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    row.name,
-                    kind_to_str(row.kind),
-                    engine_to_str(row.engine),
-                    row.pid as i64,
-                    row.endpoint,
-                    row.port as i64,
-                    row.profile_dir.to_string_lossy(),
-                    row.executable.to_string_lossy(),
-                    row.headless as i64,
-                    row.started_at,
-                ],
-            )
-            .with_context(|| format!("inserting registry row {}", row.name))?;
-        Ok(())
+            params![
+                row.name,
+                kind_to_str(row.kind),
+                engine_to_str(row.engine),
+                row.pid as i64,
+                row.endpoint,
+                row.port as i64,
+                row.profile_dir.to_string_lossy(),
+                row.executable.to_string_lossy(),
+                row.headless as i64,
+                row.started_at,
+            ],
+            || format!("inserting registry row {}", row.name),
+        )
     }
 
     /// Delete a row by name. No error if it does not exist.
     pub fn delete(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM browsers WHERE name = ?1", params![name])
-            .with_context(|| format!("deleting registry row {name}"))?;
-        Ok(())
+        db::execute(
+            &self.conn,
+            "DELETE FROM browsers WHERE name = ?1",
+            params![name],
+            || format!("deleting registry row {name}"),
+        )
     }
 
     /// Look up a row by name.
     pub fn get_by_name(&self, name: &str) -> Result<Option<BrowserRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at FROM browsers WHERE name = ?1")?;
-        let mut rows = stmt.query(params![name])?;
-        if let Some(r) = rows.next()? {
-            Ok(Some(row_from_sqlite(r)?))
-        } else {
-            Ok(None)
-        }
+        db::query_optional(
+            &self.conn,
+            "SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at FROM browsers WHERE name = ?1",
+            params![name],
+            row_from_sqlite,
+        )
     }
 
     /// All rows, no liveness check, ordered by started_at DESC.
     pub fn list_all(&self) -> Result<Vec<BrowserRow>> {
-        let mut stmt = self.conn.prepare(
+        db::query_vec(
+            &self.conn,
             "SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at
              FROM browsers ORDER BY started_at DESC",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            out.push(row_from_sqlite(r)?);
-        }
-        Ok(out)
+            [],
+            row_from_sqlite,
+        )
     }
 
     /// All rows of a given kind ordered by started_at DESC, without liveness check.
     pub(crate) fn list_by_kind_all(&self, kind: Kind) -> Result<Vec<BrowserRow>> {
-        let mut stmt = self.conn.prepare(
+        db::query_vec(
+            &self.conn,
             "SELECT name, kind, engine, pid, endpoint, port, profile_dir, executable, headless, started_at
              FROM browsers WHERE kind = ?1 ORDER BY started_at DESC",
-        )?;
-        let mut rows = stmt.query(params![kind_to_str(kind)])?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            out.push(row_from_sqlite(r)?);
-        }
-        Ok(out)
+            params![kind_to_str(kind)],
+            row_from_sqlite,
+        )
     }
 
     /// All alive rows. Stale rows are deleted as a side-effect.
@@ -210,11 +225,19 @@ impl Registry {
 }
 
 fn configure_conn(conn: &rusqlite::Connection) -> Result<()> {
-    // WAL improves concurrent reader/writer behavior; ignore the row callback.
+    // WAL allows concurrent readers + one writer per process group.
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("setting journal_mode = WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("setting synchronous = NORMAL")?;
+    // `busy_timeout` is what makes concurrent invocations safe now that
+    // we no longer hold the long-lived advisory file lock. SQLite will
+    // retry a contended write for up to this duration before returning
+    // SQLITE_BUSY. Five seconds is generous for our workloads (single
+    // INSERT/UPDATE per CLI invocation) and short enough that a stuck
+    // process surfaces visibly instead of hanging forever.
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("setting busy_timeout")?;
     Ok(())
 }
 
@@ -281,13 +304,37 @@ fn parse_engine(s: &str) -> Result<Engine> {
 
 /// Liveness check: PID exists AND a TCP connect to the local port succeeds.
 pub fn is_alive(row: &BrowserRow) -> bool {
+    let pid = sysinfo::Pid::from_u32(row.pid);
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    if sys.process(sysinfo::Pid::from_u32(row.pid)).is_none() {
+    // Refresh only the target PID rather than the whole process table:
+    // these run per-row in `list_alive`/`first_alive_by_kind`/etc., and we
+    // only ever query this one PID below.
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    if sys.process(pid).is_none() {
         return false;
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], row.port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// Cheap check: is process `pid` still running on this machine? Used by
+/// stale-row eviction in `scratches`, `tabs`, and `bidi_locks` to avoid
+/// keeping rows registered to a crashed CLI process.
+pub fn pid_alive(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    // Refresh only this PID, not the entire process table — this is hit
+    // per-row by stale-row eviction across scratches/tabs/bidi_locks.
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).is_some()
+}
+
+/// Current Unix epoch seconds.
+pub fn now_epoch_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 // -- ISO-8601 helpers --------------------------------------------------------

@@ -21,6 +21,13 @@ pub fn data_dir() -> Result<PathBuf> {
         if p.as_os_str().is_empty() {
             return Err(anyhow!("{} is set but empty", ENV_OVERRIDE));
         }
+        if !p.is_absolute() {
+            return Err(anyhow!(
+                "{} must be an absolute path (got {})",
+                ENV_OVERRIDE,
+                p.display()
+            ));
+        }
         return Ok(p);
     }
 
@@ -49,6 +56,13 @@ pub fn config_dir() -> Result<PathBuf> {
         let p = PathBuf::from(v);
         if p.as_os_str().is_empty() {
             return Err(anyhow!("{} is set but empty", CONFIG_ENV_OVERRIDE));
+        }
+        if !p.is_absolute() {
+            return Err(anyhow!(
+                "{} must be an absolute path (got {})",
+                CONFIG_ENV_OVERRIDE,
+                p.display()
+            ));
         }
         return Ok(p);
     }
@@ -130,9 +144,14 @@ mod tests {
         // Test 2: default path has the expected suffix.
         std::env::remove_var(ENV_OVERRIDE);
         let d = data_dir().unwrap();
+        let expected_suffix = if cfg!(windows) {
+            "browser-control\\data"
+        } else {
+            "browser-control"
+        };
         assert!(
-            d.ends_with("browser-control"),
-            "expected default data_dir to end with 'browser-control', got {}",
+            d.ends_with(expected_suffix),
+            "expected default data_dir to end with {expected_suffix:?}, got {}",
             d.display()
         );
     }
@@ -155,9 +174,14 @@ mod tests {
 
         std::env::remove_var(CONFIG_ENV_OVERRIDE);
         let d = config_dir().unwrap();
+        let expected_suffix = if cfg!(windows) {
+            "browser-control\\config"
+        } else {
+            "browser-control"
+        };
         assert!(
-            d.ends_with("browser-control"),
-            "expected default config_dir to end with 'browser-control', got {}",
+            d.ends_with(expected_suffix),
+            "expected default config_dir to end with {expected_suffix:?}, got {}",
             d.display()
         );
     }

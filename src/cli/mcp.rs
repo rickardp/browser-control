@@ -7,14 +7,15 @@ use crate::mcp::server::{run, ServerState, ToolRegistry};
 use crate::registry::Registry;
 
 /// Entry point for `browser-control mcp`.
-pub async fn run_cli(browser_arg: Option<String>, playwright: bool) -> Result<()> {
-    if playwright {
-        let resolved = resolve_browser(browser_arg).await?;
-        let code = crate::mcp::playwright::run(&resolved).await?;
-        std::process::exit(code);
-    }
+pub async fn run_cli(
+    browser_arg: Option<String>,
+    playwright_version: Option<String>,
+) -> Result<()> {
     let resolved = resolve_browser(browser_arg).await?;
-    let state = ServerState::new(resolved);
+    let sidecar_config = crate::sidecar::SidecarConfig {
+        version: playwright_version,
+    };
+    let state = ServerState::with_sidecar_config(resolved, sidecar_config);
     let tools = ToolRegistry::new();
     crate::mcp::tools::register_all(&tools);
     run(state, tools).await
@@ -41,4 +42,24 @@ pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrow
     Err(anyhow!(
         "no browser selected: pass a browser argument, set BROWSER_CONTROL, or run `browser-control set default <value>`"
     ))
+}
+
+/// Acquire the Firefox BiDi single-session lock if `resolved` is a
+/// registered browser on the BiDi engine. Returns `None` for external
+/// URL endpoints (the lock is per-registered-name) and for CDP engines.
+/// Wait bound: 30 s; on timeout, returns the typed `BidiLockBusy` error.
+pub fn acquire_bidi_lock_if_needed(
+    registry: &crate::registry::Registry,
+    resolved: &ResolvedBrowser,
+) -> Result<Option<crate::registry::BidiLockGuard>> {
+    use crate::detect::Engine;
+    if resolved.engine != Engine::Bidi {
+        return Ok(None);
+    }
+    let name = match &resolved.source {
+        crate::cli::env_resolver::Source::Registered { name } => name.clone(),
+        crate::cli::env_resolver::Source::External => return Ok(None),
+    };
+    let guard = registry.bidi_lock_acquire(&name, std::time::Duration::from_secs(30))?;
+    Ok(Some(guard))
 }

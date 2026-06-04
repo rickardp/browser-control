@@ -12,14 +12,24 @@
 //! Transport errors (script failure, attach failure) exit non-zero; HTTP
 //! status is reported verbatim and does not change the exit code.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::cli::mcp::resolve_browser;
+use crate::cli::route;
+use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
-use crate::session::PageSession;
+use crate::session::freshness;
+use crate::session::{evaluate_for_origin_with_recover_once, PageSession};
+
+// The default fetch timeout (60 000 ms) is set on the CLI flag in
+// `main.rs`. Bounded so a wedged renderer fails fast instead of dragging
+// out the upstream protocol timeout; tunable per invocation via
+// `--timeout-ms` for slow-network workloads.
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -31,20 +41,99 @@ pub async fn run(
     target: Option<String>,
     include: bool,
     output: Option<PathBuf>,
+    timeout_ms: u64,
+    max_age: String,
+) -> Result<()> {
+    let mut trace = CommandTrace::new("fetch");
+    let result = run_inner(
+        browser, url, method, headers, data, target, include, output, timeout_ms, max_age,
+        &mut trace,
+    )
+    .await;
+    trace.finish(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    browser: Option<String>,
+    url: String,
+    method: String,
+    headers: Vec<String>,
+    data: Option<String>,
+    target: Option<String>,
+    include: bool,
+    output: Option<PathBuf>,
+    timeout_ms: u64,
+    max_age: String,
+    trace: &mut CommandTrace,
 ) -> Result<()> {
     let header_map = parse_headers(&headers)?;
     let expr = build_fetch_expr(&url, &method, &header_map, data.as_deref())?;
+    let fetch_timeout = Duration::from_millis(timeout_ms);
+    let max_age = freshness::parse_max_age(&max_age)?;
 
-    let resolved = resolve_browser(browser).await?;
-    let session = match target.as_deref() {
-        Some(regex) => {
-            PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?
+    // Path-syntax parsing: `<browser>` or `<browser>/<tab>` in the
+    // positional. `--target <regex>` and `/<tab>` are mutually exclusive.
+    // The preamble (parse, mutual-exclusion, resolve, registry, BiDi lock) is
+    // shared with `eval`/`storage`; see `crate::cli::route`.
+    let r = route::preamble(browser, target.as_deref(), trace).await?;
+    let resolved = &r.resolved;
+
+    let result = match (r.tab_name.clone(), target.as_deref()) {
+        // Path 1: <browser>/<tab> — fetch against the named tab.
+        // Engine-agnostic via TabBackend + recover-once on dead tabs.
+        (Some(name), None) => {
+            trace.route("named-tab").tab_name(&name);
+            let expr = expr.clone();
+            route::run_named_tab(
+                &r,
+                &name,
+                "named tabs (`<browser>/<name>`) require a registered browser",
+                move |b, target_id| {
+                    let expr = expr.clone();
+                    async move {
+                        b.ensure_fresh(&target_id, max_age).await?;
+                        b.evaluate(&target_id, &expr, true, fetch_timeout).await
+                    }
+                },
+            )
+            .await?
         }
-        None => PageSession::attach_for_origin(&resolved.endpoint, resolved.engine, &url).await?,
+        // Path 2: --target regex (legacy).
+        (None, Some(regex)) => {
+            trace.route("target-regex");
+            let session =
+                PageSession::attach(&resolved.endpoint, resolved.engine, Some(regex)).await?;
+            session.ensure_fresh(max_age).await?;
+            let value = session
+                .evaluate_with_timeout(&expr, true, Some(fetch_timeout))
+                .await;
+            session.close().await;
+            value?
+        }
+        // Path 3: bare browser → attach_for_origin (current default).
+        // Auth-inheritance: the request runs from the URL's origin, so
+        // cookies/credentials propagate. Scratch routing (which would use
+        // about:blank) would lose this; we deliberately keep
+        // attach_for_origin here instead.
+        //
+        // Recover-once lives in the shared session helper so CLI fetch and
+        // wait-for-cookie validation cannot drift on the origin-bound contract.
+        (None, None) => {
+            trace.route("attach-for-origin");
+            evaluate_for_origin_with_recover_once(
+                &resolved.endpoint,
+                resolved.engine,
+                &url,
+                &expr,
+                true,
+                fetch_timeout,
+                max_age,
+            )
+            .await?
+        }
+        _ => unreachable!("mutex was checked above"),
     };
-    let result = session.evaluate(&expr, true).await;
-    session.close().await;
-    let result = result?;
 
     let envelope = parse_envelope(&result)?;
 
@@ -80,6 +169,20 @@ struct FetchEnvelope {
     status: u16,
     status_text: String,
     headers: Vec<(String, String)>,
+    body: String,
+}
+
+/// Wire shape of the `FETCH_JS` envelope. Deserialized directly; only `status`
+/// is required. `headers` is a `BTreeMap` so iteration is key-sorted, matching
+/// the previous `serde_json::Map` iteration order.
+#[derive(Deserialize)]
+struct RawFetchEnvelope {
+    status: u16,
+    #[serde(default, rename = "statusText")]
+    status_text: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
     body: String,
 }
 
@@ -130,36 +233,13 @@ fn parse_envelope(v: &Value) -> Result<FetchEnvelope> {
     let s = v
         .as_str()
         .ok_or_else(|| anyhow!("fetch script returned non-string value: {v}"))?;
-    let inner: Value = serde_json::from_str(s)
+    let raw: RawFetchEnvelope = serde_json::from_str(s)
         .with_context(|| format!("fetch script returned invalid JSON: {s}"))?;
-    let status = inner
-        .get("status")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| anyhow!("fetch envelope missing `status`"))? as u16;
-    let status_text = inner
-        .get("statusText")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let headers = inner
-        .get("headers")
-        .and_then(|x| x.as_object())
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let body = inner
-        .get("body")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
     Ok(FetchEnvelope {
-        status,
-        status_text,
-        headers,
-        body,
+        status: raw.status,
+        status_text: raw.status_text,
+        headers: raw.headers.into_iter().collect(),
+        body: raw.body,
     })
 }
 

@@ -6,6 +6,7 @@
 //! by a long-lived BiDi client via [`PageSession::from_bidi_cache`].
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
@@ -14,7 +15,9 @@ use serde_json::{json, Value};
 use crate::bidi::BidiClient;
 use crate::cdp::CdpClient;
 use crate::detect::Engine;
-use crate::session::targets::{open_bidi, open_cdp};
+use crate::errors::SessionError;
+use crate::session::freshness;
+use crate::session::targets::{open_bidi, open_cdp, BidiContext, CdpTarget};
 
 /// A bound page-level session. Variants are not constructed directly outside
 /// this module; use [`PageSession::attach`].
@@ -35,6 +38,11 @@ pub struct CdpPage {
 pub struct BidiPage {
     pub client: Arc<BidiClient>,
     pub context: String,
+    /// True when this `PageSession` opened the BiDi session (`session.new`)
+    /// and is therefore responsible for ending it on close. False for
+    /// sessions built from a shared, cached client (e.g. MCP server) where
+    /// the lifetime is managed externally.
+    owns_session: bool,
 }
 
 impl PageSession {
@@ -50,6 +58,13 @@ impl PageSession {
                 let client = open_cdp(endpoint).await?;
                 let target_id = pick_cdp_page(&client, pattern.as_ref()).await?;
                 let session_id = client.attach_to_target(&target_id).await?;
+                // Enable Inspector domain so `Inspector.targetCrashed`
+                // is delivered to this session while evaluates are in
+                // flight. Best-effort; see `TabBackend::evaluate` for
+                // rationale.
+                let _ = client
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
+                    .await;
                 Ok(PageSession::Cdp(CdpPage {
                     client,
                     session_id,
@@ -60,7 +75,11 @@ impl PageSession {
                 let client = Arc::new(open_bidi(endpoint).await?);
                 client.session_new().await?;
                 let context = pick_bidi_context(&client, pattern.as_ref()).await?;
-                Ok(PageSession::Bidi(BidiPage { client, context }))
+                Ok(PageSession::Bidi(BidiPage {
+                    client,
+                    context,
+                    owns_session: true,
+                }))
             }
         }
     }
@@ -73,7 +92,11 @@ impl PageSession {
     pub async fn from_bidi_cache(client: Arc<BidiClient>, url_regex: Option<&str>) -> Result<Self> {
         let pattern = url_regex.map(Regex::new).transpose()?;
         let context = pick_bidi_context(&client, pattern.as_ref()).await?;
-        Ok(PageSession::Bidi(BidiPage { client, context }))
+        Ok(PageSession::Bidi(BidiPage {
+            client,
+            context,
+            owns_session: false,
+        }))
     }
 
     /// Attach to (or create) a page whose document origin matches `origin`.
@@ -98,6 +121,9 @@ impl PageSession {
                     None => create_cdp_tab(&client, &origin_root).await?,
                 };
                 let session_id = client.attach_to_target(&target_id).await?;
+                let _ = client
+                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
+                    .await;
                 Ok(PageSession::Cdp(CdpPage {
                     client,
                     session_id,
@@ -111,7 +137,11 @@ impl PageSession {
                     Some(c) => c,
                     None => create_bidi_tab(&client, &origin_root).await?,
                 };
-                Ok(PageSession::Bidi(BidiPage { client, context }))
+                Ok(PageSession::Bidi(BidiPage {
+                    client,
+                    context,
+                    owns_session: true,
+                }))
             }
         }
     }
@@ -121,28 +151,100 @@ impl PageSession {
     /// `await_promise = true` mirrors `Runtime.evaluate({awaitPromise:true})`
     /// and is appropriate for fetch / promise-returning code. The returned
     /// value is the raw `result.value` from CDP / BiDi after `returnByValue`.
+    ///
+    /// Equivalent to [`evaluate_with_timeout`](Self::evaluate_with_timeout)
+    /// with `timeout = None` (bounded only by the upstream client's protocol
+    /// timeout, currently 30 s). Prefer the bounded form in any path where
+    /// the renderer's responsiveness is uncertain — see the module docs.
     pub async fn evaluate(&self, expression: &str, await_promise: bool) -> Result<Value> {
+        self.evaluate_with_timeout(expression, await_promise, None)
+            .await
+    }
+
+    /// Bounded variant of [`evaluate`](Self::evaluate).
+    ///
+    /// If `timeout` is `Some`, the call races the upstream send against a
+    /// `tokio::time::sleep`. On expiry, returns a typed
+    /// [`SessionError::TabHung`] tagged with the target's id and URL — this
+    /// is the catch-all for the alive-but-unresponsive renderer case that
+    /// has no protocol event signal (service-worker-paused page, JS infinite
+    /// loop, modal dialog, devtools-paused, embedded admin UIs whose
+    /// renderer ignores `Runtime.evaluate`).
+    ///
+    /// On the CDP arm, the in-flight `Runtime.evaluate` is additionally
+    /// raced against the renderer-crash events
+    /// (`Target.targetCrashed` / `Inspector.targetCrashed`) for this
+    /// target/session — a matching event short-circuits the call with a
+    /// typed [`SessionError::TabCrashed`] instead of waiting for the
+    /// timeout. BiDi has no equivalent protocol event; a context crash
+    /// surfaces as `no such frame/context` on the next request and is
+    /// classified as `TargetGone` by the client layer.
+    ///
+    /// If `timeout` is `None`, the call is bounded only by the underlying
+    /// client's protocol timeout (CDP: 30 s, BiDi: 30 s).
+    pub async fn evaluate_with_timeout(
+        &self,
+        expression: &str,
+        await_promise: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let target_id = self.target_id();
+        let url = None;
         match self {
             PageSession::Cdp(p) => {
-                let v = p
-                    .client
-                    .send_with_session(
-                        "Runtime.evaluate",
-                        json!({
-                            "expression": expression,
-                            "returnByValue": true,
-                            "awaitPromise": await_promise,
-                        }),
-                        Some(&p.session_id),
-                    )
-                    .await?;
-                Ok(v["result"]["value"].clone())
+                let inner = async {
+                    let v = p
+                        .client
+                        .send_with_session(
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": expression,
+                                "returnByValue": true,
+                                "awaitPromise": await_promise,
+                            }),
+                            Some(&p.session_id),
+                        )
+                        .await?;
+                    Ok::<Value, anyhow::Error>(v["result"]["value"].clone())
+                };
+                crate::session::crash::evaluate_with_crash_detection(
+                    &p.client,
+                    &p.target_id,
+                    Some(&p.session_id),
+                    inner,
+                    timeout,
+                )
+                .await
             }
             PageSession::Bidi(p) => {
-                let _ = await_promise; // BiDi always awaits per script_evaluate
-                let v = p.client.script_evaluate(&p.context, expression).await?;
-                Ok(v["result"]["value"].clone())
+                let inner = async {
+                    let _ = await_promise; // BiDi always awaits per script_evaluate
+                    let v = p.client.script_evaluate(&p.context, expression).await?;
+                    Ok::<Value, anyhow::Error>(v["result"]["value"].clone())
+                };
+                match timeout {
+                    None => inner.await,
+                    Some(d) => match tokio::time::timeout(d, inner).await {
+                        Ok(r) => r,
+                        Err(_) => Err(SessionError::TabHung {
+                            target_id,
+                            url,
+                            timeout_ms: d.as_millis() as u64,
+                            hint: "op-timeout",
+                        }
+                        .into()),
+                    },
+                }
             }
+        }
+    }
+
+    /// Engine-specific target id for diagnostics (CDP `targetId`, BiDi
+    /// browsing context id).
+    pub fn target_id(&self) -> Option<String> {
+        match self {
+            PageSession::Cdp(p) => Some(p.target_id.clone()),
+            PageSession::Bidi(p) => Some(p.context.clone()),
         }
     }
 
@@ -159,6 +261,59 @@ impl PageSession {
                 p.client.browsing_context_navigate(&p.context, url).await?;
                 Ok(())
             }
+        }
+    }
+
+    /// Reload an old HTTP(S) page before reading auth-sensitive page state.
+    ///
+    /// The age is measured from the document's `performance.timeOrigin`.
+    /// `about:blank`, `chrome://`, `devtools://`, and other non-web pages are
+    /// left untouched.
+    pub async fn ensure_fresh(&self, max_age: Duration) -> Result<()> {
+        let info_value = self
+            .evaluate_with_timeout(
+                freshness::PAGE_FRESHNESS_EXPR,
+                false,
+                Some(freshness::CHECK_TIMEOUT),
+            )
+            .await?;
+        let info = freshness::parse_page_freshness(info_value)?;
+        if !info.should_reload(max_age) {
+            return Ok(());
+        }
+
+        tracing::info!(
+            target = "session",
+            url = %info.href,
+            age_ms = info.age_ms,
+            max_age_ms = max_age.as_millis(),
+            "reloading stale page before reading page context"
+        );
+        tokio::time::timeout(freshness::RELOAD_READY_TIMEOUT, self.navigate(&info.href)).await??;
+        self.wait_until_ready().await
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + freshness::RELOAD_READY_TIMEOUT;
+        loop {
+            let value = self
+                .evaluate_with_timeout(
+                    freshness::READY_STATE_EXPR,
+                    false,
+                    Some(freshness::CHECK_TIMEOUT),
+                )
+                .await?;
+            if freshness::is_ready(&value) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target = "session",
+                    "page reload did not reach document.readyState=complete before continuing"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(freshness::READY_POLL_INTERVAL).await;
         }
     }
 
@@ -185,7 +340,7 @@ impl PageSession {
             PageSession::Bidi(p) => {
                 let _ = full_page; // BiDi captures the viewport by default
                 p.client
-                    .browsing_context_capture_screenshot(&p.context)
+                    .browsing_context_capture_screenshot(&p.context, None)
                     .await
             }
         }
@@ -199,65 +354,243 @@ impl PageSession {
         }
     }
 
-    /// Release the underlying CDP connection (no-op for BiDi, whose client
-    /// is shared via `Arc`).
+    /// Release the underlying connection. For BiDi sessions that this
+    /// `PageSession` opened, also calls `session.end` so that Firefox (which
+    /// enforces one BiDi session per browser) accepts a fresh `session.new`
+    /// on the next invocation.
     pub async fn close(self) {
         match self {
             PageSession::Cdp(p) => p.client.close().await,
-            PageSession::Bidi(_) => {}
+            PageSession::Bidi(p) => {
+                if p.owns_session {
+                    let _ = p.client.session_end().await;
+                }
+            }
         }
     }
 }
 
+/// Attach to a page on `origin_url`'s document origin, evaluate `expression`,
+/// close the session, and retry once on recoverable target-level failures.
+///
+/// This is the shared path for credentialed page-context fetches. Each attempt
+/// resolves the target by origin, so retrying never falls back to an opaque
+/// `about:blank` scratch tab that would drop cookies or trip CORS.
+pub async fn evaluate_for_origin_with_recover_once(
+    endpoint: &str,
+    engine: Engine,
+    origin_url: &str,
+    expression: &str,
+    await_promise: bool,
+    timeout: Duration,
+    max_age: Duration,
+) -> Result<Value> {
+    let first = evaluate_for_origin_once(
+        endpoint,
+        engine,
+        origin_url,
+        expression,
+        await_promise,
+        timeout,
+        max_age,
+    )
+    .await;
+    match first {
+        Ok(v) => Ok(v),
+        Err(e) if crate::errors::is_recoverable_tab_failure(&e) => {
+            tracing::warn!(
+                target = "session",
+                "origin-bound evaluate failed with recoverable error; re-attaching and retrying once: {e:#}"
+            );
+            evaluate_for_origin_once(
+                endpoint,
+                engine,
+                origin_url,
+                expression,
+                await_promise,
+                timeout,
+                max_age,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn evaluate_for_origin_once(
+    endpoint: &str,
+    engine: Engine,
+    origin_url: &str,
+    expression: &str,
+    await_promise: bool,
+    timeout: Duration,
+    max_age: Duration,
+) -> Result<Value> {
+    let session = PageSession::attach_for_origin(endpoint, engine, origin_url).await?;
+    let result = async {
+        session.ensure_fresh(max_age).await?;
+        session
+            .evaluate_with_timeout(expression, await_promise, Some(timeout))
+            .await
+    }
+    .await;
+    session.close().await;
+    result
+}
+
+/// Per-candidate pre-flight probe budget when iterating URL-regex matches.
+///
+/// Each candidate gets this much wall-clock to reply to `Runtime.evaluate("1")`
+/// (CDP) or `script.evaluate("1")` (BiDi). Tight enough that a wedged
+/// renderer (Brave Sleeping Tab, devtools-paused, infinite-loop) fails fast
+/// so we can iterate to the next match; generous enough that a healthy tab
+/// on a loaded machine still answers.
+const PICK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn pick_cdp_page(client: &CdpClient, pattern: Option<&Regex>) -> Result<String> {
     let targets = client.list_targets().await?;
-    let mut pages = targets
-        .iter()
-        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"));
-    let pick = if let Some(re) = pattern {
-        pages
-            .find(|t| {
-                t.get("url")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| re.is_match(u))
-            })
-            .ok_or_else(|| anyhow!("no CDP page target matched URL regex"))?
-    } else {
-        pages
+    let pages: Vec<CdpTarget> = CdpTarget::pages(&targets).collect();
+
+    // No regex: keep existing behaviour — take the first page. We do not
+    // probe in this branch because there's typically only one candidate and
+    // the caller hasn't expressed which they want; failing fast on a wedged
+    // single page would be more surprising than just letting the op timeout
+    // handle it.
+    let Some(re) = pattern else {
+        return pages
+            .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("no page target found"))?
+            .map(|t| t.id)
+            .ok_or_else(|| anyhow!("no page target found"));
     };
-    pick.get("targetId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("targetId missing from page target"))
+
+    let matches: Vec<CdpTarget> = pages.into_iter().filter(|t| re.is_match(&t.url)).collect();
+    if matches.is_empty() {
+        return Err(anyhow!("no CDP page target matched URL regex"));
+    }
+
+    // Probe each match in order. Return the first responsive one. If all
+    // are unresponsive, surface a TabHung with the count so the caller
+    // gets an actionable error instead of a 10-second op timeout.
+    let mut hung_count = 0usize;
+    let mut last_target: Option<String> = None;
+    let mut last_url: Option<String> = None;
+    for t in &matches {
+        let target_id = t.id.clone();
+        last_target = Some(target_id.clone());
+        last_url = Some(t.url.clone());
+        if probe_cdp_target(client, &target_id, PICK_PROBE_TIMEOUT).await {
+            return Ok(target_id);
+        }
+        hung_count += 1;
+    }
+    let err: anyhow::Error = SessionError::TabHung {
+        target_id: last_target,
+        url: last_url,
+        timeout_ms: PICK_PROBE_TIMEOUT.as_millis() as u64,
+        hint: "all-matches-hung",
+    }
+    .into();
+    Err(err.context(format!(
+        "URL regex matched {hung_count} page(s) but none responded to a {}ms probe",
+        PICK_PROBE_TIMEOUT.as_millis()
+    )))
+}
+
+/// Probe a CDP target by attaching a transient session and evaluating `1`.
+///
+/// Returns `true` if the target answered within `budget`. Best-effort detach
+/// on the way out; the probe outcome doesn't depend on the detach succeeding.
+async fn probe_cdp_target(client: &CdpClient, target_id: &str, budget: Duration) -> bool {
+    let attach = tokio::time::timeout(
+        budget,
+        client.send(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        ),
+    )
+    .await;
+    let session_id = match attach {
+        Ok(Ok(v)) => match v.get("sessionId").and_then(|s| s.as_str()) {
+            Some(s) => s.to_string(),
+            None => return false,
+        },
+        _ => return false,
+    };
+    let eval = client.send_with_session(
+        "Runtime.evaluate",
+        json!({
+            "expression": "1",
+            "returnByValue": true,
+            "awaitPromise": false,
+        }),
+        Some(&session_id),
+    );
+    let alive = matches!(tokio::time::timeout(budget, eval).await, Ok(Ok(_)));
+    let _ = client
+        .send(
+            "Target.detachFromTarget",
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+    alive
 }
 
 async fn pick_bidi_context(client: &BidiClient, pattern: Option<&Regex>) -> Result<String> {
     let tree = client.send("browsingContext.getTree", json!({})).await?;
-    let contexts = tree
-        .get("contexts")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("no contexts in browsingContext.getTree"))?;
-    if let Some(re) = pattern {
-        for c in contexts {
-            let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if re.is_match(url) {
-                return c
-                    .get("context")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| anyhow!("no context id"));
-            }
-        }
-        Err(anyhow!("no BiDi context matched URL regex"))
-    } else {
-        contexts
-            .first()
-            .and_then(|c| c.get("context").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("no top-level browsing context"))
+    let contexts = BidiContext::from_tree(&tree);
+
+    // No regex: existing "first top-level context" behaviour.
+    let Some(re) = pattern else {
+        return contexts
+            .into_iter()
+            .next()
+            .map(|c| c.context)
+            .ok_or_else(|| anyhow!("no top-level browsing context"));
+    };
+
+    let matches: Vec<BidiContext> = contexts
+        .into_iter()
+        .filter(|c| re.is_match(&c.url))
+        .collect();
+    if matches.is_empty() {
+        return Err(anyhow!("no BiDi context matched URL regex"));
     }
+
+    let mut hung_count = 0usize;
+    let mut last_ctx: Option<String> = None;
+    let mut last_url: Option<String> = None;
+    for c in &matches {
+        let ctx = c.context.clone();
+        last_ctx = Some(ctx.clone());
+        last_url = Some(c.url.clone());
+        if probe_bidi_context(client, &ctx, PICK_PROBE_TIMEOUT).await {
+            return Ok(ctx);
+        }
+        hung_count += 1;
+    }
+    let err: anyhow::Error = SessionError::TabHung {
+        target_id: last_ctx,
+        url: last_url,
+        timeout_ms: PICK_PROBE_TIMEOUT.as_millis() as u64,
+        hint: "all-matches-hung",
+    }
+    .into();
+    Err(err.context(format!(
+        "URL regex matched {hung_count} context(s) but none responded to a {}ms probe",
+        PICK_PROBE_TIMEOUT.as_millis()
+    )))
+}
+
+/// Probe a BiDi browsing context via `script.evaluate("1")`.
+///
+/// BiDi has no per-target attach; the existing session covers all contexts.
+/// Returns `true` if the context answered within `budget`.
+async fn probe_bidi_context(client: &BidiClient, context: &str, budget: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(budget, client.script_evaluate(context, "1")).await,
+        Ok(Ok(_))
+    )
 }
 
 /// True when both URLs share scheme, host, and effective port.
@@ -280,20 +613,11 @@ pub(crate) fn origin_root_url(u: &url::Url) -> String {
 
 async fn find_cdp_target_for_origin(client: &CdpClient, want: &url::Url) -> Result<Option<String>> {
     let targets = client.list_targets().await?;
-    Ok(targets
-        .iter()
-        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-        .find_map(|t| {
-            let u = t.get("url").and_then(|v| v.as_str())?;
-            let parsed = url::Url::parse(u).ok()?;
-            if same_origin(&parsed, want) {
-                t.get("targetId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            }
-        }))
+    let found = CdpTarget::pages(&targets).find_map(|t| {
+        let parsed = url::Url::parse(&t.url).ok()?;
+        same_origin(&parsed, want).then_some(t.id)
+    });
+    Ok(found)
 }
 
 async fn create_cdp_tab(client: &CdpClient, url: &str) -> Result<String> {
@@ -311,21 +635,9 @@ async fn find_bidi_context_for_origin(
     want: &url::Url,
 ) -> Result<Option<String>> {
     let tree = client.send("browsingContext.getTree", json!({})).await?;
-    let contexts = tree
-        .get("contexts")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(contexts.iter().find_map(|c| {
-        let u = c.get("url").and_then(|v| v.as_str())?;
-        let parsed = url::Url::parse(u).ok()?;
-        if same_origin(&parsed, want) {
-            c.get("context")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        }
+    Ok(BidiContext::from_tree(&tree).into_iter().find_map(|c| {
+        let parsed = url::Url::parse(&c.url).ok()?;
+        same_origin(&parsed, want).then_some(c.context)
     }))
 }
 
@@ -346,6 +658,11 @@ async fn create_bidi_tab(client: &BidiClient, url: &str) -> Result<String> {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message;
 
     async fn spawn_cdp_mock(targets: Vec<Value>) -> String {
@@ -372,6 +689,107 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    async fn spawn_cdp_origin_eval_mock(
+        targets: Vec<Value>,
+        fail_first_eval: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let targets = Arc::new(targets);
+        let created_urls = Arc::new(Mutex::new(Vec::new()));
+        let attached_targets = Arc::new(Mutex::new(Vec::new()));
+        let eval_count = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn({
+            let targets = targets.clone();
+            let created_urls = created_urls.clone();
+            let attached_targets = attached_targets.clone();
+            let eval_count = eval_count.clone();
+            async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let targets = targets.clone();
+                    let created_urls = created_urls.clone();
+                    let attached_targets = attached_targets.clone();
+                    let eval_count = eval_count.clone();
+                    tokio::spawn(async move {
+                        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        while let Some(Ok(Message::Text(t))) = ws.next().await {
+                            let req: Value = serde_json::from_str(&t).unwrap();
+                            let id = req["id"].as_u64().unwrap();
+                            let method = req["method"].as_str().unwrap_or("");
+                            if method == "Runtime.evaluate"
+                                && fail_first_eval
+                                && eval_count.fetch_add(1, Ordering::SeqCst) == 0
+                            {
+                                let resp = json!({
+                                    "id": id,
+                                    "error": {
+                                        "code": -32000,
+                                        "message": "No target with given id",
+                                    }
+                                });
+                                ws.send(Message::Text(resp.to_string())).await.unwrap();
+                                continue;
+                            }
+                            let result = match method {
+                                "Target.getTargets" => {
+                                    json!({"targetInfos": targets.as_ref().clone()})
+                                }
+                                "Target.createTarget" => {
+                                    let url = req
+                                        .pointer("/params/url")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    created_urls.lock().await.push(url);
+                                    json!({"targetId": "NEW"})
+                                }
+                                "Target.attachToTarget" => {
+                                    let target_id = req
+                                        .pointer("/params/targetId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let mut attached = attached_targets.lock().await;
+                                    attached.push(target_id);
+                                    json!({"sessionId": format!("S{}", attached.len())})
+                                }
+                                "Target.detachFromTarget" => json!({}),
+                                "Inspector.enable" => json!({}),
+                                "Runtime.evaluate" => {
+                                    let expression = req
+                                        .pointer("/params/expression")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let value = if expression == freshness::READY_STATE_EXPR {
+                                        json!("complete")
+                                    } else if expression == freshness::PAGE_FRESHNESS_EXPR {
+                                        json!({
+                                            "href": "https://example.com/login",
+                                            "ageMs": 0.0,
+                                            "readyState": "complete"
+                                        })
+                                    } else {
+                                        json!("ok")
+                                    };
+                                    json!({"result": {"value": value}})
+                                }
+                                _ => json!({}),
+                            };
+                            let resp = json!({"id": id, "result": result});
+                            ws.send(Message::Text(resp.to_string())).await.unwrap();
+                        }
+                    });
+                }
+            }
+        });
+
+        (format!("ws://{addr}"), created_urls, attached_targets)
     }
 
     #[test]
@@ -422,6 +840,58 @@ mod tests {
             PageSession::Cdp(p) => assert_eq!(p.target_id, "NEW"),
             _ => panic!("expected CDP"),
         }
+    }
+
+    #[tokio::test]
+    async fn evaluate_for_origin_creates_origin_tab_when_no_match() {
+        let (url, created_urls, attached_targets) = spawn_cdp_origin_eval_mock(
+            vec![json!({"targetId":"a","type":"page","url":"https://other.test/"})],
+            false,
+        )
+        .await;
+        let value = evaluate_for_origin_with_recover_once(
+            &url,
+            Engine::Cdp,
+            "https://example.com/api",
+            "1+1",
+            true,
+            Duration::from_secs(1),
+            freshness::DEFAULT_MAX_AGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!("ok"));
+        assert_eq!(
+            *created_urls.lock().await,
+            vec!["https://example.com/".to_string()]
+        );
+        assert_eq!(*attached_targets.lock().await, vec!["NEW".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn evaluate_for_origin_reattaches_and_retries_once() {
+        let (url, created_urls, attached_targets) = spawn_cdp_origin_eval_mock(
+            vec![json!({"targetId":"A","type":"page","url":"https://example.com/login"})],
+            true,
+        )
+        .await;
+        let value = evaluate_for_origin_with_recover_once(
+            &url,
+            Engine::Cdp,
+            "https://example.com/api",
+            "1+1",
+            true,
+            Duration::from_secs(1),
+            freshness::DEFAULT_MAX_AGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!("ok"));
+        assert!(created_urls.lock().await.is_empty());
+        assert_eq!(
+            *attached_targets.lock().await,
+            vec!["A".to_string(), "A".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -492,5 +962,233 @@ mod tests {
         let b64 = s.screenshot(false).await.unwrap();
         assert_eq!(b64, "PNGDATA");
         s.close().await;
+    }
+
+    /// Spawn a CDP mock that answers `Target.getTargets` / `attachToTarget`
+    /// normally but **never replies to `Runtime.evaluate`** — simulating the
+    /// iLO-style wedge where the renderer is alive but refuses to service JS.
+    async fn spawn_cdp_mock_eval_hangs(targets: Vec<Value>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap_or("");
+                if method == "Runtime.evaluate" {
+                    // Drop the request on the floor. No response, ever.
+                    continue;
+                }
+                let result = match method {
+                    "Target.getTargets" => json!({"targetInfos": targets.clone()}),
+                    "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                    _ => json!({}),
+                };
+                let resp = json!({"id": id, "result": result});
+                ws.send(Message::Text(resp.to_string())).await.unwrap();
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Test #1: the iLO-style wedge. `evaluate_with_timeout` returns a typed
+    /// `TabHung` within the bound — not the 30 s upstream `REQUEST_TIMEOUT`.
+    #[tokio::test]
+    async fn evaluate_with_timeout_returns_tab_hung_on_no_reply() {
+        let url = spawn_cdp_mock_eval_hangs(vec![
+            json!({"targetId":"iLO","type":"page","url":"https://192.168.2.28/"}),
+        ])
+        .await;
+        let s = PageSession::attach(&url, Engine::Cdp, None).await.unwrap();
+        let start = std::time::Instant::now();
+        let err = s
+            .evaluate_with_timeout("1+1", false, Some(Duration::from_millis(300)))
+            .await
+            .expect_err("must return TabHung");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "did not honour 300ms bound, took {elapsed:?}"
+        );
+        let downcast = err.downcast_ref::<SessionError>().expect("typed error");
+        match downcast {
+            SessionError::TabHung {
+                target_id,
+                timeout_ms,
+                hint,
+                ..
+            } => {
+                assert_eq!(target_id.as_deref(), Some("iLO"));
+                assert_eq!(*timeout_ms, 300);
+                assert_eq!(*hint, "op-timeout");
+            }
+            other => panic!("expected TabHung, got {other:?}"),
+        }
+        s.close().await;
+    }
+
+    /// Test #16 (partial): a stuck eval on one PageSession does not block a
+    /// concurrent eval on a sibling PageSession sharing the same browser. We
+    /// model the "sibling" by opening a second mock — same protocol, two
+    /// CdpClient instances. The point of the test is to verify that the
+    /// timeout/error path on one session is isolated from the other.
+    #[tokio::test]
+    async fn stuck_eval_does_not_block_sibling_session() {
+        let bad = spawn_cdp_mock_eval_hangs(vec![
+            json!({"targetId":"BAD","type":"page","url":"https://192.168.2.28/"}),
+        ])
+        .await;
+        let good = spawn_cdp_mock(vec![
+            json!({"targetId":"GOOD","type":"page","url":"https://example.com/"}),
+        ])
+        .await;
+
+        let s_bad = PageSession::attach(&bad, Engine::Cdp, None).await.unwrap();
+        let s_good = PageSession::attach(&good, Engine::Cdp, None).await.unwrap();
+
+        // Run both concurrently. The bad one should fast-fail; the good one
+        // should succeed independently.
+        let bad_fut = s_bad.evaluate_with_timeout("1+1", false, Some(Duration::from_millis(200)));
+        let good_fut = s_good.evaluate_with_timeout("1+1", false, Some(Duration::from_secs(5)));
+        let (bad_res, good_res) = tokio::join!(bad_fut, good_fut);
+
+        assert!(bad_res.is_err(), "bad session must surface TabHung");
+        assert_eq!(good_res.unwrap(), json!("ok"));
+
+        s_bad.close().await;
+        s_good.close().await;
+    }
+
+    /// CDP mock that selectively wedges `Runtime.evaluate` based on which
+    /// `sessionId` is in use. The mock maps each `attachToTarget` to a
+    /// distinct sessionId, so the test can decide "evals on tab X hang,
+    /// evals on tab Y succeed."
+    async fn spawn_cdp_mock_per_target_eval(
+        targets: Vec<Value>,
+        wedged_targets: Vec<&'static str>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // sessionId → wedge flag
+            let mut session_wedge: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            let mut next_session: u32 = 0;
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap_or("");
+                if method == "Runtime.evaluate" {
+                    if let Some(sid) = req.get("sessionId").and_then(|v| v.as_str()) {
+                        if session_wedge.get(sid).copied().unwrap_or(false) {
+                            // Drop on the floor.
+                            continue;
+                        }
+                    }
+                }
+                let result = match method {
+                    "Target.getTargets" => json!({"targetInfos": targets.clone()}),
+                    "Target.attachToTarget" => {
+                        let target_id = req
+                            .get("params")
+                            .and_then(|p| p.get("targetId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        next_session += 1;
+                        let sid = format!("S{next_session}");
+                        let wedge = wedged_targets.iter().any(|w| *w == target_id);
+                        session_wedge.insert(sid.clone(), wedge);
+                        json!({"sessionId": sid})
+                    }
+                    "Target.detachFromTarget" => json!({}),
+                    "Runtime.evaluate" => json!({"result": {"value": "ok"}}),
+                    _ => json!({}),
+                };
+                let resp = json!({"id": id, "result": result});
+                ws.send(Message::Text(resp.to_string())).await.unwrap();
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Regex matches two pages; the first is wedged, the second answers
+    /// the probe. We pick the second.
+    #[tokio::test]
+    async fn pick_cdp_iterates_past_hung_match() {
+        let url = spawn_cdp_mock_per_target_eval(
+            vec![
+                json!({"targetId":"DEAD","type":"page","url":"https://twitch.tv/gametechnology"}),
+                json!({"targetId":"LIVE","type":"page","url":"https://gametechnology.somewhere.com"}),
+            ],
+            vec!["DEAD"],
+        )
+        .await;
+        let s = PageSession::attach(&url, Engine::Cdp, Some(r"gametechnology"))
+            .await
+            .expect("must iterate past the wedged tab and pick LIVE");
+        match s {
+            PageSession::Cdp(p) => assert_eq!(p.target_id, "LIVE"),
+            _ => panic!("expected CDP"),
+        }
+    }
+
+    /// Regex matches two pages and both are wedged → typed TabHung with
+    /// the `all-matches-hung` hint. Must complete within
+    /// 2 × PICK_PROBE_TIMEOUT + slack (one probe per match).
+    #[tokio::test]
+    async fn pick_cdp_all_matches_hung_returns_tab_hung() {
+        let url = spawn_cdp_mock_per_target_eval(
+            vec![
+                json!({"targetId":"A","type":"page","url":"https://example.com/foo"}),
+                json!({"targetId":"B","type":"page","url":"https://example.com/bar"}),
+            ],
+            vec!["A", "B"],
+        )
+        .await;
+        let start = std::time::Instant::now();
+        let err = match PageSession::attach(&url, Engine::Cdp, Some(r"example\.com")).await {
+            Ok(_) => panic!("all matches wedged → must error"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < PICK_PROBE_TIMEOUT * 2 + Duration::from_millis(500),
+            "took too long: {elapsed:?}"
+        );
+        let typed = err.downcast_ref::<SessionError>().expect("typed error");
+        match typed {
+            SessionError::TabHung { hint, .. } => {
+                assert_eq!(*hint, "all-matches-hung");
+            }
+            other => panic!("expected TabHung, got {other:?}"),
+        }
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("URL regex matched 2 page(s)"),
+            "context missing count: {text}"
+        );
+    }
+
+    /// Regex matches one healthy page → picks it, the probe is a no-op
+    /// for behaviour (just confirms responsiveness) and we still attach.
+    #[tokio::test]
+    async fn pick_cdp_single_healthy_match_is_picked() {
+        let url = spawn_cdp_mock_per_target_eval(
+            vec![json!({"targetId":"OK","type":"page","url":"https://example.com/x"})],
+            vec![],
+        )
+        .await;
+        let s = PageSession::attach(&url, Engine::Cdp, Some(r"example"))
+            .await
+            .unwrap();
+        match s {
+            PageSession::Cdp(p) => assert_eq!(p.target_id, "OK"),
+            _ => panic!("expected CDP"),
+        }
     }
 }

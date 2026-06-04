@@ -12,6 +12,25 @@ pub const GET_DOM_JS: &str = r#"
 })
 "#;
 
+/// Resolves a selector to a clip rectangle in *document* coordinates,
+/// scrolling the element into view first. Returns `null` when the selector
+/// matches nothing or the element has zero area (hidden / detached).
+pub const GET_CLIP_RECT_JS: &str = r#"
+(function(selector) {
+    const el = document.querySelector(selector);
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
+    return {
+        x: r.left + window.scrollX,
+        y: r.top + window.scrollY,
+        width: r.width,
+        height: r.height,
+    };
+})
+"#;
+
 /// Interactive element picker. Resolves with the selector string for the picked element.
 pub const SELECT_ELEMENT_JS: &str = r#"
 (function() {

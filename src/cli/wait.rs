@@ -1,23 +1,42 @@
 //! `browser-control wait` — block until the browser endpoint is ready.
+//!
+//! Browser-wide command — tab suffixes on `--browser` are rejected.
+//! Readiness is the default (and only) mode; the former `--ready` flag
+//! is hidden and accepted as a no-op for backward compatibility.
 
 use anyhow::{anyhow, bail, Result};
 use std::time::{Duration, Instant};
 
+use crate::cli::env_resolver;
+use crate::cli::trace::CommandTrace;
 use crate::detect::Engine;
 
-pub async fn run(browser: Option<String>, ready: bool, timeout: u64) -> Result<()> {
-    if !ready {
-        bail!("`wait` requires --ready in this version");
+pub async fn run(browser: Option<String>, _ready: bool, timeout: u64) -> Result<()> {
+    let mut trace = CommandTrace::new("wait");
+    trace.route("registry");
+    let result: Result<()> = async {
+        if let Some(ref raw) = browser {
+            let parsed = env_resolver::parse_target(raw)?;
+            if parsed.tab.is_some() {
+                bail!(
+                    "`wait` operates browser-wide; tab suffixes are not supported \
+                     (got `{raw}`). Use a bare browser selector instead."
+                );
+            }
+        }
+        let resolved = crate::cli::mcp::resolve_browser(browser).await?;
+        trace.engine(resolved.engine);
+        wait_until_ready(
+            &resolved.endpoint,
+            resolved.engine,
+            Duration::from_secs(timeout),
+        )
+        .await?;
+        println!("ready");
+        Ok(())
     }
-    let resolved = crate::cli::mcp::resolve_browser(browser).await?;
-    wait_until_ready(
-        &resolved.endpoint,
-        resolved.engine,
-        Duration::from_secs(timeout),
-    )
-    .await?;
-    println!("ready");
-    Ok(())
+    .await;
+    trace.finish(result)
 }
 
 /// Convert a raw browser endpoint (which may be a `ws://host:port/...` URL or

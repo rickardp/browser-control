@@ -1,10 +1,36 @@
-//! `browser-control eval` — evaluate a JS expression in the active page.
+//! `browser-control eval` — evaluate a JS expression in a page.
+//!
+//! Three routing paths, picked by what the caller supplies:
+//!
+//! 1. **`eval <browser>/<tab>`** — named-tab path. Resolves `<tab>` in the
+//!    `tabs` SQLite table via the engine-agnostic [`TabBackend`]; if
+//!    missing, returns `TabNotFound` so the agent can
+//!    `tab open <browser>/<tab>` first. Mutually exclusive with
+//!    `--target`. Works for both CDP and BiDi browsers.
+//! 2. **`eval <browser>` with no `--target`** — routes through the
+//!    daemon-style scratch tab with recover-once. The default, and the
+//!    architectural fix for the iLO failure mode: lock-free `eval`
+//!    never silently lands on a user's admin tab. Engine-agnostic.
+//! 3. **`eval <browser> --target <regex>`** — explicit selector against
+//!    a user tab matching the URL regex. The original behaviour, kept
+//!    for ad-hoc targeted use.
+//!
+//! The shared preamble and the named-tab arm live in [`crate::cli::route`];
+//! see that module for the routing-path overview. The bare-browser arm here is
+//! scratch-with-recover-once (the iLO fix), and the External-endpoint fallback
+//! is the legacy direct attach.
+
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::cli::mcp::resolve_browser;
-use crate::session::PageSession;
+use crate::cli::env_resolver::Source;
+use crate::cli::route;
+use crate::cli::trace::CommandTrace;
+use crate::session::backend::open_backend;
+use crate::session::freshness;
+use crate::session::{with_scratch_recovery, PageSession};
 
 pub async fn run(
     browser: Option<String>,
@@ -12,13 +38,111 @@ pub async fn run(
     target: Option<String>,
     json: bool,
     await_promise: bool,
+    timeout_ms: u64,
+    max_age: String,
 ) -> Result<()> {
-    let resolved = resolve_browser(browser).await?;
-    let session =
-        PageSession::attach(&resolved.endpoint, resolved.engine, target.as_deref()).await?;
-    let value = session.evaluate(&expression, await_promise).await;
-    session.close().await;
-    let value = value?;
+    let mut trace = CommandTrace::new("eval");
+    let result = run_inner(
+        browser,
+        expression,
+        target,
+        json,
+        await_promise,
+        timeout_ms,
+        max_age,
+        &mut trace,
+    )
+    .await;
+    trace.finish(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    browser: Option<String>,
+    expression: String,
+    target: Option<String>,
+    json: bool,
+    await_promise: bool,
+    timeout_ms: u64,
+    max_age: String,
+    trace: &mut CommandTrace,
+) -> Result<()> {
+    let timeout = Duration::from_millis(timeout_ms);
+    let max_age = freshness::parse_max_age(&max_age)?;
+
+    let r = route::preamble(browser, target.as_deref(), trace).await?;
+    let resolved = &r.resolved;
+
+    let value = match (r.tab_name.clone(), target) {
+        // Path 1: <browser>/<tab> — named tab, engine-agnostic, with
+        // recover-once around a tab that dies between resolve and op.
+        (Some(name), None) => {
+            trace.route("named-tab").tab_name(&name);
+            let expr = expression.clone();
+            route::run_named_tab(
+                &r,
+                &name,
+                "named tabs (`<browser>/<name>`) require a registered browser; \
+                 external endpoints can't carry tab names",
+                move |b, target_id| {
+                    let expr = expr.clone();
+                    async move {
+                        b.ensure_fresh(&target_id, max_age).await?;
+                        b.evaluate(&target_id, &expr, await_promise, timeout).await
+                    }
+                },
+            )
+            .await?
+        }
+        // Path 2: bare browser, no `--target` → scratch tab with
+        // recover-once. Engine-agnostic via TabBackend.
+        (None, None) => {
+            if matches!(resolved.source, Source::External) {
+                // External URL endpoints don't have a registered name to
+                // key the scratch row by. Fall back to the legacy direct
+                // attach so `eval ws://...` still works.
+                trace.route("direct");
+                let session =
+                    PageSession::attach(&resolved.endpoint, resolved.engine, None).await?;
+                session.ensure_fresh(max_age).await?;
+                let value = session
+                    .evaluate_with_timeout(&expression, await_promise, Some(timeout))
+                    .await;
+                session.close().await;
+                value?
+            } else {
+                trace.route("scratch");
+                let browser_name = match &resolved.source {
+                    Source::Registered { name } => name.clone(),
+                    _ => unreachable!("Source::External branch handled above"),
+                };
+                let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+                let expr = expression.clone();
+                with_scratch_recovery(&backend, &r.registry, &browser_name, move |b, target_id| {
+                    let expr = expr.clone();
+                    async move {
+                        b.ensure_fresh(&target_id, max_age).await?;
+                        b.evaluate(&target_id, &expr, await_promise, timeout).await
+                    }
+                })
+                .await?
+            }
+        }
+        // Path 3: bare browser, --target regex → legacy selector.
+        (None, Some(regex)) => {
+            trace.route("target-regex");
+            let session =
+                PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
+            session.ensure_fresh(max_age).await?;
+            let value = session
+                .evaluate_with_timeout(&expression, await_promise, Some(timeout))
+                .await;
+            session.close().await;
+            value?
+        }
+        _ => unreachable!("mutex was checked above"),
+    };
+
     println!("{}", format_output(&value, json));
     Ok(())
 }
@@ -70,7 +194,6 @@ mod tests {
         assert_eq!(format_output(&json!(true), false), "true");
     }
 
-    // Mock CDP round-trip test mirroring src/session/attach.rs tests.
     use crate::detect::Engine;
     use crate::session::PageSession;
     use futures_util::{SinkExt, StreamExt};

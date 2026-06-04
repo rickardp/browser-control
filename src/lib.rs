@@ -12,11 +12,13 @@ pub mod mcp;
 pub mod paths;
 pub mod registry;
 pub mod session;
+pub mod sidecar;
+pub mod transport;
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Mutex;
     /// Global lock for tests that mutate process-wide env vars
     /// (`BROWSER_CONTROL_DATA_DIR`, `BROWSER_CONTROL_CONFIG_DIR`).
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 }

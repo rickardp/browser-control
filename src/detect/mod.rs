@@ -100,13 +100,34 @@ impl Probe for RealProbe {
         if !exe.exists() {
             return None;
         }
-        let output = std::process::Command::new(exe)
+        use std::process::Stdio;
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+
+        let mut child = std::process::Command::new(exe)
             .arg("--version")
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .ok()?;
-        if !output.status.success() {
-            return None;
+
+        // Some browsers (notably GUI builds on Windows) never exit when invoked
+        // with --version. Cap the wait so detection cannot hang the caller.
+        match child.wait_timeout(Duration::from_secs(5)).ok()? {
+            Some(status) if status.success() => {}
+            Some(_) => {
+                let _ = child.wait();
+                return None;
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
+
+        let output = child.wait_with_output().ok()?;
         let s = String::from_utf8_lossy(&output.stdout);
         parse_version(&s)
     }

@@ -118,6 +118,99 @@ pub fn parse(value: &str) -> Result<BrowserSelector> {
     Ok(BrowserSelector::Name(v.to_string()))
 }
 
+/// A target addressing both a browser instance and (optionally) a named tab.
+///
+/// The CLI positional that used to be a bare browser selector now accepts
+/// either `<browser>` or `<browser>/<tab>`. A bare value parses as today;
+/// a value containing `/` (after the first character, to avoid collision
+/// with absolute paths) is split into a browser part and a tab name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserTarget {
+    pub browser: BrowserSelector,
+    pub tab: Option<String>,
+}
+
+/// Parse a positional `<browser>[/<tab>]` argument.
+///
+/// Parse precedence — first match wins:
+/// 1. URL scheme (`ws://`, `wss://`, `http://`, `https://`) → [`BrowserSelector::Url`], no tab.
+/// 2. Absolute path that exists → [`BrowserSelector::ExecutablePath`], no tab.
+/// 3. Value containing `/` after position 0 → split on first `/`: left is
+///    parsed as a bare selector, right is validated as a tab name.
+/// 4. Matches a [`Kind`] → [`BrowserSelector::Kind`], no tab.
+/// 5. Otherwise [`BrowserSelector::Name`], no tab.
+///
+/// Backward compat: any value without an embedded `/` parses identically
+/// to [`parse`].
+pub fn parse_target(value: &str) -> Result<BrowserTarget> {
+    let v = value.trim();
+    if v.is_empty() {
+        bail!("BROWSER_CONTROL value is empty");
+    }
+    let lower = v.to_ascii_lowercase();
+    if lower.starts_with("ws://")
+        || lower.starts_with("wss://")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+    {
+        let u = url::Url::parse(v).with_context(|| format!("parsing URL {v}"))?;
+        return Ok(BrowserTarget {
+            browser: BrowserSelector::Url(u),
+            tab: None,
+        });
+    }
+    let path = Path::new(v);
+    if path.is_absolute() && path.exists() {
+        return Ok(BrowserTarget {
+            browser: BrowserSelector::ExecutablePath(path.to_path_buf()),
+            tab: None,
+        });
+    }
+    // Split on `/` only if the slash is *not* the leading character — that
+    // case is covered by the absolute-path branch above (even if the path
+    // doesn't exist, we don't want to treat `/foo/bar` as `browser=/foo`).
+    if let Some(idx) = v.find('/') {
+        if idx > 0 {
+            let (left, right) = v.split_at(idx);
+            let tab = &right[1..];
+            validate_tab_name(tab)?;
+            return Ok(BrowserTarget {
+                browser: parse(left)?,
+                tab: Some(tab.to_string()),
+            });
+        }
+    }
+    Ok(BrowserTarget {
+        browser: parse(v)?,
+        tab: None,
+    })
+}
+
+/// Validate a tab name: lowercase ASCII alpha/digit plus `-`/`_`, length
+/// 1..=64, and the leading-`_` namespace is reserved (used by internal
+/// scratch / system rows so agents can't collide with them).
+pub fn validate_tab_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("tab name is empty");
+    }
+    if name.len() > 64 {
+        bail!("tab name `{name}` exceeds 64 characters");
+    }
+    if name.starts_with('_') {
+        bail!("tab name `{name}` starts with `_` (reserved namespace)");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        bail!(
+            "tab name `{name}` contains invalid characters \
+             (allowed: a-z, 0-9, `-`, `_`)"
+        );
+    }
+    Ok(())
+}
+
 /// Heuristic engine detection for a WebSocket URL.
 ///
 /// A path beginning with `/session` (WebDriver BiDi) → [`Engine::Bidi`];
@@ -343,6 +436,96 @@ mod tests {
             parse("firefox-pikachu").unwrap(),
             BrowserSelector::Name("firefox-pikachu".to_string())
         );
+    }
+
+    // --- parse_target() ---------------------------------------------------
+
+    #[test]
+    fn parse_target_bare_name_has_no_tab() {
+        let t = parse_target("firefox-pikachu").unwrap();
+        assert_eq!(
+            t.browser,
+            BrowserSelector::Name("firefox-pikachu".to_string())
+        );
+        assert!(t.tab.is_none());
+    }
+
+    #[test]
+    fn parse_target_name_slash_tab_splits() {
+        let t = parse_target("brave-twilight/scrape-cart").unwrap();
+        assert_eq!(
+            t.browser,
+            BrowserSelector::Name("brave-twilight".to_string())
+        );
+        assert_eq!(t.tab.as_deref(), Some("scrape-cart"));
+    }
+
+    #[test]
+    fn parse_target_kind_slash_tab_splits() {
+        let t = parse_target("chrome/login").unwrap();
+        assert_eq!(t.browser, BrowserSelector::Kind(Kind::Chrome));
+        assert_eq!(t.tab.as_deref(), Some("login"));
+    }
+
+    #[test]
+    fn parse_target_url_keeps_slashes_in_url() {
+        let s = "ws://127.0.0.1:9222/devtools/browser/abc";
+        let t = parse_target(s).unwrap();
+        match t.browser {
+            BrowserSelector::Url(u) => assert_eq!(u.as_str(), s),
+            other => panic!("expected Url, got {other:?}"),
+        }
+        assert!(t.tab.is_none());
+    }
+
+    #[test]
+    fn parse_target_absolute_nonexistent_path_falls_through_to_name_with_slashes() {
+        // Leading `/` activates the path branch first; if the path doesn't
+        // exist, fall through to Name (no tab split, matches parse()).
+        let s = "/non/existent/path/to/nothing-xyz-12345";
+        let t = parse_target(s).unwrap();
+        assert_eq!(t.browser, BrowserSelector::Name(s.to_string()));
+        assert!(t.tab.is_none());
+    }
+
+    #[test]
+    fn parse_target_existing_absolute_path_with_no_slash_in_tab_slot() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let t = parse_target(f.path().to_str().unwrap()).unwrap();
+        match &t.browser {
+            BrowserSelector::ExecutablePath(p) => assert_eq!(p, f.path()),
+            other => panic!("expected ExecutablePath, got {other:?}"),
+        }
+        assert!(t.tab.is_none());
+    }
+
+    #[test]
+    fn parse_target_validates_tab_name() {
+        assert!(parse_target("brave/UPPER").is_err()); // uppercase
+        assert!(parse_target("brave/has space").is_err()); // whitespace
+        assert!(parse_target("brave/_internal").is_err()); // reserved namespace
+        assert!(parse_target("brave/").is_err()); // empty tab
+    }
+
+    // --- validate_tab_name() ---------------------------------------------
+
+    #[test]
+    fn validate_tab_name_accepts_canonical_forms() {
+        validate_tab_name("scrape-cart").unwrap();
+        validate_tab_name("a").unwrap();
+        validate_tab_name("checkout-flow-2").unwrap();
+        validate_tab_name("page_a").unwrap();
+        validate_tab_name("042").unwrap();
+    }
+
+    #[test]
+    fn validate_tab_name_rejects_invalid() {
+        assert!(validate_tab_name("").is_err());
+        assert!(validate_tab_name("a".repeat(65).as_str()).is_err());
+        assert!(validate_tab_name("_scratch").is_err());
+        assert!(validate_tab_name("Tab").is_err());
+        assert!(validate_tab_name("a/b").is_err());
+        assert!(validate_tab_name("a b").is_err());
     }
 
     // --- resolve_with() ---------------------------------------------------

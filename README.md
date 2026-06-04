@@ -25,13 +25,64 @@ cargo install browser-control
 
 Prebuilt binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64) and Windows (x86_64) are attached to every [GitHub Release](https://github.com/rickardp/browser-control/releases).
 
-Requires Rust 1.80 or newer when building from source. Node.js (for `npx`) is
-only required if you intend to use `mcp --playwright`.
+On Windows, install via the PowerShell one-liner:
+
+```powershell
+irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/install.ps1 | iex
+```
+
+It downloads the latest release zip, extracts `browser-control.exe` to `%USERPROFILE%\.browser-control\bin`, and prepends that directory to your user `PATH`. The script is idempotent — re-running it upgrades to the latest release, and is a no-op when the requested version is already installed. To pin a version, force a reinstall, or skip the PATH update:
+
+```powershell
+$script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/install.ps1
+& ([scriptblock]::Create($script)) -Version 0.3.5
+& ([scriptblock]::Create($script)) -Force
+& ([scriptblock]::Create($script)) -NoPathUpdate
+```
+
+To uninstall:
+
+```powershell
+irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/uninstall.ps1 | iex
+```
+
+By default the user data directory (`%APPDATA%\browser-control`, containing the browser registry and config) is preserved. Pass `-Purge` to remove it as well:
+
+```powershell
+$script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/uninstall.ps1
+& ([scriptblock]::Create($script)) -Purge
+```
+
+Requires Rust 1.80 or newer when building from source. A Node runtime
+(`bun` preferred, `node`+`npm` accepted) is required only if you invoke the
+Playwright-only MCP tools (`browser_click`, `browser_snapshot`, etc.); the
+sidecar is spawned lazily on first use.
 
 ## Usage
 
-The CLI exposes four subcommands. All of them accept `--json` (where listed
-below) for machine-readable output.
+The CLI groups commands into lifecycle, config, browser-wide session ops,
+page-context ops, and named tabs. Most commands accept `--json` for
+machine-readable output.
+
+### Browser selection
+
+Page-context commands (`eval`, `fetch`, `storage`, …) and browser-wide
+commands (`targets`, `cookies`, `wait`, `wait-for-cookie`) accept a
+`--browser` / `-b` flag (with `$BROWSER_CONTROL` env fallback) to select
+the target browser:
+
+```sh
+browser-control eval -b firefox 'document.title'
+BROWSER_CONTROL=chrome browser-control cookies --format netscape
+browser-control fetch --browser brave https://example.com/api/me
+```
+
+Resolution order: `--browser` flag → `$BROWSER_CONTROL` env →
+`browser-control set default <value>` → error.
+
+Page-context commands also accept a tab suffix: `--browser brave/cart`
+routes to a named tab. Browser-wide commands reject tab suffixes with an
+error.
 
 ### `list-installed`
 
@@ -88,26 +139,40 @@ Windows: `%APPDATA%\browser-control\profiles\<kind>\default\`), so subsequent
 starts of the same kind reuse the same browser state across reboots. This is
 intentional: it avoids re-authenticating in every new browser session.
 
-### `mcp [BROWSER] [--playwright]`
+### `mcp [--browser BROWSER] [--playwright-version <X.Y.Z>]`
 
 Start an MCP server on stdio that targets a running browser.
 
 ```sh
-browser-control mcp                     # use persisted default browser
-browser-control mcp firefox             # target a specific kind
-browser-control mcp --playwright        # passthrough to @playwright/mcp
+browser-control mcp                             # use persisted default browser
+browser-control mcp -b firefox                   # target a specific kind
+browser-control mcp --playwright-version 1.55    # pin a custom playwright-core
 ```
 
 Browser resolution order:
 
-1. The positional `BROWSER` argument (or `BROWSER_CONTROL` env, merged by clap; the argument wins when both are present)
+1. The `--browser` / `-b` flag (or `BROWSER_CONTROL` env, merged by clap; the flag wins when both are present)
 2. The persisted default from `browser-control set default <value>`
 3. Otherwise, exit with an error
 
-With `--playwright`, the CLI spawns the official `@playwright/mcp` via `npx`,
-hands it the resolved CDP endpoint, and forwards stdio bidirectionally. The
-host sees only Playwright MCP's tools; `browser-control`'s own MCP tools are
-not exposed in that mode.
+The server exposes engine-agnostic tools (`browser_navigate`, `browser_get_html`,
+`browser_fetch`, `browser_take_screenshot`, `browser_storage_get`,
+`browser_cookies`, …) that work on every supported browser including Firefox.
+Playwright-only interaction tools (`browser_click`,
+`browser_type`, `browser_snapshot`, `browser_press_key`, `browser_drag`,
+`browser_hover`, `browser_wait_for`, `browser_pdf_save`) route through an
+internal Node sidecar that wraps `playwright-core`. On the first call to one
+of these tools the sidecar is spawned (prefers `bun`, falls back to `node`+`npm`)
+against the active browser's CDP endpoint; on Firefox they return
+`EngineUnsupported`. The `--playwright-version` flag overrides the pinned
+`playwright-core` version for the sidecar.
+
+`browser_select` switches the MCP server's active browser before preparing
+engine-specific state such as the Firefox BiDi lock. If that preparation fails
+(for example, another process holds Firefox's single BiDi session), the server
+keeps the newly selected browser active and reports the failure. The caller can
+then retry the same selection after the lock clears, switch to another browser,
+or switch back explicitly.
 
 ### `set | get | unset <KEY> [VALUE]`
 
@@ -134,7 +199,8 @@ Override the directory with `BROWSER_CONTROL_CONFIG_DIR`.
 ## The `BROWSER_CONTROL` environment variable
 
 A single environment variable selects which browser the current shell session
-should talk to. The syntax of the value decides how it is interpreted:
+should talk to. It serves as the fallback for the `--browser` / `-b` flag on
+most subcommands. The syntax of the value decides how it is interpreted:
 
 | Value form                              | Behavior                                                                                       |
 |-----------------------------------------|------------------------------------------------------------------------------------------------|
@@ -151,29 +217,31 @@ A small set of session subcommands lets agents and shell scripts use a *real*
 browser session — with its cookies, headers, TLS stack, ad-blockers, and geo —
 without scraping `cookies.sqlite`, re-implementing OAuth flows, or driving a
 second headless browser. They attach to a browser already registered by
-`start`, work over both CDP and BiDi (Firefox), and accept the same
-`BROWSER_CONTROL` resolution rules as every other subcommand. None of them
-launch a browser; run `start` first.
+`start`, work over both CDP and BiDi (Firefox), and accept `--browser` / `-b`
+(or `$BROWSER_CONTROL`) for browser selection. None of them launch a browser;
+run `start` first.
 
 ### `targets`
 
-List open page targets (and optionally filter by URL regex).
+List open page targets (and optionally filter by URL regex). Browser-wide —
+tab suffixes are not supported.
 
 ```sh
-browser-control targets                                    # table: KIND ID URL TITLE
-browser-control targets --url '^https://example\.com'      # filter by URL regex
-browser-control targets --json                             # machine-readable
+browser-control targets                                        # table: KIND ID URL TITLE
+browser-control targets -b firefox --url '^https://example\.com'
+browser-control targets --json
 ```
 
 ### `cookies`
 
 Export cookies from the live browser, normalised across CDP and BiDi.
+Browser-wide — tab suffixes are not supported.
 
 ```sh
 browser-control cookies --domain '\.example\.com$' --name '^session'    # JSON (default)
-browser-control cookies --format header                                 # 'Cookie: a=…; b=…'
-browser-control cookies --format netscape -o cookies.txt                # curl/yt-dlp jar (0600)
-browser-control cookies --reveal                                        # print values to stdout
+browser-control cookies --format header
+browser-control cookies -b brave --format netscape -o cookies.txt       # curl/yt-dlp jar (0600)
+browser-control cookies --reveal
 ```
 
 `--domain` and `--name` are unanchored Rust regexes. Without `--reveal`,
@@ -182,15 +250,22 @@ full values and is `chmod 0600` on Unix. `--format netscape` produces a file
 byte-compatible with the Mozilla `cookies.txt` format (see
 [docs/session-ops.md](docs/session-ops.md)).
 
+Page-context reads that commonly surface auth state (`fetch`, `eval`,
+`storage get`, `storage list`, and `wait-for-cookie --validate-url`) reload
+HTTP(S) pages whose document is older than 10 minutes before evaluating, so
+SSO has a chance to refresh tokens. Override with `--max-age 1h`, `--max-age
+30s`, etc.
+
 ### `fetch`
 
 Run an HTTP request from inside the page's JavaScript context. Cookies,
 `Origin`, CORS, and the browser's TLS stack apply — handy for hitting an API
-that requires the user's session.
+that requires the user's session. Page-context — supports tab suffixes via
+`-b browser/tab`.
 
 ```sh
 browser-control fetch https://example.com/api/me
-browser-control fetch -X POST -H 'Content-Type: application/json' \
+browser-control fetch -b brave -X POST -H 'Content-Type: application/json' \
     -d '{"q":1}' https://example.com/api/search
 browser-control fetch --target '^https://app\.example\.com' -i \
     -o body.json https://app.example.com/api/data
@@ -211,10 +286,11 @@ URLREGEX` to override and explicitly pick a tab by URL regex.
 
 Read and write `localStorage` (default) or `sessionStorage` (`--namespace
 session`). Storage is origin-scoped, so most uses want `--target`.
+Page-context — supports tab suffixes via `-b browser/tab`.
 
 ```sh
 browser-control storage get auth_token --target '^https://app\.example\.com'
-browser-control storage set theme dark --target '^https://app\.example\.com'
+browser-control storage set theme dark -b brave --target '^https://app\.example\.com'
 browser-control storage list --namespace session --key-regex '^feature_' --json
 ```
 
@@ -222,11 +298,12 @@ browser-control storage list --namespace session --key-regex '^feature_' --json
 
 Evaluate a JavaScript expression in the active page. Returns the result as
 plain text by default; `--json` emits the full evaluation envelope.
+Page-context — supports tab suffixes via `-b browser/tab`.
 
 ```sh
 browser-control eval 'document.title'
-browser-control eval --target '^https://app\.example\.com' \
-    --json 'fetch("/api/whoami").then(r => r.json())'
+browser-control eval -b brave/cart --json 'fetch("/api/whoami").then(r => r.json())'
+browser-control eval --target '^https://app\.example\.com' 'document.cookie'
 ```
 
 `--await-promise` is on by default, so async expressions just work.
@@ -234,10 +311,10 @@ browser-control eval --target '^https://app\.example\.com' \
 ### `wait`
 
 Block until the browser's CDP / BiDi endpoint is up. Useful right after
-`start` in scripts.
+`start` in scripts. Browser-wide — tab suffixes are not supported.
 
 ```sh
-browser-control start firefox && browser-control wait --ready --timeout 30
+browser-control start firefox && browser-control wait -b firefox --timeout 30
 ```
 
 ### `wait-for-cookie`
@@ -245,12 +322,13 @@ browser-control start firefox && browser-control wait --ready --timeout 30
 Block until a cookie matching `--domain REGEX --name REGEX` exists in the
 browser. Optional `--validate-url URL` follows up with a `fetch()` from the
 page and requires a 2xx response before exiting — the typical pattern for
-"wait until the user has finished logging in".
+"wait until the user has finished logging in". Browser-wide — tab suffixes
+are not supported.
 
 ```sh
 browser-control wait-for-cookie \
     --domain '\.example\.com$' --name '^session_token$' --timeout 120
-browser-control wait-for-cookie --domain example.com --name auth \
+browser-control wait-for-cookie -b brave --domain example.com --name auth \
     --validate-url https://example.com/api/session
 ```
 
@@ -262,9 +340,9 @@ A typical "launch browser, wait for login, call API" shell flow collapses to:
 
 ```sh
 browser-control start brave
-browser-control wait-for-cookie --domain clientzone.gamesglobal.com \
+browser-control wait-for-cookie -b brave --domain clientzone.gamesglobal.com \
     --name '__Secure-next-auth.session-token' --timeout 120
-SESSION_JSON=$(browser-control fetch \
+SESSION_JSON=$(browser-control fetch -b brave \
     https://clientzone.gamesglobal.com/api/auth/session)
 ```
 
@@ -275,6 +353,24 @@ And any Python `write_netscape_cookie_jar()` helper that reads
 browser-control cookies --format netscape -o cookies.txt
 # then: curl --cookie cookies.txt https://…   or   yt-dlp --cookies cookies.txt …
 ```
+
+### Named tabs
+
+Named tabs let agents manage isolated tab contexts. `tab open` creates
+(or reuses) a named tab; `tab list` shows them; `tab adopt` binds an
+existing unnamed tab to a name.
+
+```sh
+browser-control tab open brave/cart https://shop.example.com     # create named tab
+browser-control tab list brave                                    # list registered tabs
+browser-control tab list brave --all                              # include unnamed live tabs
+browser-control tab adopt brave/my-tab ABC123DEF                  # adopt by target ID
+browser-control eval -b brave/cart 'document.title'               # use in page-context commands
+```
+
+`tab list --all` surfaces unnamed tabs with their target IDs. Use
+`tab adopt <browser>/<name> <target-id>` to bind them to a name, making
+them addressable via `-b <browser>/<name>` in `eval`, `fetch`, `storage`.
 
 ## MCP integration
 
@@ -293,20 +389,6 @@ underlying model.
     "browser-control": {
       "command": "browser-control",
       "args": ["mcp"]
-    }
-  }
-}
-```
-
-With `--playwright` passthrough (Playwright MCP's tool surface, but driving
-the browser that `browser-control` manages):
-
-```json
-{
-  "mcpServers": {
-    "browser-control": {
-      "command": "browser-control",
-      "args": ["mcp", "--playwright"]
     }
   }
 }
@@ -345,8 +427,9 @@ same registry.
                                                          ▲
                                                          │ CDP / BiDi
                                                          │
-              MCP host ──► browser-control mcp [--playwright] ┘
+              MCP host ──► browser-control mcp ┘
                               (resolves browser via registry / BROWSER_CONTROL)
+                              (Playwright tools route through internal sidecar)
 ```
 
 The CLI does not stop or restart browsers; the user owns lifecycle. Stale

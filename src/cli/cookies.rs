@@ -1,5 +1,7 @@
 //! `browser-control cookies` — export cookies from the active browser.
 //!
+//! Browser-wide command — tab suffixes on `--browser` are rejected.
+//!
 //! Output formats:
 //! - `json`: pretty JSON array of normalised cookies. Always contains full values
 //!   (machine-readable; user explicitly opted in).
@@ -17,9 +19,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::cli::env_resolver::ResolvedBrowser;
-use crate::cli::mcp::resolve_browser;
+use crate::cli::env_resolver::{self, ResolvedBrowser};
+use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
+use crate::cli::trace::CommandTrace;
 use crate::detect::Engine;
+use crate::registry::Registry;
 use crate::session::targets::{open_bidi, open_cdp};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -52,56 +56,93 @@ pub async fn run(
     reveal: bool,
     json: bool,
 ) -> Result<()> {
-    let effective_format = if json { "json".to_string() } else { format };
-    match effective_format.as_str() {
-        "json" | "netscape" | "header" => {}
-        other => bail!("unknown --format `{other}`: expected one of `netscape`, `json`, `header`"),
-    }
-
-    let domain_re = domain
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("invalid --domain regex")?;
-    let name_re = name
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("invalid --name regex")?;
-
-    let resolved = resolve_browser(browser).await?;
-    let raw = fetch_cookies(&resolved).await?;
-
-    let cookies: Vec<NormalCookie> = raw
-        .into_iter()
-        .filter(|c| matches_filter(c, domain_re.as_ref(), name_re.as_ref()))
-        .collect();
-
-    // For `-o FILE` writes we always emit full values (the file is 0600).
-    // Redaction only applies to stdout + `header` format without `--reveal`.
-    let to_stdout = output.is_none();
-    let body = match effective_format.as_str() {
-        "json" => format_json(&cookies)?,
-        "netscape" => format_netscape(&cookies),
-        "header" => format_header(&cookies, !to_stdout || reveal),
-        _ => unreachable!(),
-    };
-
-    match output {
-        Some(path) => {
-            write_file(&path, &body)?;
-            eprintln!("wrote {} cookies to {}", cookies.len(), path.display());
-        }
-        None => {
-            use std::io::Write;
-            let mut out = std::io::stdout().lock();
-            out.write_all(body.as_bytes())?;
-            if !body.ends_with('\n') {
-                out.write_all(b"\n")?;
+    let mut trace = CommandTrace::new("cookies");
+    let result: Result<()> = async {
+        let effective_format = if json { "json".to_string() } else { format };
+        match effective_format.as_str() {
+            "json" | "netscape" | "header" => {}
+            other => {
+                bail!("unknown --format `{other}`: expected one of `netscape`, `json`, `header`")
             }
         }
+
+        let domain_re = domain
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .context("invalid --domain regex")?;
+        let name_re = name
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .context("invalid --name regex")?;
+
+        // Accept `<browser>[/<tab>]` for syntactic consistency with
+        // `eval`/`fetch`/`storage`. Cookies are inherently browser-wide
+        // (CDP `Network.getAllCookies` / BiDi `storage.getCookies` return
+        // the full cookie jar), so tab suffixes are rejected.
+        let raw = browser.unwrap_or_default();
+        let parsed = if raw.is_empty() {
+            None
+        } else {
+            Some(env_resolver::parse_target(&raw)?)
+        };
+        if parsed.as_ref().and_then(|p| p.tab.as_ref()).is_some() {
+            bail!(
+                "`cookies` operates browser-wide; tab suffixes are not supported \
+                 (got `{raw}`). Use a bare browser selector instead."
+            );
+        }
+        let browser_only = parsed.as_ref().map(|_| raw.clone()).unwrap_or_default();
+        let resolved = resolve_browser(if browser_only.is_empty() {
+            None
+        } else {
+            Some(browser_only.clone())
+        })
+        .await?;
+        trace.browser(&browser_only).engine(resolved.engine);
+        trace.route("browser-wide");
+        // Hold the BiDi single-session lock for the read; releases on Drop.
+        // No-op for CDP and for external URL endpoints.
+        let _bidi_lock = {
+            let registry = Registry::open()?;
+            acquire_bidi_lock_if_needed(&registry, &resolved)?
+        };
+        let raw = fetch_cookies(&resolved).await?;
+
+        let cookies: Vec<NormalCookie> = raw
+            .into_iter()
+            .filter(|c| matches_filter(c, domain_re.as_ref(), name_re.as_ref()))
+            .collect();
+
+        // For `-o FILE` writes we always emit full values (the file is 0600).
+        // Redaction only applies to stdout + `header` format without `--reveal`.
+        let to_stdout = output.is_none();
+        let body = match effective_format.as_str() {
+            "json" => format_json(&cookies)?,
+            "netscape" => format_netscape(&cookies),
+            "header" => format_header(&cookies, !to_stdout || reveal),
+            _ => unreachable!(),
+        };
+
+        match output {
+            Some(path) => {
+                write_file(&path, &body)?;
+                eprintln!("wrote {} cookies to {}", cookies.len(), path.display());
+            }
+            None => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                out.write_all(body.as_bytes())?;
+                if !body.ends_with('\n') {
+                    out.write_all(b"\n")?;
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    trace.finish(result)
 }
 
 async fn fetch_cdp(endpoint: &str) -> Result<Vec<NormalCookie>> {
@@ -118,7 +159,9 @@ async fn fetch_cdp(endpoint: &str) -> Result<Vec<NormalCookie>> {
 async fn fetch_bidi(endpoint: &str) -> Result<Vec<NormalCookie>> {
     let client = open_bidi(endpoint).await?;
     client.session_new().await?;
-    let result = client.send("storage.getCookies", json!({})).await?;
+    let result = client.send("storage.getCookies", json!({})).await;
+    let _ = client.session_end().await;
+    let result = result?;
     let arr = result
         .get("cookies")
         .and_then(|v| v.as_array())
@@ -137,7 +180,7 @@ fn bool_field(v: &Value, k: &str) -> bool {
     v.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
 }
 
-fn normalize_cdp(v: &Value) -> NormalCookie {
+pub(crate) fn normalize_cdp(v: &Value) -> NormalCookie {
     let expires =
         v.get("expires")
             .and_then(|x| x.as_i64())
@@ -158,7 +201,7 @@ fn normalize_cdp(v: &Value) -> NormalCookie {
     }
 }
 
-fn normalize_bidi(v: &Value) -> NormalCookie {
+pub(crate) fn normalize_bidi(v: &Value) -> NormalCookie {
     let value = v
         .get("value")
         .and_then(|inner| inner.get("value").and_then(|x| x.as_str()))
