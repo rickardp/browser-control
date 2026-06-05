@@ -875,7 +875,7 @@ fn make_browser_select() -> RegisteredTool {
 fn make_browser_list() -> RegisteredTool {
     RegisteredTool {
         name: "browser_list".into(),
-        description: "List registered browsers with `[{name, kind, engine, endpoint, alive}]`."
+        description: "List live registered browsers with `[{name, kind, engine, endpoint, alive}]`; dead-process rows are pruned."
             .into(),
         input_schema: json!({"type": "object", "properties": {}}),
         handler: handler(|_state, _args| {
@@ -883,11 +883,10 @@ fn make_browser_list() -> RegisteredTool {
                 // `Registry` is `!Send`; do the read on a blocking thread.
                 let arr = tokio::task::spawn_blocking(|| -> Result<Vec<Value>> {
                     let registry = crate::registry::Registry::open()?;
-                    let rows = registry.list_all()?;
+                    let rows = registry.list_alive()?;
                     Ok(rows
                         .into_iter()
                         .map(|r| {
-                            let alive = crate::registry::is_alive(&r);
                             json!({
                                 "name": r.name,
                                 "kind": r.kind.as_str(),
@@ -896,7 +895,7 @@ fn make_browser_list() -> RegisteredTool {
                                     crate::detect::Engine::Bidi => "bidi",
                                 },
                                 "endpoint": r.endpoint,
-                                "alive": alive,
+                                "alive": true,
                             })
                         })
                         .collect())

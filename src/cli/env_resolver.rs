@@ -270,6 +270,35 @@ fn resolve_name(name: &str, registry: &Registry) -> Result<ResolvedBrowser> {
         .get_by_name(name)
         .with_context(|| format!("looking up browser {name}"))?
         .ok_or_else(|| anyhow!("no registered browser named {name}"))?;
+    match crate::registry::liveness(&row) {
+        crate::registry::BrowserLiveness::Alive => {}
+        crate::registry::BrowserLiveness::DeadPid => {
+            registry
+                .delete(&row.name)
+                .with_context(|| format!("pruning stale browser {}", row.name))?;
+            bail!(
+                "registered browser `{}` is stale (pid {} is no longer running); \
+                 pruned it from the registry. Select a live browser by kind with `-b {}` or \
+                 update the default with `browser-control set default {}`",
+                row.name,
+                row.pid,
+                row.kind.as_str(),
+                row.kind.as_str()
+            );
+        }
+        crate::registry::BrowserLiveness::EndpointUnreachable => {
+            bail!(
+                "registered browser `{}` is not reachable at {} (pid {} still exists); \
+                 keeping the registry row because this can be transient. Select a live browser \
+                 by kind with `-b {}` or update the default with `browser-control set default {}`",
+                row.name,
+                row.endpoint,
+                row.pid,
+                row.kind.as_str(),
+                row.kind.as_str()
+            );
+        }
+    }
     Ok(ResolvedBrowser {
         endpoint: row.endpoint,
         engine: row.engine,
@@ -597,10 +626,11 @@ mod tests {
     #[tokio::test]
     async fn name_lookup_hit() {
         let reg = Registry::open_in_memory().unwrap();
+        let (_listener, port) = alive_listener();
         let r = row(
             "firefox-pikachu",
             Kind::Firefox,
-            9111,
+            port,
             "2024-06-01T00:00:00Z",
         );
         reg.insert(&r).unwrap();
@@ -620,6 +650,47 @@ mod tests {
                 name: "firefox-pikachu".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn name_lookup_stale_prunes_and_errors() {
+        let reg = Registry::open_in_memory().unwrap();
+        let mut r = row("brave-cosmos", Kind::Brave, 9111, "2024-06-01T00:00:00Z");
+        r.pid = 99_999_999;
+        reg.insert(&r).unwrap();
+        let fake = FakeResolver::empty();
+        let err = resolve_with(
+            BrowserSelector::Name("brave-cosmos".to_string()),
+            &reg,
+            &fake,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("brave-cosmos"), "got: {msg}");
+        assert!(msg.contains("stale"), "got: {msg}");
+        assert!(msg.contains("set default brave"), "got: {msg}");
+        assert!(reg.get_by_name("brave-cosmos").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn name_lookup_endpoint_unreachable_is_retained() {
+        let reg = Registry::open_in_memory().unwrap();
+        let r = row("brave-cumin", Kind::Brave, 9111, "2024-06-01T00:00:00Z");
+        reg.insert(&r).unwrap();
+        let fake = FakeResolver::empty();
+        let err = resolve_with(
+            BrowserSelector::Name("brave-cumin".to_string()),
+            &reg,
+            &fake,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("brave-cumin"), "got: {msg}");
+        assert!(msg.contains("not reachable"), "got: {msg}");
+        assert!(msg.contains("keeping the registry row"), "got: {msg}");
+        assert!(reg.get_by_name("brave-cumin").unwrap().is_some());
     }
 
     #[tokio::test]

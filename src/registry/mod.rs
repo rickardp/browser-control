@@ -38,6 +38,20 @@ pub struct BrowserRow {
     pub started_at: String,
 }
 
+/// Current registry liveness classification for a browser row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserLiveness {
+    /// The recorded process exists and the debugging endpoint accepts TCP.
+    Alive,
+    /// The recorded process no longer exists. This is high-confidence stale
+    /// state and can be pruned.
+    DeadPid,
+    /// The recorded process exists, but the debugging endpoint did not accept
+    /// TCP right now. Treat as unavailable, but do not delete the row: short
+    /// endpoint outages can be transient during browser startup/restart.
+    EndpointUnreachable,
+}
+
 /// SQLite registry handle. SQLite-level WAL + `busy_timeout` handles
 /// concurrent reader/writer coordination across processes; we no longer
 /// hold a long-lived exclusive file lock for the lifetime of the
@@ -185,27 +199,33 @@ impl Registry {
         )
     }
 
-    /// All alive rows. Stale rows are deleted as a side-effect.
+    /// All alive rows. Dead-PID rows are deleted as a side-effect; rows whose
+    /// endpoint is temporarily unreachable are omitted but retained.
     pub fn list_alive(&self) -> Result<Vec<BrowserRow>> {
         let all = self.list_all()?;
         let mut alive = Vec::with_capacity(all.len());
         for row in all {
-            if is_alive(&row) {
-                alive.push(row);
-            } else {
-                self.delete(&row.name)?;
+            match liveness(&row) {
+                BrowserLiveness::Alive => alive.push(row),
+                BrowserLiveness::DeadPid => {
+                    self.delete(&row.name)?;
+                }
+                BrowserLiveness::EndpointUnreachable => {}
             }
         }
         Ok(alive)
     }
 
-    /// First alive row of the given kind (most recent first). Stale matches are pruned.
+    /// First alive row of the given kind (most recent first). Dead-PID matches
+    /// are pruned; endpoint-unreachable rows are retained.
     pub fn first_alive_by_kind(&self, kind: Kind) -> Result<Option<BrowserRow>> {
         for row in self.list_by_kind_all(kind)? {
-            if is_alive(&row) {
-                return Ok(Some(row));
-            } else {
-                self.delete(&row.name)?;
+            match liveness(&row) {
+                BrowserLiveness::Alive => return Ok(Some(row)),
+                BrowserLiveness::DeadPid => {
+                    self.delete(&row.name)?;
+                }
+                BrowserLiveness::EndpointUnreachable => {}
             }
         }
         Ok(None)
@@ -214,10 +234,12 @@ impl Registry {
     /// Most recently started alive row across all kinds.
     pub fn most_recent_alive(&self) -> Result<Option<BrowserRow>> {
         for row in self.list_all()? {
-            if is_alive(&row) {
-                return Ok(Some(row));
-            } else {
-                self.delete(&row.name)?;
+            match liveness(&row) {
+                BrowserLiveness::Alive => return Ok(Some(row)),
+                BrowserLiveness::DeadPid => {
+                    self.delete(&row.name)?;
+                }
+                BrowserLiveness::EndpointUnreachable => {}
             }
         }
         Ok(None)
@@ -304,6 +326,11 @@ fn parse_engine(s: &str) -> Result<Engine> {
 
 /// Liveness check: PID exists AND a TCP connect to the local port succeeds.
 pub fn is_alive(row: &BrowserRow) -> bool {
+    liveness(row) == BrowserLiveness::Alive
+}
+
+/// Classify row liveness. Only [`BrowserLiveness::DeadPid`] is safe to prune.
+pub fn liveness(row: &BrowserRow) -> BrowserLiveness {
     let pid = sysinfo::Pid::from_u32(row.pid);
     let mut sys = sysinfo::System::new();
     // Refresh only the target PID rather than the whole process table:
@@ -311,10 +338,14 @@ pub fn is_alive(row: &BrowserRow) -> bool {
     // only ever query this one PID below.
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     if sys.process(pid).is_none() {
-        return false;
+        return BrowserLiveness::DeadPid;
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], row.port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+        BrowserLiveness::Alive
+    } else {
+        BrowserLiveness::EndpointUnreachable
+    }
 }
 
 /// Cheap check: is process `pid` still running on this machine? Used by
@@ -476,7 +507,7 @@ mod tests {
         assert_eq!(chromes[1].name, "older");
 
         // first_alive_by_kind on these synthetic rows should find none alive
-        // and prune stale entries.
+        // and prune dead-process entries.
         assert!(reg.first_alive_by_kind(Kind::Chrome).unwrap().is_none());
         assert!(reg.list_by_kind_all(Kind::Chrome).unwrap().is_empty());
     }
@@ -491,6 +522,26 @@ mod tests {
         let alive = reg.list_alive().unwrap();
         assert!(alive.is_empty());
         assert!(reg.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_alive_retains_live_pid_with_unreachable_endpoint() {
+        let reg = Registry::open_in_memory().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut row = sample_row(
+            "temporarily-unreachable",
+            Kind::Chrome,
+            port,
+            "2024-01-01T00:00:00Z",
+        );
+        row.pid = std::process::id();
+        reg.insert(&row).unwrap();
+
+        let alive = reg.list_alive().unwrap();
+        assert!(alive.is_empty());
+        assert!(reg.get_by_name("temporarily-unreachable").unwrap().is_some());
     }
 
     #[test]

@@ -141,65 +141,74 @@ async fn spawn_cdp_mock(behaviour: MockBehaviour) -> (String, oneshot::Sender<()
     let addr = listener.local_addr().unwrap();
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let mut next_target = 0u32;
-        let mut next_session = 0u32;
-        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
-        loop {
+        'accept: loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
-                msg = ws.next() => {
-                    let msg = match msg {
-                        Some(Ok(m)) => m,
-                        _ => break,
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        continue;
                     };
-                    if let Message::Text(t) = msg {
-                        let req: Value = serde_json::from_str(&t).unwrap();
-                        let id = req["id"].as_u64().unwrap();
-                        let method = req["method"].as_str().unwrap_or("");
-                        if behaviour.hang_runtime_evaluate && method == "Runtime.evaluate" {
-                            continue; // drop reply — client times out
-                        }
-                        let result = match method {
-                            "Target.createTarget" => {
-                                next_target += 1;
-                                let tid = format!("T{next_target}");
-                                live.insert(tid.clone());
-                                json!({"targetId": tid})
-                            }
-                            "Target.closeTarget" => {
-                                if let Some(tid) = req
-                                    .pointer("/params/targetId")
-                                    .and_then(|v| v.as_str())
-                                {
-                                    live.remove(tid);
+                    let mut next_target = 0u32;
+                    let mut next_session = 0u32;
+                    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    loop {
+                        tokio::select! {
+                            _ = &mut stop_rx => break 'accept,
+                            msg = ws.next() => {
+                                let msg = match msg {
+                                    Some(Ok(m)) => m,
+                                    _ => break,
+                                };
+                                if let Message::Text(t) = msg {
+                                    let req: Value = serde_json::from_str(&t).unwrap();
+                                    let id = req["id"].as_u64().unwrap();
+                                    let method = req["method"].as_str().unwrap_or("");
+                                    if behaviour.hang_runtime_evaluate && method == "Runtime.evaluate" {
+                                        continue; // drop reply — client times out
+                                    }
+                                    let result = match method {
+                                        "Target.createTarget" => {
+                                            next_target += 1;
+                                            let tid = format!("T{next_target}");
+                                            live.insert(tid.clone());
+                                            json!({"targetId": tid})
+                                        }
+                                        "Target.closeTarget" => {
+                                            if let Some(tid) = req
+                                                .pointer("/params/targetId")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                live.remove(tid);
+                                            }
+                                            json!({"success": true})
+                                        }
+                                        "Target.attachToTarget" => {
+                                            next_session += 1;
+                                            json!({"sessionId": format!("S{next_session}")})
+                                        }
+                                        "Target.detachFromTarget" => json!({}),
+                                        "Page.navigate" => json!({}),
+                                        "Runtime.evaluate" => json!({"result": {"value": 1}}),
+                                        "Target.getTargets" => {
+                                            let infos: Vec<Value> = live
+                                                .iter()
+                                                .map(|tid| json!({
+                                                    "targetId": tid,
+                                                    "type": "page",
+                                                    "url": format!("https://example.com/{tid}"),
+                                                    "title": format!("page-{tid}"),
+                                                }))
+                                                .collect();
+                                            json!({"targetInfos": infos})
+                                        }
+                                        _ => json!({}),
+                                    };
+                                    let resp = json!({"id": id, "result": result});
+                                    ws.send(Message::Text(resp.to_string())).await.unwrap();
                                 }
-                                json!({"success": true})
                             }
-                            "Target.attachToTarget" => {
-                                next_session += 1;
-                                json!({"sessionId": format!("S{next_session}")})
-                            }
-                            "Target.detachFromTarget" => json!({}),
-                            "Page.navigate" => json!({}),
-                            "Runtime.evaluate" => json!({"result": {"value": 1}}),
-                            "Target.getTargets" => {
-                                let infos: Vec<Value> = live
-                                    .iter()
-                                    .map(|tid| json!({
-                                        "targetId": tid,
-                                        "type": "page",
-                                        "url": format!("https://example.com/{tid}"),
-                                        "title": format!("page-{tid}"),
-                                    }))
-                                    .collect();
-                                json!({"targetInfos": infos})
-                            }
-                            _ => json!({}),
-                        };
-                        let resp = json!({"id": id, "result": result});
-                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                        }
                     }
                 }
             }
@@ -904,6 +913,44 @@ async fn browser_list_enumerates_registered_browsers() {
     let arr: Vec<Value> = serde_json::from_str(&text_payload(&out)).unwrap();
     let names: Vec<&str> = arr.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(names.contains(&"chrome-fixture"), "got names {names:?}");
+    std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+}
+
+#[tokio::test]
+async fn browser_list_prunes_stale_registered_browsers() {
+    use browser_control::detect::Kind;
+    use browser_control::registry::{BrowserRow, Registry};
+    use std::path::PathBuf;
+    let _guard = REGISTRY_TEST_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
+    {
+        let reg = Registry::open().unwrap();
+        reg.insert(&BrowserRow {
+            name: "brave-cosmos".into(),
+            kind: Kind::Brave,
+            engine: Engine::Cdp,
+            pid: 99_999_999,
+            endpoint: "ws://127.0.0.1:9/devtools/browser/stale".into(),
+            port: 9,
+            profile_dir: PathBuf::from("/tmp/profiles/stale"),
+            executable: PathBuf::from("/usr/bin/example"),
+            headless: false,
+            started_at: "2024-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+
+    let (_url, _stop) = spawn_cdp_mock(MockBehaviour::default()).await;
+    let state = state_for_mock(&_url);
+    let out = call_tool(state, "browser_list", json!({})).await.unwrap();
+    let arr: Vec<Value> = serde_json::from_str(&text_payload(&out)).unwrap();
+    let names: Vec<&str> = arr.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(!names.contains(&"brave-cosmos"), "got names {names:?}");
+    {
+        let reg = Registry::open().unwrap();
+        assert!(reg.get_by_name("brave-cosmos").unwrap().is_none());
+    }
     std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
 }
 
