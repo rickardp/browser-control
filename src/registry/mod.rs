@@ -541,7 +541,10 @@ mod tests {
 
         let alive = reg.list_alive().unwrap();
         assert!(alive.is_empty());
-        assert!(reg.get_by_name("temporarily-unreachable").unwrap().is_some());
+        assert!(reg
+            .get_by_name("temporarily-unreachable")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
