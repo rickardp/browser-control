@@ -69,6 +69,7 @@ pub fn register_all(registry: &ToolRegistry) {
     // New browser-management tools.
     registry.register(make_browser_select());
     registry.register(make_browser_list());
+    registry.register(make_browser_show());
     // Playwright-only interaction tools — Chromium-family only (route
     // through the Node sidecar). Each errors with `EngineUnsupported`
     // when the active browser is BiDi.
@@ -909,6 +910,34 @@ fn make_browser_list() -> RegisteredTool {
     }
 }
 
+fn make_browser_show() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_show".into(),
+        description: "Explicitly reveal the active browser window for login or debugging. \
+                      Normal automation keeps new tabs in the background."
+            .into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        handler: handler(|state, _args| {
+            Box::pin(async move {
+                let backend = state.ensure_backend().await?;
+                let target_id = backend.target_for_show().await?;
+                let resolved = state.browser_snapshot().await;
+                let source = resolved.source.clone();
+                let os_activated = tokio::task::spawn_blocking(move || -> Result<bool> {
+                    let registry = crate::registry::Registry::open()?;
+                    crate::cli::show::activate_resolved_app(&registry, &source)
+                })
+                .await??;
+                backend.show_tab(&target_id).await?;
+                Ok(text_content(serde_json::to_string_pretty(&json!({
+                    "target_id": target_id,
+                    "os_activated": os_activated,
+                }))?))
+            })
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Playwright-only interaction tools (routed through the Node sidecar).
 // ---------------------------------------------------------------------------
@@ -1259,6 +1288,7 @@ mod tests {
         "browser_tab_close",
         "browser_select",
         "browser_list",
+        "browser_show",
         "browser_snapshot",
         "browser_click",
         "browser_type",

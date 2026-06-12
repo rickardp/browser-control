@@ -9,7 +9,10 @@ use tokio::process::Command;
 
 use crate::detect::{Engine, Installed};
 
-use super::{allocate_free_port, configure_session_detachment, LaunchOpts, LaunchedHandle};
+use super::{
+    allocate_free_port, background_after_launch, configure_session_detachment, LaunchOpts,
+    LaunchedHandle,
+};
 
 pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedHandle> {
     let port = allocate_free_port().context("allocating BiDi port")?;
@@ -47,6 +50,9 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
     let pid = child.id().context("child has no pid")?;
 
     let endpoint = wait_for_firefox_endpoint(port, &mut child, &log_path).await?;
+    if !opts.headless {
+        background_after_launch(pid);
+    }
 
     Ok(LaunchedHandle {
         pid,

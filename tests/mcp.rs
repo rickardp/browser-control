@@ -113,6 +113,7 @@ async fn registered_tools_list_contains_full_playwright_shaped_set() {
         "browser_tab_close",
         "browser_select",
         "browser_list",
+        "browser_show",
         "list_targets",
     ] {
         assert!(names.contains(expected), "missing {expected} in {names:?}");
@@ -505,6 +506,18 @@ async fn browser_tab_new_makes_tab_active() {
     // The state's pointer now references the new tab.
     let ptr = state.active_target_id.lock().await.clone();
     assert_eq!(ptr.as_deref(), Some("T1"));
+}
+
+#[tokio::test]
+async fn browser_show_reveals_or_creates_target() {
+    let (url, _stop) = spawn_cdp_mock(MockBehaviour::default()).await;
+    let state = state_for_mock(&url);
+    let out = call_tool(state.clone(), "browser_show", json!({}))
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
+    assert_eq!(parsed["target_id"], "T1");
+    assert_eq!(parsed["os_activated"], false);
 }
 
 #[tokio::test]

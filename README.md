@@ -139,6 +139,25 @@ Windows: `%APPDATA%\browser-control\profiles\<kind>\default\`), so subsequent
 starts of the same kind reuse the same browser state across reboots. This is
 intentional: it avoids re-authenticating in every new browser session.
 
+GUI browser launches are kept in the background by default. Chromium-family
+browsers are started minimized, automated CDP-created tabs are opened in the
+background, and macOS launches hide the just-started browser after the debug
+endpoint is ready. Use `show` only when a human needs to interact with the
+browser.
+
+### `show [--browser BROWSER]`
+
+Explicitly reveal the selected browser for login or debugging.
+
+```sh
+browser-control show -b brave
+browser-control show --json
+```
+
+`show` uses the same browser selector rules as other browser-wide commands. It
+activates the browser app when possible and brings a live page target to the
+front, creating an `about:blank` target if none exists.
+
 ### `mcp [--browser BROWSER] [--playwright-version <X.Y.Z>]`
 
 Start an MCP server on stdio that targets a running browser.

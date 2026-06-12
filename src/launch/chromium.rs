@@ -9,7 +9,8 @@ use tokio::process::Command;
 use crate::detect::{Engine, Installed};
 
 use super::{
-    allocate_free_port, configure_session_detachment, wait_for_endpoint, LaunchOpts, LaunchedHandle,
+    allocate_free_port, background_after_launch, configure_session_detachment, wait_for_endpoint,
+    LaunchOpts, LaunchedHandle,
 };
 
 pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedHandle> {
@@ -36,6 +37,8 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
         .arg("--disable-component-update");
     if opts.headless {
         cmd.arg("--headless=new");
+    } else {
+        cmd.arg("--start-minimized");
     }
     cmd.arg("about:blank");
 
@@ -51,6 +54,9 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
     let pid = child.id().context("child has no pid")?;
 
     let endpoint = wait_for_endpoint(port, &mut child, &log_path).await?;
+    if !opts.headless {
+        background_after_launch(pid);
+    }
 
     Ok(LaunchedHandle {
         pid,

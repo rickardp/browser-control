@@ -9,6 +9,7 @@ pub mod output;
 pub mod route;
 pub mod routing;
 pub mod set;
+pub mod show;
 pub mod start;
 pub mod storage;
 pub mod tab;

@@ -12,6 +12,7 @@ Browser selection
 - Select a browser with `browser_select` in MCP, or with CLI `-b/--browser`, `$BROWSER_CONTROL`, or `browser-control set default <selector>`.
 - Selectors may be a kind (`chrome`, `edge`, `chromium`, `brave`, `firefox`), a friendly name from `list-running`, an absolute executable path, or a CDP/BiDi endpoint URL.
 - If nothing is running, use `browser-control start <kind>`. It reuses a persistent per-kind profile so login state survives.
+- Browser windows and automated tabs stay in the background by default. Reveal the browser only when human interaction is needed: use MCP `browser_show` or CLI `browser-control show -b <browser>`.
 
 Tabs
 - Prefer tab primitives over target IDs:

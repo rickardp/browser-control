@@ -1,7 +1,7 @@
 use anyhow::Result;
 use browser_control::cli::{
-    agent_instructions, cookies, eval, fetch, list, set, storage, targets as cli_targets, wait,
-    wait_for_cookie,
+    agent_instructions, cookies, eval, fetch, list, set, show, storage, targets as cli_targets,
+    wait, wait_for_cookie,
 };
 use clap::{Parser, Subcommand};
 
@@ -39,6 +39,14 @@ enum Command {
         /// Seconds to wait for the endpoint when not using --no-wait.
         #[arg(long, default_value_t = 30)]
         wait_timeout: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly reveal the selected browser for login or debugging.
+    Show {
+        /// Browser to reveal. Defaults to the configured default browser.
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
+        browser: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -240,6 +248,7 @@ async fn main() -> Result<()> {
             wait_timeout,
             json,
         } => browser_control::cli::start::run(browser, headless, no_wait, wait_timeout, json).await,
+        Command::Show { browser, json } => show::run(browser, json).await,
         Command::Mcp {
             browser,
             playwright_version,

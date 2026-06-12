@@ -622,7 +622,10 @@ async fn find_cdp_target_for_origin(client: &CdpClient, want: &url::Url) -> Resu
 
 async fn create_cdp_tab(client: &CdpClient, url: &str) -> Result<String> {
     let v = client
-        .send("Target.createTarget", json!({ "url": url }))
+        .send(
+            "Target.createTarget",
+            json!({ "url": url, "background": true }),
+        )
         .await?;
     v.get("targetId")
         .and_then(|x| x.as_str())
@@ -694,17 +697,17 @@ mod tests {
     async fn spawn_cdp_origin_eval_mock(
         targets: Vec<Value>,
         fail_first_eval: bool,
-    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    ) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let targets = Arc::new(targets);
-        let created_urls = Arc::new(Mutex::new(Vec::new()));
+        let created_params = Arc::new(Mutex::new(Vec::new()));
         let attached_targets = Arc::new(Mutex::new(Vec::new()));
         let eval_count = Arc::new(AtomicUsize::new(0));
 
         tokio::spawn({
             let targets = targets.clone();
-            let created_urls = created_urls.clone();
+            let created_params = created_params.clone();
             let attached_targets = attached_targets.clone();
             let eval_count = eval_count.clone();
             async move {
@@ -713,7 +716,7 @@ mod tests {
                         break;
                     };
                     let targets = targets.clone();
-                    let created_urls = created_urls.clone();
+                    let created_params = created_params.clone();
                     let attached_targets = attached_targets.clone();
                     let eval_count = eval_count.clone();
                     tokio::spawn(async move {
@@ -741,12 +744,7 @@ mod tests {
                                     json!({"targetInfos": targets.as_ref().clone()})
                                 }
                                 "Target.createTarget" => {
-                                    let url = req
-                                        .pointer("/params/url")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    created_urls.lock().await.push(url);
+                                    created_params.lock().await.push(req["params"].clone());
                                     json!({"targetId": "NEW"})
                                 }
                                 "Target.attachToTarget" => {
@@ -789,7 +787,7 @@ mod tests {
             }
         });
 
-        (format!("ws://{addr}"), created_urls, attached_targets)
+        (format!("ws://{addr}"), created_params, attached_targets)
     }
 
     #[test]
@@ -844,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_for_origin_creates_origin_tab_when_no_match() {
-        let (url, created_urls, attached_targets) = spawn_cdp_origin_eval_mock(
+        let (url, created_params, attached_targets) = spawn_cdp_origin_eval_mock(
             vec![json!({"targetId":"a","type":"page","url":"https://other.test/"})],
             false,
         )
@@ -861,16 +859,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(value, json!("ok"));
-        assert_eq!(
-            *created_urls.lock().await,
-            vec!["https://example.com/".to_string()]
-        );
+        let created = created_params.lock().await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["url"], "https://example.com/");
+        assert_eq!(created[0]["background"], true);
         assert_eq!(*attached_targets.lock().await, vec!["NEW".to_string()]);
     }
 
     #[tokio::test]
     async fn evaluate_for_origin_reattaches_and_retries_once() {
-        let (url, created_urls, attached_targets) = spawn_cdp_origin_eval_mock(
+        let (url, created_params, attached_targets) = spawn_cdp_origin_eval_mock(
             vec![json!({"targetId":"A","type":"page","url":"https://example.com/login"})],
             true,
         )
@@ -887,7 +885,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(value, json!("ok"));
-        assert!(created_urls.lock().await.is_empty());
+        assert!(created_params.lock().await.is_empty());
         assert_eq!(
             *attached_targets.lock().await,
             vec!["A".to_string(), "A".to_string()]

@@ -69,7 +69,12 @@ impl TabBackend {
         let url = if url.is_empty() { "about:blank" } else { url };
         match self {
             TabBackend::Cdp(c) => {
-                let v = c.send("Target.createTarget", json!({ "url": url })).await?;
+                let v = c
+                    .send(
+                        "Target.createTarget",
+                        json!({ "url": url, "background": true }),
+                    )
+                    .await?;
                 v.get("targetId")
                     .and_then(|x| x.as_str())
                     .map(String::from)
@@ -159,6 +164,57 @@ impl TabBackend {
                 }
             }
         }
+    }
+
+    /// Make a tab visible and focused inside the browser window. This is
+    /// intentionally explicit: normal automation creates/navigates tabs in
+    /// the background so agents don't steal the user's foreground app unless
+    /// they need interactive debugging or login.
+    pub async fn show_tab(&self, target_id: &str) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let _ = c
+                    .send("Target.activateTarget", json!({ "targetId": target_id }))
+                    .await?;
+                let attach = c
+                    .send(
+                        "Target.attachToTarget",
+                        json!({ "targetId": target_id, "flatten": true }),
+                    )
+                    .await?;
+                let session_id = attach
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("attachToTarget returned no sessionId"))?
+                    .to_string();
+                let result = c
+                    .send_with_session("Page.bringToFront", json!({}), Some(&session_id))
+                    .await;
+                let _ = c
+                    .send(
+                        "Target.detachFromTarget",
+                        json!({ "sessionId": session_id }),
+                    )
+                    .await;
+                result?;
+                Ok(())
+            }
+            TabBackend::Bidi(c) => {
+                let _ = c
+                    .send("browsingContext.activate", json!({ "context": target_id }))
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Return a tab suitable for `show`: prefer an existing live tab, create
+    /// `about:blank` if the browser currently has none.
+    pub async fn target_for_show(&self) -> Result<String> {
+        if let Some(t) = self.live_targets().await?.into_iter().next() {
+            return Ok(t.id);
+        }
+        self.create_tab("about:blank").await
     }
 
     /// Reload an old HTTP(S) tab before reading auth-sensitive page state.
@@ -766,6 +822,36 @@ mod tests {
         (format!("ws://{addr}"), navigations)
     }
 
+    async fn spawn_cdp_recording_mock() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    seen.lock().await.push(req.clone());
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("");
+                    let result = match method {
+                        "Target.createTarget" => json!({"targetId": "T1"}),
+                        "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                        "Target.getTargets" => json!({"targetInfos": [
+                            {"targetId": "T1", "type": "page", "url": "about:blank", "title": ""}
+                        ]}),
+                        _ => json!({}),
+                    };
+                    let resp = json!({"id": id, "result": result});
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        (format!("ws://{addr}"), seen)
+    }
+
     #[tokio::test]
     async fn cdp_backend_create_close_navigate_list_evaluate() {
         let (url, _stop) = spawn_cdp_mock().await;
@@ -785,6 +871,55 @@ mod tests {
         backend.close_tab(&t1).await.unwrap();
         let live = backend.live_target_ids().await.unwrap();
         assert!(!live.contains(&t1));
+    }
+
+    #[tokio::test]
+    async fn cdp_create_tab_requests_background_target() {
+        let (url, seen) = spawn_cdp_recording_mock().await;
+        let backend = open_backend(&url, crate::detect::Engine::Cdp)
+            .await
+            .unwrap();
+        let tid = backend.create_tab("https://example.com/").await.unwrap();
+        assert_eq!(tid, "T1");
+        let calls = seen.lock().await;
+        let create = calls
+            .iter()
+            .find(|v| v["method"] == "Target.createTarget")
+            .expect("create call");
+        assert_eq!(
+            create.pointer("/params/url").and_then(Value::as_str),
+            Some("https://example.com/")
+        );
+        assert_eq!(
+            create
+                .pointer("/params/background")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn cdp_show_tab_activates_and_brings_to_front() {
+        let (url, seen) = spawn_cdp_recording_mock().await;
+        let backend = open_backend(&url, crate::detect::Engine::Cdp)
+            .await
+            .unwrap();
+        backend.show_tab("T1").await.unwrap();
+        let methods: Vec<String> = seen
+            .lock()
+            .await
+            .iter()
+            .filter_map(|v| v["method"].as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "Target.activateTarget",
+                "Target.attachToTarget",
+                "Page.bringToFront",
+                "Target.detachFromTarget"
+            ]
+        );
     }
 
     #[tokio::test]

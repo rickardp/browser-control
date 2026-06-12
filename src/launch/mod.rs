@@ -108,6 +108,47 @@ pub(crate) fn configure_session_detachment(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Best-effort hide/background step for GUI browser launches. Some browsers
+/// on macOS ignore `--start-minimized` during initial app activation; hiding
+/// the just-launched process after the debug endpoint is ready keeps normal
+/// automation from leaving the browser frontmost. Explicit `show` reverses
+/// this by activating the app and bringing a target to front.
+pub(crate) fn background_after_launch(pid: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"System Events\" to set visible of first application process whose unix id is {pid} to false"
+        );
+        match std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                tracing::warn!(
+                    target = "launch",
+                    pid,
+                    %status,
+                    "failed to hide launched browser process"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = "launch",
+                    pid,
+                    error = %err,
+                    "failed to run osascript to hide launched browser process"
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+    }
+}
+
 /// Poll `http://127.0.0.1:<port>/json/version` at 50ms cadence for up to 15s.
 /// Returns the `webSocketDebuggerUrl` once available.
 ///
