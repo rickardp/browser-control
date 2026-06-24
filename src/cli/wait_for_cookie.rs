@@ -4,8 +4,8 @@
 //!
 //! v1 strategy: **polling only**. The plan envisions an event-driven path via
 //! CDP `Network.responseReceived` / BiDi `network.responseCompleted`, but for
-//! v1 simplicity we poll `Network.getAllCookies` / `storage.getCookies` at a
-//! fixed interval until the matching cookie appears or the timeout elapses.
+//! v1 simplicity we poll the browser cookie jar at a fixed interval until the
+//! matching cookie appears or the timeout elapses.
 //!
 //! After a match, an optional `--validate-url` performs a `fetch()` from the
 //! page context (credentials included) and requires a 2xx status.
@@ -46,8 +46,7 @@ pub async fn run(
         let name_re = Regex::new(&name).context("invalid --name regex")?;
 
         // Reject `<browser>/<tab>` — `wait-for-cookie` is browser-wide.
-        // The cookie poll uses `Network.getAllCookies` / `storage.getCookies`
-        // which are browser-scoped; tabs don't apply.
+        // The cookie poll is browser-scoped; tabs don't apply.
         let raw = browser.unwrap_or_default();
         if !raw.is_empty() {
             let parsed = env_resolver::parse_target(&raw)?;

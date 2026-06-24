@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "browser-control",
+  "displayName": "Browser Control",
+  "version": "1.0.1",
+  "description": "Expose browser-control's MCP server for controlling local browsers through CDP and WebDriver BiDi.",
+  "author": {
+    "name": "rickardp",
+    "url": "https://github.com/rickardp"
+  },
+  "homepage": "https://github.com/rickardp/browser-control",
+  "repository": "https://github.com/rickardp/browser-control",
+  "license": "MIT",
+  "keywords": ["browser", "cdp", "bidi", "mcp", "automation"],
+  "mcpServers": "./.mcp.json"
+}

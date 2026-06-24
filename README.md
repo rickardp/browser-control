@@ -175,7 +175,7 @@ Browser resolution order:
 3. Otherwise, exit with an error
 
 The server exposes engine-agnostic tools (`browser_navigate`, `browser_get_html`,
-`browser_fetch`, `browser_take_screenshot`, `browser_storage_get`,
+`browser_eval`, `browser_fetch`, `browser_take_screenshot`, `browser_storage_get`,
 `browser_cookies`, …) that work on every supported browser including Firefox.
 Playwright-only interaction tools (`browser_click`,
 `browser_type`, `browser_snapshot`, `browser_press_key`, `browser_drag`,
@@ -192,6 +192,39 @@ engine-specific state such as the Firefox BiDi lock. If that preparation fails
 keeps the newly selected browser active and reports the failure. The caller can
 then retry the same selection after the lock clears, switch to another browser,
 or switch back explicitly.
+
+### Claude Code and Codex plugins
+
+This repository can be installed as a Claude Code or Codex plugin. The plugin
+bundles the MCP server configuration in `.mcp.json` and runs the installed
+`browser-control mcp` command, so install `browser-control` first. On startup,
+the MCP server resolves the configured browser, falls back to the most recent
+live browser, or starts the default installed browser when none is live.
+Agents can recover from a terminated browser with `browser_start`, or switch
+directly with `browser_select` using the same selector syntax as the CLI
+(`brave`, `firefox`, `brave/cart`, etc.):
+
+```sh
+brew install browser-control
+browser-control set default brave
+```
+
+For local Claude Code testing from this checkout:
+
+```sh
+claude plugin marketplace add .
+claude plugin install browser-control@browser-control
+```
+
+For local Codex testing, expose this checkout through the personal marketplace
+layout (`~/.agents/plugins/marketplace.json` points at `~/plugins/browser-control`),
+then install it:
+
+```sh
+mkdir -p ~/plugins
+ln -sfn "$PWD" ~/plugins/browser-control
+codex plugin add browser-control@personal
+```
 
 ### `set | get | unset <KEY> [VALUE]`
 

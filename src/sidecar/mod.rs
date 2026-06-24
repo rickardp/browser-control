@@ -45,6 +45,11 @@ mod tests;
 /// Overridable via `--playwright-version` (CLI) or [`SidecarConfig::version`].
 pub const DEFAULT_PLAYWRIGHT_VERSION: &str = "1.49.1";
 
+/// Bound Playwright's initial CDP attach below common MCP client call
+/// timeouts, so browser-control can classify and explain connection-layer
+/// failures instead of letting the client time out first.
+const CONNECT_TIMEOUT_MS: u64 = 5_000;
+
 /// User-facing configuration for spawning a sidecar.
 #[derive(Debug, Clone, Default)]
 pub struct SidecarConfig {
@@ -298,7 +303,11 @@ impl Sidecar {
     /// from `/json/version`). Holds a Playwright `Browser` for the
     /// sidecar's lifetime; future calls reuse it.
     pub async fn connect(&self, endpoint: &str) -> Result<Value> {
-        self.call("connect", json!({ "endpoint": endpoint })).await
+        self.call(
+            "connect",
+            json!({ "endpoint": endpoint, "timeout_ms": CONNECT_TIMEOUT_MS }),
+        )
+        .await
     }
 
     /// Send a method call, await the response.

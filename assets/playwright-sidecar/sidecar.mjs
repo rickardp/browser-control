@@ -88,6 +88,7 @@ function forgetTarget(targetId) {
 async function methodConnect(params) {
   const endpoint = params?.endpoint;
   if (!endpoint) throw new Error("missing 'endpoint'");
+  const timeout = params?.timeout_ms ?? 5000;
   if (browser) {
     try {
       await browser.close();
@@ -96,7 +97,7 @@ async function methodConnect(params) {
     }
   }
   pagesByTargetId.clear();
-  browser = await chromium.connectOverCDP(endpoint);
+  browser = await chromium.connectOverCDP(endpoint, { timeout });
   const contexts = browser.contexts();
   context = contexts.length > 0 ? contexts[0] : await browser.newContext();
   // Listen for new pages so future creations are caught early.

@@ -30,6 +30,22 @@ pub async fn run(
     wait_timeout: u64,
     json: bool,
 ) -> Result<()> {
+    let res = ensure_started(browser, headless, no_wait, wait_timeout).await?;
+    emit(&res, json)?;
+    Ok(())
+}
+
+/// Ensure a browser of the requested kind is running and registered.
+///
+/// This is the programmatic form of `browser-control start`: it reuses the
+/// most recent live registry row for the selected kind, otherwise launches a
+/// new browser with the same default profile semantics as the CLI command.
+pub async fn ensure_started(
+    browser: Option<String>,
+    headless: bool,
+    no_wait: bool,
+    wait_timeout: u64,
+) -> Result<StartResult> {
     let installed = detect::list_installed();
     if installed.is_empty() {
         anyhow::bail!("no supported browsers installed; run `browser-control list-installed`");
@@ -64,9 +80,7 @@ pub async fn run(
             )
             .await?;
         }
-        let res = to_result(&row, true);
-        emit(&res, json)?;
-        return Ok(());
+        return Ok(to_result(&row, true));
     }
 
     let name = registry::naming::generate_default(resolved_kind, &registry)?;
@@ -104,12 +118,10 @@ pub async fn run(
         .await?;
     }
 
-    let res = to_result(&row, false);
-    emit(&res, json)?;
-    Ok(())
+    Ok(to_result(&row, false))
 }
 
-fn first_chromium_or_first(installed: &[Installed]) -> Option<Kind> {
+pub(crate) fn first_chromium_or_first(installed: &[Installed]) -> Option<Kind> {
     installed
         .iter()
         .find(|i| i.kind.is_chromium())

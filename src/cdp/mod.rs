@@ -169,11 +169,96 @@ impl CdpClient {
         }
     }
 
+    /// Fetch the browser's full cookie jar across Chromium versions.
+    ///
+    /// Modern Chromium exposes browser-wide cookie export as
+    /// `Storage.getCookies` on the browser endpoint. Older builds and some
+    /// protocol surfaces only exposed the deprecated Network method, either
+    /// on the browser endpoint or through an attached page session.
+    pub async fn get_all_cookies(&self) -> Result<Value> {
+        match self.send("Storage.getCookies", json!({})).await {
+            Ok(v) => return Ok(v),
+            Err(e) if !is_cdp_method_not_found(&e) => return Err(e),
+            Err(_) => {}
+        }
+
+        match self.send("Network.getAllCookies", Value::Null).await {
+            Ok(v) => return Ok(v),
+            Err(e) if !is_cdp_method_not_found(&e) => return Err(e),
+            Err(_) => {}
+        }
+
+        self.get_all_cookies_via_page_session().await
+    }
+
+    async fn get_all_cookies_via_page_session(&self) -> Result<Value> {
+        let mut created_target = None::<String>;
+        let target_id = match self
+            .list_targets()
+            .await?
+            .into_iter()
+            .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+            .and_then(|t| {
+                t.get("targetId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }) {
+            Some(id) => id,
+            None => {
+                let v = self
+                    .send(
+                        "Target.createTarget",
+                        json!({ "url": "about:blank", "background": true }),
+                    )
+                    .await?;
+                let id = v
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("Target.createTarget returned no targetId"))?
+                    .to_string();
+                created_target = Some(id.clone());
+                id
+            }
+        };
+
+        let session_id = match self.attach_to_target(&target_id).await {
+            Ok(session_id) => session_id,
+            Err(e) => {
+                if let Some(target_id) = created_target {
+                    let _ = self
+                        .send("Target.closeTarget", json!({ "targetId": target_id }))
+                        .await;
+                }
+                return Err(e);
+            }
+        };
+        let result = self
+            .send_with_session("Network.getAllCookies", Value::Null, Some(&session_id))
+            .await;
+        let _ = self
+            .send(
+                "Target.detachFromTarget",
+                json!({ "sessionId": session_id }),
+            )
+            .await;
+        if let Some(target_id) = created_target {
+            let _ = self
+                .send("Target.closeTarget", json!({ "targetId": target_id }))
+                .await;
+        }
+        result
+    }
+
     /// Gracefully shut down. Dropping the client also aborts the tasks via
     /// `WsRpc`'s `Drop`, so this is the explicit-flush path.
     pub async fn close(self) {
         self.rpc.close().await;
     }
+}
+
+pub fn is_cdp_method_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CdpError>()
+        .is_some_and(|e| e.code == -32601)
 }
 
 /// Convert a `CdpError` reply into a typed `SessionError::TargetGone` if
@@ -196,8 +281,9 @@ fn classify_cdp_error(err: CdpError, attached: bool) -> anyhow::Error {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, Mutex};
     use tokio_tungstenite::tungstenite::Message;
 
     #[tokio::test]
@@ -329,6 +415,164 @@ mod tests {
         assert!(
             err.downcast_ref::<crate::errors::SessionError>().is_none(),
             "root-session error must NOT classify as TargetGone"
+        );
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_cookies_prefers_storage_get_cookies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    seen.lock().await.push(method.clone());
+                    let result = match method.as_str() {
+                        "Storage.getCookies" => {
+                            json!({"cookies": [{"name": "sid", "value": "modern"}]})
+                        }
+                        _ => json!({}),
+                    };
+                    let resp = json!({"id": id, "result": result});
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let v = client.get_all_cookies().await.unwrap();
+        assert_eq!(v["cookies"][0]["value"], "modern");
+        assert_eq!(*seen.lock().await, vec!["Storage.getCookies".to_string()]);
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_cookies_falls_back_to_root_network_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    seen.lock().await.push(method.clone());
+                    let resp = match method.as_str() {
+                        "Storage.getCookies" => json!({
+                            "id": id,
+                            "error": {
+                                "code": -32601,
+                                "message": "'Storage.getCookies' wasn't found"
+                            }
+                        }),
+                        "Network.getAllCookies" => json!({
+                            "id": id,
+                            "result": {
+                                "cookies": [{"name": "sid", "value": "root-legacy"}]
+                            }
+                        }),
+                        _ => json!({"id": id, "result": {}}),
+                    };
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let v = client.get_all_cookies().await.unwrap();
+        assert_eq!(v["cookies"][0]["value"], "root-legacy");
+        assert_eq!(
+            *seen.lock().await,
+            vec![
+                "Storage.getCookies".to_string(),
+                "Network.getAllCookies".to_string()
+            ]
+        );
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_cookies_falls_back_to_attached_network_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    let session = req
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    seen.lock().await.push((method.clone(), session));
+                    let resp = match method.as_str() {
+                        "Storage.getCookies" | "Network.getAllCookies"
+                            if req.get("sessionId").is_none() =>
+                        {
+                            json!({
+                                "id": id,
+                                "error": {
+                                    "code": -32601,
+                                    "message": format!("'{method}' wasn't found")
+                                }
+                            })
+                        }
+                        "Target.getTargets" => json!({
+                            "id": id,
+                            "result": {
+                                "targetInfos": [{
+                                    "targetId": "T1",
+                                    "type": "page",
+                                    "url": "about:blank"
+                                }]
+                            }
+                        }),
+                        "Target.attachToTarget" => {
+                            json!({"id": id, "result": {"sessionId": "S1"}})
+                        }
+                        "Network.getAllCookies" => json!({
+                            "id": id,
+                            "result": {
+                                "cookies": [{"name": "sid", "value": "legacy"}]
+                            }
+                        }),
+                        "Target.detachFromTarget" => json!({"id": id, "result": {}}),
+                        _ => json!({"id": id, "result": {}}),
+                    };
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let v = client.get_all_cookies().await.unwrap();
+        assert_eq!(v["cookies"][0]["value"], "legacy");
+        assert_eq!(
+            *seen.lock().await,
+            vec![
+                ("Storage.getCookies".to_string(), None),
+                ("Network.getAllCookies".to_string(), None),
+                ("Target.getTargets".to_string(), None),
+                ("Target.attachToTarget".to_string(), None),
+                ("Network.getAllCookies".to_string(), Some("S1".to_string())),
+                ("Target.detachFromTarget".to_string(), None),
+            ]
         );
         client.close().await;
     }

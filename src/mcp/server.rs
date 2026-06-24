@@ -4,7 +4,7 @@
 //! capable framework (e.g. `rmcp`). The protocol surface is small:
 //! newline-delimited JSON-RPC 2.0 over stdin/stdout.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,6 +122,22 @@ impl ServerState {
     /// Idempotent: subsequent calls return the cached handle. The handle
     /// is dropped (and the child killed) when `switch_browser` clears it.
     pub async fn ensure_sidecar(&self, tool_name: &str) -> Result<crate::sidecar::Sidecar> {
+        self.ensure_sidecar_supported(tool_name).await?;
+        let resolved = self.browser_snapshot().await;
+        let mut guard = self.sidecar.lock().await;
+        if let Some(sc) = guard.as_ref() {
+            return Ok(sc.clone());
+        }
+        let sc = crate::sidecar::Sidecar::start(self.sidecar_config.clone()).await?;
+        sc.connect(&resolved.endpoint).await?;
+        *guard = Some(sc.clone());
+        Ok(sc)
+    }
+
+    /// Validate that the active browser can use the Playwright sidecar without
+    /// spawning Node or opening a Playwright CDP connection.
+    pub async fn ensure_sidecar_supported(&self, tool_name: &str) -> Result<()> {
+        self.ensure_active_browser_alive().await?;
         let resolved = self.browser_snapshot().await;
         if resolved.engine != crate::detect::Engine::Cdp {
             return Err(crate::errors::SessionError::EngineUnsupported {
@@ -132,14 +148,15 @@ impl ServerState {
             }
             .into());
         }
-        let mut guard = self.sidecar.lock().await;
-        if let Some(sc) = guard.as_ref() {
-            return Ok(sc.clone());
-        }
-        let sc = crate::sidecar::Sidecar::start(self.sidecar_config.clone()).await?;
-        sc.connect(&resolved.endpoint).await?;
-        *guard = Some(sc.clone());
-        Ok(sc)
+        Ok(())
+    }
+
+    /// Drop the cached Playwright sidecar after a connection-layer failure.
+    /// Drop kills the child through `SidecarInner`; avoid a best-effort
+    /// `dispose` RPC here because the sidecar may be exactly what is wedged.
+    pub async fn reset_sidecar(&self) {
+        let mut sidecar = self.sidecar.lock().await;
+        let _ = sidecar.take();
     }
 
     /// Snapshot the current resolved browser (cheap clone of a small struct).
@@ -185,6 +202,7 @@ impl ServerState {
     /// is cached for the server's lifetime so the BiDi `session.new`
     /// handshake runs once and the CDP WebSocket is reused across calls.
     pub async fn ensure_backend(&self) -> Result<TabBackend> {
+        self.ensure_active_browser_alive().await?;
         self.ensure_bidi_lock().await?;
         let mut guard = self.backend.lock().await;
         if let Some(b) = guard.as_ref() {
@@ -194,6 +212,59 @@ impl ServerState {
         let b = crate::session::backend::open_backend(&resolved.endpoint, resolved.engine).await?;
         *guard = Some(b.clone());
         Ok(b)
+    }
+
+    /// Check that the active registered browser is still usable before a tool
+    /// attempts protocol I/O. This keeps terminated-browser recovery
+    /// actionable for agents: call `browser_start` to launch/reuse a browser
+    /// or `browser_select` to switch to another live one.
+    ///
+    /// External URL endpoints have no registry identity, so they are checked
+    /// by the transport layer.
+    pub async fn ensure_active_browser_alive(&self) -> Result<()> {
+        use crate::cli::env_resolver::Source;
+        use crate::registry::BrowserLiveness;
+
+        let resolved = self.browser_snapshot().await;
+        let Source::Registered { name } = resolved.source else {
+            return Ok(());
+        };
+        sync_registry_op(move |registry| {
+            let Some(row) = registry
+                .get_by_name(&name)
+                .with_context(|| format!("checking active browser `{name}`"))?
+            else {
+                let hint = "call `browser_start` to start a browser, or `browser_select` to switch to another live browser";
+                let kind_hint = generated_kind_hint(&name);
+                anyhow::bail!(
+                    "active browser `{name}` is no longer registered{kind_hint}; {hint}"
+                );
+            };
+            match crate::registry::liveness(&row) {
+                BrowserLiveness::Alive => Ok(()),
+                BrowserLiveness::DeadPid => {
+                    registry
+                        .delete(&row.name)
+                        .with_context(|| format!("pruning terminated browser {}", row.name))?;
+                    anyhow::bail!(
+                        "active browser `{}` has exited (pid {}); call `browser_start` with `{}` to launch/reuse a browser, or `browser_select` another live browser",
+                        row.name,
+                        row.pid,
+                        row.kind.as_str()
+                    );
+                }
+                BrowserLiveness::EndpointUnreachable => {
+                    anyhow::bail!(
+                        "active browser `{}` is not reachable at {} (pid {} still exists); retry, call `browser_start` with `{}` to launch/reuse a browser, or `browser_select` another live browser",
+                        row.name,
+                        row.endpoint,
+                        row.pid,
+                        row.kind.as_str()
+                    );
+                }
+            }
+        })
+        .await
     }
 
     /// Resolve the MCP server's "active tab" — backed by an in-memory
@@ -429,6 +500,17 @@ where
     .await?
 }
 
+fn generated_kind_hint(name: &str) -> String {
+    let Some((prefix, _)) = name.split_once('-') else {
+        return String::new();
+    };
+    if crate::detect::Kind::parse(prefix).is_some() {
+        format!("; it looks like a generated `{prefix}` browser name")
+    } else {
+        String::new()
+    }
+}
+
 /// Resolve a `BrowserSelector` to a `ResolvedBrowser` from a `Send`
 /// async context. The URL branch awaits an HTTP roundtrip (no registry
 /// needed); the registered/kind/path branches run synchronously via
@@ -438,7 +520,8 @@ pub(crate) async fn resolve_browser_send(
     selector: crate::cli::env_resolver::BrowserSelector,
 ) -> Result<ResolvedBrowser> {
     use crate::cli::env_resolver::{BrowserSelector, DefaultResolver, Resolver};
-    match selector {
+    let startable_kind = crate::cli::mcp::startable_kind_from_selector(&selector);
+    let resolved = match selector {
         BrowserSelector::Url(u) => match u.scheme() {
             "ws" | "wss" => Ok(ResolvedBrowser {
                 engine: if u.path().contains("/session") {
@@ -480,6 +563,23 @@ pub(crate) async fn resolve_browser_send(
                 ))
             })
             .await?
+        }
+    };
+    match resolved {
+        Ok(browser) => Ok(browser),
+        Err(resolve_err) => {
+            if let Some(kind) = startable_kind {
+                crate::cli::mcp::start_and_resolve(Some(kind.as_str().to_string()), false, 30)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "browser selector failed to resolve ({resolve_err:#}); also failed to start {}",
+                            kind.as_str()
+                        )
+                    })
+            } else {
+                Err(resolve_err)
+            }
         }
     }
 }
@@ -1099,6 +1199,28 @@ mod tests {
         })
     }
 
+    fn register_browser_row(name: &str, endpoint: &str) {
+        let port: u16 = endpoint
+            .strip_prefix("ws://127.0.0.1:")
+            .and_then(|s| s.split('/').next())
+            .and_then(|s| s.parse().ok())
+            .expect("parse mock port");
+        let reg = crate::registry::Registry::open().unwrap();
+        reg.insert(&crate::registry::BrowserRow {
+            name: name.to_string(),
+            kind: crate::detect::Kind::Chrome,
+            engine: Engine::Cdp,
+            pid: std::process::id(),
+            endpoint: endpoint.to_string(),
+            port,
+            profile_dir: std::path::PathBuf::from("/tmp/profiles/bx"),
+            executable: std::path::PathBuf::from("/usr/bin/example"),
+            headless: false,
+            started_at: "2024-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+
     // Holds the synchronous ENV_LOCK across awaits on purpose: it serializes
     // the whole env-mutating test against the rest of the suite.
     #[allow(clippy::await_holding_lock)]
@@ -1118,6 +1240,7 @@ mod tests {
         }
 
         let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        register_browser_row("bx", &url);
         let state = registered_state("bx", &url);
 
         let target_id = match state.resolve_target_for_args(&json!({"tab": "work"})).await {
@@ -1149,6 +1272,7 @@ mod tests {
         }
 
         let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        register_browser_row("bx", &url);
         let state = registered_state("bx", &url);
 
         let err = match state.resolve_target_for_args(&json!({"tab": "gone"})).await {
@@ -1184,6 +1308,7 @@ mod tests {
         std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
 
         let (url, _conns, _stop) = spawn_counting_cdp_mock(vec!["T1".into()]).await;
+        register_browser_row("bx", &url);
         let state = registered_state("bx", &url);
 
         let err = match state.resolve_target_for_args(&json!({"tab": "nope"})).await {

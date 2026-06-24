@@ -1,11 +1,11 @@
 //! `browser-control mcp` subcommand entry point.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
-use crate::cli::env_resolver::{self, BrowserSelector, ResolvedBrowser};
+use crate::cli::env_resolver::{self, BrowserSelector, ResolvedBrowser, Source};
 use crate::detect::Kind;
 use crate::mcp::server::{run, ServerState, ToolRegistry};
-use crate::registry::Registry;
+use crate::registry::{BrowserRow, Registry};
 
 /// Entry point for `browser-control mcp`.
 pub async fn run_cli(
@@ -24,24 +24,50 @@ pub async fn run_cli(
 
 /// Resolution order: positional arg / `BROWSER_CONTROL` env (arg wins, env is
 /// the fallback — both are merged by clap into `browser_arg`) > persisted
-/// default (`browser-control set default ...`) > error.
+/// default (`browser-control set default ...`) > most recent live browser >
+/// start the default installed browser.
 ///
-/// We deliberately do NOT fall back to a "most recently alive" registry row:
-/// that hides which browser is being controlled and depends on global state
-/// that other processes can mutate, producing surprising results for agents
-/// that share a host.
+/// MCP must be recoverable by the agent using it. Unlike short-lived CLI
+/// commands, the server cannot exit before exposing tools such as
+/// `browser_start` / `browser_select`, so the no-explicit-selection path picks
+/// or starts a usable browser.
 pub async fn resolve_browser(browser_arg: Option<String>) -> Result<ResolvedBrowser> {
     let registry = Registry::open()?;
     if let Some(arg) = browser_arg.as_deref().filter(|s| !s.is_empty()) {
         let sel = env_resolver::parse(arg)?;
-        return env_resolver::resolve(sel, &registry).await;
+        return resolve_selector_or_start(sel, &registry).await;
     }
     if let Some(value) = crate::config::load()?.default {
-        return resolve_default_browser(&value, &registry).await;
+        match resolve_default_browser(&value, &registry).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(default_err) => {
+                if let Some(row) = registry.most_recent_alive()? {
+                    return Ok(resolved_from_row(row));
+                }
+                if let Ok(sel) = env_resolver::parse(&value) {
+                    if let Some(kind) = startable_kind_from_selector(&sel) {
+                        return start_and_resolve(Some(kind.as_str().to_string()), false, 30)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "default browser `{value}` failed to resolve ({default_err:#}); also failed to start {}",
+                                    kind.as_str()
+                                )
+                            });
+                    }
+                }
+                return start_and_resolve(None, false, 30).await.with_context(|| {
+                    format!(
+                        "default browser `{value}` failed to resolve ({default_err:#}); also failed to start a browser"
+                    )
+                });
+            }
+        }
     }
-    Err(anyhow!(
-        "no browser selected: pass a browser argument, set BROWSER_CONTROL, or run `browser-control set default <value>`"
-    ))
+    if let Some(row) = registry.most_recent_alive()? {
+        return Ok(resolved_from_row(row));
+    }
+    start_and_resolve(None, false, 30).await
 }
 
 async fn resolve_default_browser(value: &str, registry: &Registry) -> Result<ResolvedBrowser> {
@@ -61,6 +87,57 @@ async fn resolve_default_browser(value: &str, registry: &Registry) -> Result<Res
         }
     }
     env_resolver::resolve(sel, registry).await
+}
+
+async fn resolve_selector_or_start(
+    selector: BrowserSelector,
+    registry: &Registry,
+) -> Result<ResolvedBrowser> {
+    match env_resolver::resolve(selector.clone(), registry).await {
+        Ok(resolved) => Ok(resolved),
+        Err(resolve_err) => {
+            if let Some(kind) = startable_kind_from_selector(&selector) {
+                return start_and_resolve(Some(kind.as_str().to_string()), false, 30)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "browser selector failed to resolve ({resolve_err:#}); also failed to start {}",
+                            kind.as_str()
+                        )
+                    });
+            }
+            Err(resolve_err)
+        }
+    }
+}
+
+pub(crate) fn startable_kind_from_selector(selector: &BrowserSelector) -> Option<Kind> {
+    match selector {
+        BrowserSelector::Kind(kind) => Some(*kind),
+        BrowserSelector::Name(name) => kind_from_generated_name(name),
+        BrowserSelector::Url(_) | BrowserSelector::ExecutablePath(_) => None,
+    }
+}
+
+pub async fn start_and_resolve(
+    browser: Option<String>,
+    headless: bool,
+    wait_timeout: u64,
+) -> Result<ResolvedBrowser> {
+    let started = crate::cli::start::ensure_started(browser, headless, false, wait_timeout).await?;
+    Ok(ResolvedBrowser {
+        endpoint: started.endpoint,
+        engine: started.engine,
+        source: Source::Registered { name: started.name },
+    })
+}
+
+fn resolved_from_row(row: BrowserRow) -> ResolvedBrowser {
+    ResolvedBrowser {
+        endpoint: row.endpoint,
+        engine: row.engine,
+        source: Source::Registered { name: row.name },
+    }
 }
 
 fn stale_default_kind(name: &str, registry: &Registry) -> Result<Option<Kind>> {

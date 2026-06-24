@@ -58,7 +58,7 @@ rewrite) and ADR-002 (CLI lifecycle).
 - `browser-control mcp` is a stdio MCP server that targets a browser resolved
   via `--browser` / `$BROWSER_CONTROL` / persisted default.
 - Engine-agnostic tools (`browser_navigate`, `browser_get_html`,
-  `browser_fetch`, `browser_take_screenshot`, `browser_storage_*`,
+  `browser_eval`, `browser_fetch`, `browser_take_screenshot`, `browser_storage_*`,
   `browser_cookies`, …) work on every supported browser including Firefox.
 - Playwright-only interaction tools route through a lazily-spawned Node
   sidecar wrapping `playwright-core`; on Firefox they return

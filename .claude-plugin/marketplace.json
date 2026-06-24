@@ -1,0 +1,24 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "browser-control",
+  "description": "Browser control MCP server plugin for Claude Code.",
+  "owner": {
+    "name": "rickardp",
+    "url": "https://github.com/rickardp"
+  },
+  "plugins": [
+    {
+      "name": "browser-control",
+      "source": "./",
+      "description": "Expose browser-control's MCP server for controlling local browsers through CDP and WebDriver BiDi.",
+      "version": "1.0.1",
+      "author": {
+        "name": "rickardp",
+        "url": "https://github.com/rickardp"
+      },
+      "category": "development",
+      "homepage": "https://github.com/rickardp/browser-control",
+      "tags": ["browser", "mcp", "automation", "cdp", "bidi"]
+    }
+  ]
+}

@@ -79,8 +79,8 @@ pub async fn run(
 
         // Accept `<browser>[/<tab>]` for syntactic consistency with
         // `eval`/`fetch`/`storage`. Cookies are inherently browser-wide
-        // (CDP `Network.getAllCookies` / BiDi `storage.getCookies` return
-        // the full cookie jar), so tab suffixes are rejected.
+        // (CDP `Storage.getCookies` / BiDi `storage.getCookies` return the
+        // full cookie jar), so tab suffixes are rejected.
         let raw = browser.unwrap_or_default();
         let parsed = if raw.is_empty() {
             None
@@ -147,12 +147,12 @@ pub async fn run(
 
 async fn fetch_cdp(endpoint: &str) -> Result<Vec<NormalCookie>> {
     let client = open_cdp(endpoint).await?;
-    let result = client.send("Network.getAllCookies", Value::Null).await?;
+    let result = client.get_all_cookies().await?;
     client.close().await;
     let arr = result
         .get("cookies")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("CDP Network.getAllCookies: missing `cookies` array"))?;
+        .ok_or_else(|| anyhow!("CDP cookie export: missing `cookies` array"))?;
     Ok(arr.iter().map(normalize_cdp).collect())
 }
 

@@ -2,7 +2,7 @@
 //!
 //! The tool surface is Playwright-shaped (`browser_*` prefix) plus
 //! browser-control extensions (`browser_get_html`, `browser_fetch`,
-//! `browser_select_element`, `browser_cookies`, `browser_storage_*`,
+//! `browser_eval`, `browser_select_element`, `browser_cookies`, `browser_storage_*`,
 //! `browser_wait_for_cookie`) and the legacy CDP-shaped `list_targets`
 //! kept for info-dense diagnostics.
 //!
@@ -21,7 +21,9 @@ use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
 use crate::cli::wait_for_cookie::cookie_matches;
 use crate::detect::Engine;
 use crate::dom::scripts::{FETCH_JS, GET_CLIP_RECT_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
+use crate::errors::SessionError;
 use crate::mcp::server::{RegisteredTool, ServerState, ToolHandler, ToolRegistry};
+use crate::session::backend::TabBackend;
 use crate::session::freshness;
 use crate::session::targets::TargetInfo;
 
@@ -47,10 +49,14 @@ const MCP_SELECT_ELEMENT_TIMEOUT: Duration = Duration::from_secs(300);
 /// returning `TabHung`. Matches `session::attach::PICK_PROBE_TIMEOUT`.
 const TAB_SELECT_PROBE: Duration = Duration::from_millis(500);
 
+/// Native wake/probe budget used only after a Playwright sidecar CDP failure.
+const SIDECAR_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Register the standard tool set onto the given registry.
 pub fn register_all(registry: &ToolRegistry) {
     // Renamed-from-Playwright tools.
     registry.register(make_navigate());
+    registry.register(make_eval());
     registry.register(make_get_html());
     registry.register(make_take_screenshot());
     registry.register(make_fetch());
@@ -67,6 +73,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_tab_select());
     registry.register(make_tab_close());
     // New browser-management tools.
+    registry.register(make_browser_start());
     registry.register(make_browser_select());
     registry.register(make_browser_list());
     registry.register(make_browser_show());
@@ -164,6 +171,19 @@ fn max_age_arg(args: &Value) -> Result<Duration> {
     }
 }
 
+fn timeout_ms_arg(args: &Value, key: &str, default: Duration) -> Result<Duration> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map(Duration::from_millis)
+            .ok_or_else(|| anyhow!("`{key}` number must be non-negative milliseconds")),
+        Some(_) => Err(anyhow!(
+            "`{key}` must be a non-negative number of milliseconds"
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // browser_navigate
 // ---------------------------------------------------------------------------
@@ -187,6 +207,61 @@ fn make_navigate() -> RegisteredTool {
                 let (backend, target_id) = state.resolve_target_for_args(&args).await?;
                 backend.navigate(&target_id, &url).await?;
                 Ok(text_content(format!("Navigated to {url}")))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_eval
+// ---------------------------------------------------------------------------
+
+fn make_eval() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_eval".into(),
+        description: "Evaluate a JavaScript expression in the active page.".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(json!({
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression to evaluate."
+                },
+                "await_promise": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Treat the expression as a Promise and await it."
+                },
+                "timeout_ms": {
+                    "type": "number",
+                    "description": "Per-call timeout in milliseconds (default 10000)."
+                },
+                "max_age": {
+                    "type": "string",
+                    "description": "Reload the page first if its document is older than this duration (default 10m)."
+                }
+            })),
+            "required": ["expression"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let expression = args
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing 'expression'"))?
+                    .to_string();
+                let await_promise = args
+                    .get("await_promise")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let timeout = timeout_ms_arg(&args, "timeout_ms", MCP_OP_TIMEOUT)?;
+                let max_age = max_age_arg(&args)?;
+                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                backend.ensure_fresh(&target_id, max_age).await?;
+                let value = backend
+                    .evaluate(&target_id, &expression, await_promise, timeout)
+                    .await?;
+                Ok(text_content(serde_json::to_string_pretty(&value)?))
             })
         }),
     }
@@ -694,15 +769,24 @@ async fn tab_list_value(state: &ServerState) -> Result<Value> {
 fn make_tab_new() -> RegisteredTool {
     RegisteredTool {
         name: "browser_tab_new".into(),
-        description: "Create a new tab and make it the active tab. Defaults to about:blank.".into(),
+        description: "Create a new tab and make it the active tab. Defaults to about:blank. \
+                      Pass `name` to create or select a durable named tab addressable as \
+                      `<browser>/<name>`."
+            .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
+                "name": { "type": "string", "description": "Optional named-tab id (a-z, 0-9, '-', '_')." },
                 "url": { "type": "string", "description": "Optional URL; defaults to about:blank." }
             },
         }),
         handler: handler(|state, args| {
             Box::pin(async move {
+                if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+                    let url = args.get("url").and_then(|v| v.as_str());
+                    let opened = open_or_create_named_tab(&state, name, url).await?;
+                    return Ok(text_content(serde_json::to_string_pretty(&opened)?));
+                }
                 let url = args
                     .get("url")
                     .and_then(|v| v.as_str())
@@ -719,6 +803,89 @@ fn make_tab_new() -> RegisteredTool {
             })
         }),
     }
+}
+
+async fn open_or_create_named_tab(
+    state: &ServerState,
+    name: &str,
+    url: Option<&str>,
+) -> Result<Value> {
+    crate::cli::env_resolver::validate_tab_name(name)?;
+    let want_url = url.unwrap_or("about:blank").to_string();
+    let backend = state.ensure_backend().await?;
+    let browser_name = state.registered_browser_name().await?;
+
+    let existing = {
+        let bn = browser_name.clone();
+        let n = name.to_string();
+        crate::mcp::server::sync_registry_op(move |reg| reg.tab_get(&bn, &n)).await?
+    };
+    if let Some(row) = existing {
+        let live = backend.live_target_ids().await?;
+        if live.contains(&row.target_id) {
+            if url.is_some() && row.last_url != want_url {
+                backend.navigate(&row.target_id, &want_url).await?;
+                let bn = browser_name.clone();
+                let n = name.to_string();
+                let u = want_url.clone();
+                crate::mcp::server::sync_registry_op(move |reg| reg.tab_set_url(&bn, &n, &u))
+                    .await?;
+            } else {
+                let bn = browser_name.clone();
+                let n = name.to_string();
+                crate::mcp::server::sync_registry_op(move |reg| reg.tab_touch(&bn, &n)).await?;
+            }
+            *state.active_target_id.lock().await = Some(row.target_id.clone());
+            return Ok(json!({
+                "name": name,
+                "target_id": row.target_id,
+                "url": if url.is_some() { want_url } else { row.last_url },
+                "active": true,
+                "created": false,
+            }));
+        }
+
+        let _ = backend.close_tab(&row.target_id).await;
+        let bn = browser_name.clone();
+        let n = name.to_string();
+        crate::mcp::server::sync_registry_op(move |reg| reg.tab_delete(&bn, &n)).await?;
+    }
+
+    let victim = {
+        let bn = browser_name.clone();
+        crate::mcp::server::sync_registry_op(
+            move |reg| -> Result<Option<crate::registry::TabRow>> {
+                if reg.tabs_count_daemon_created(&bn)? >= crate::session::tabs::HARD_CAP {
+                    reg.tabs_lru_daemon_created(&bn)
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .await?
+    };
+    if let Some(victim) = victim {
+        let _ = backend.close_tab(&victim.target_id).await;
+        let bn = victim.browser_name;
+        let n = victim.name;
+        crate::mcp::server::sync_registry_op(move |reg| reg.tab_delete(&bn, &n)).await?;
+    }
+
+    let target_id = backend.create_tab(&want_url).await?;
+    let bn = browser_name;
+    let n = name.to_string();
+    let tid = target_id.clone();
+    let u = want_url.clone();
+    crate::mcp::server::sync_registry_op(move |reg| reg.tab_upsert(&bn, &n, &tid, &u, true))
+        .await?;
+    *state.active_target_id.lock().await = Some(target_id.clone());
+    Ok(json!({
+        "name": name,
+        "target_id": target_id,
+        "url": want_url,
+        "active": true,
+        "created": true,
+    }))
 }
 
 fn make_tab_select() -> RegisteredTool {
@@ -829,18 +996,76 @@ fn make_tab_close() -> RegisteredTool {
 // browser_select / browser_list
 // ---------------------------------------------------------------------------
 
+fn make_browser_start() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_start".into(),
+        description: "Start or reuse a browser, then make it the active MCP browser. \
+                      Use this to recover after the active browser exits."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "browser": { "type": "string", "description": "Optional browser kind (chrome, edge, chromium, brave, firefox). Defaults to the first installed Chromium-family browser." },
+                "headless": { "type": "boolean", "default": false },
+                "wait_timeout_seconds": { "type": "integer", "default": 30 }
+            },
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let browser = args
+                    .get("browser")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let headless = args
+                    .get("headless")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let wait_timeout = args
+                    .get("wait_timeout_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
+                let started =
+                    crate::cli::start::ensure_started(browser, headless, false, wait_timeout)
+                        .await?;
+                let resolved = crate::cli::env_resolver::ResolvedBrowser {
+                    endpoint: started.endpoint.clone(),
+                    engine: started.engine,
+                    source: crate::cli::env_resolver::Source::Registered {
+                        name: started.name.clone(),
+                    },
+                };
+                state.switch_browser(resolved).await?;
+                let tabs = tab_list_value(&state).await?;
+                Ok(text_content(serde_json::to_string_pretty(&json!({
+                    "name": started.name,
+                    "kind": started.kind.as_str(),
+                    "engine": match started.engine {
+                        crate::detect::Engine::Cdp => "cdp",
+                        crate::detect::Engine::Bidi => "bidi",
+                    },
+                    "endpoint": started.endpoint,
+                    "reused": started.reused,
+                    "selected": true,
+                    "tabs": tabs,
+                }))?))
+            })
+        }),
+    }
+}
+
 fn make_browser_select() -> RegisteredTool {
     RegisteredTool {
         name: "browser_select".into(),
-        description: "Switch the active browser by registered name (or any selector accepted by \
-                      the CLI, e.g. `chrome`, `firefox-pikachu`). The switch is committed before \
+        description: "Switch the active browser by registered name, kind, URL, or CLI target \
+                      syntax such as `chrome` or `brave/cart`. A kind selector starts or reuses \
+                      that browser when none is live. The switch is committed before \
                       Firefox BiDi lock preparation; if preparation fails, the new browser remains \
                       active and the caller decides whether to retry, switch elsewhere, or switch back."
             .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string" }
+                "name": { "type": "string", "description": "Browser selector, optionally `<browser>/<tab>`." }
             },
             "required": ["name"],
         }),
@@ -851,10 +1076,16 @@ fn make_browser_select() -> RegisteredTool {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing 'name'"))?
                     .to_string();
-                let selector = crate::cli::env_resolver::parse(&name)?;
-                let resolved = crate::mcp::server::resolve_browser_send(selector).await?;
+                let target = crate::cli::env_resolver::parse_target(&name)?;
+                let resolved =
+                    crate::mcp::server::resolve_browser_send(target.browser.clone()).await?;
                 let resolved_clone = resolved.clone();
                 state.switch_browser(resolved).await?;
+                let selected_tab = if let Some(tab) = target.tab.as_deref() {
+                    Some(open_or_create_named_tab(&state, tab, None).await?)
+                } else {
+                    None
+                };
                 let tabs = tab_list_value(&state).await?;
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "name": match &resolved_clone.source {
@@ -866,6 +1097,7 @@ fn make_browser_select() -> RegisteredTool {
                         crate::detect::Engine::Bidi => "bidi",
                     },
                     "endpoint": resolved_clone.endpoint,
+                    "selected_tab": selected_tab,
                     "tabs": tabs,
                 }))?))
             })
@@ -948,8 +1180,12 @@ fn make_browser_show() -> RegisteredTool {
 //      BiDi browsers this errors with `EngineUnsupported`.
 //   3. Forwards to the sidecar with `target_id` + tool-specific params.
 
-/// Forward a sidecar call. Resolves the target, ensures the sidecar is
-/// up, sends the RPC with `target_id` merged into the params.
+/// Forward a sidecar call. Resolves the target natively first, ensures the
+/// sidecar is up, then sends the RPC with `target_id` merged into the params.
+/// If Playwright fails at the CDP attachment/connection layer, wake and probe
+/// the tab through browser-control's native backend before returning a typed
+/// sidecar-specific error. This prevents agents from misreading a sidecar CDP
+/// timeout as evidence that the page itself is hung.
 async fn forward_to_sidecar(
     state: &ServerState,
     tool_name: &str,
@@ -957,14 +1193,130 @@ async fn forward_to_sidecar(
     sidecar_method: &str,
     mut params: serde_json::Map<String, Value>,
 ) -> Result<Value> {
-    // Preflight: check engine support before resolving the target.
-    // `ensure_sidecar` returns `EngineUnsupported` on BiDi browsers;
-    // calling it first avoids opening a backend / creating a tab
-    // only to discard it.
-    let sc = state.ensure_sidecar(tool_name).await?;
-    let (_, target_id) = state.resolve_target_for_args(args).await?;
+    // Preflight: check engine support before resolving the target, but do not
+    // spawn the sidecar yet. If Playwright attach fails, we still need a native
+    // backend + target id for the wake/probe diagnostic.
+    state.ensure_sidecar_supported(tool_name).await?;
+    let (backend, target_id) = state.resolve_target_for_args(args).await?;
     params.insert("target_id".into(), Value::String(target_id));
-    sc.call(sidecar_method, Value::Object(params)).await
+    let sc = match state.ensure_sidecar(tool_name).await {
+        Ok(sc) => sc,
+        Err(e) if looks_like_sidecar_cdp_attach_failure(&e) => {
+            return sidecar_cdp_failure_after_probe(
+                state,
+                &backend,
+                tool_name,
+                sidecar_method,
+                params
+                    .get("target_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                e,
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
+    match sc.call(sidecar_method, Value::Object(params.clone())).await {
+        Ok(v) => Ok(v),
+        Err(e) if looks_like_sidecar_cdp_attach_failure(&e) => {
+            sidecar_cdp_failure_after_probe(
+                state,
+                &backend,
+                tool_name,
+                sidecar_method,
+                params
+                    .get("target_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                e,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn sidecar_cdp_failure_after_probe(
+    state: &ServerState,
+    backend: &TabBackend,
+    tool_name: &str,
+    sidecar_method: &str,
+    target_id: &str,
+    err: anyhow::Error,
+) -> Result<Value> {
+    state.reset_sidecar().await;
+    let url = wake_and_probe_target(backend, target_id).await?;
+    Err(SessionError::SidecarConnectionFailed {
+        tool: tool_name.to_string(),
+        method: sidecar_method.to_string(),
+        target_id: target_id.to_string(),
+        url,
+        details: format!("{err:#}"),
+        hint: "retry the Playwright-sidecar tool or inspect with browser_get_html / browser_take_screenshot",
+    }
+    .into())
+}
+
+async fn wake_and_probe_target(backend: &TabBackend, target_id: &str) -> Result<Option<String>> {
+    match tokio::time::timeout(SIDECAR_WAKE_PROBE_TIMEOUT, backend.show_tab(target_id)).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(SessionError::TabHung {
+                target_id: Some(target_id.to_string()),
+                url: None,
+                timeout_ms: SIDECAR_WAKE_PROBE_TIMEOUT.as_millis() as u64,
+                hint: "sidecar-wake-timeout",
+            }
+            .into());
+        }
+    }
+
+    match tokio::time::timeout(
+        SIDECAR_WAKE_PROBE_TIMEOUT,
+        backend.evaluate(target_id, "1", false, SIDECAR_WAKE_PROBE_TIMEOUT),
+    )
+    .await
+    {
+        Ok(r) => {
+            let _ = r?;
+        }
+        Err(_) => {
+            return Err(SessionError::TabHung {
+                target_id: Some(target_id.to_string()),
+                url: None,
+                timeout_ms: SIDECAR_WAKE_PROBE_TIMEOUT.as_millis() as u64,
+                hint: "sidecar-probe-timeout",
+            }
+            .into());
+        }
+    }
+
+    match tokio::time::timeout(SIDECAR_WAKE_PROBE_TIMEOUT, backend.live_targets()).await {
+        Ok(Ok(targets)) => Ok(targets
+            .into_iter()
+            .find(|t| t.id == target_id)
+            .map(|t| t.url)),
+        _ => Ok(None),
+    }
+}
+
+fn looks_like_sidecar_cdp_attach_failure(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("<ws connecting>")
+        || msg.contains("connectovercdp")
+        || msg.contains("websocket")
+        || msg.contains("browser has been closed")
+        || msg.contains("browser closed")
+        || msg.contains("browser disconnected")
+        || msg.contains("target closed")
+        || msg.contains("cdp session closed")
+        || msg.contains("econnrefused")
+        || msg.contains("econnreset")
+        || msg.contains("socket hang up")
+        || msg.contains("sidecar stdout closed")
+        || msg.contains("sidecar writer closed")
+        || msg.contains("sidecar response channel dropped")
 }
 
 fn make_snapshot() -> RegisteredTool {
@@ -1273,6 +1625,7 @@ mod tests {
     /// registration order in `register_all`.
     const EXPECTED_TOOLS: &[&str] = &[
         "browser_navigate",
+        "browser_eval",
         "browser_get_html",
         "browser_take_screenshot",
         "browser_fetch",
@@ -1286,6 +1639,7 @@ mod tests {
         "browser_tab_new",
         "browser_tab_select",
         "browser_tab_close",
+        "browser_start",
         "browser_select",
         "browser_list",
         "browser_show",
@@ -1434,6 +1788,18 @@ mod tests {
         assert!(
             schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty()
         );
+    }
+
+    #[test]
+    fn browser_eval_requires_expression_and_supports_routing() {
+        let schema = schema_for("browser_eval");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(required.iter().any(|v| v == "expression"));
+        assert_eq!(schema["properties"]["expression"]["type"], "string");
+        assert_eq!(schema["properties"]["await_promise"]["type"], "boolean");
+        assert_eq!(schema["properties"]["timeout_ms"]["type"], "number");
+        assert_eq!(schema["properties"]["tab"]["type"], "string");
+        assert_eq!(schema["properties"]["target"]["type"], "string");
     }
 
     #[test]
@@ -1640,6 +2006,36 @@ mod tests {
             }
             other => panic!("expected EngineUnsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sidecar_cdp_attach_failure_classifier_matches_connect_layer_errors() {
+        let err = anyhow::anyhow!(
+            "browserType.connectOverCDP: Timeout 5000ms exceeded while <ws connecting> to ws://127.0.0.1:64767/devtools/browser/x"
+        );
+        assert!(looks_like_sidecar_cdp_attach_failure(&err));
+
+        let err = anyhow::anyhow!("page.waitForLoadState: Timeout 30000ms exceeded");
+        assert!(
+            !looks_like_sidecar_cdp_attach_failure(&err),
+            "normal page wait timeouts must not be reclassified as sidecar attach failures"
+        );
+    }
+
+    #[test]
+    fn sidecar_connection_failed_message_discourages_page_hang_inference() {
+        let err = SessionError::SidecarConnectionFailed {
+            tool: "browser_snapshot".into(),
+            method: "snapshot".into(),
+            target_id: "T1".into(),
+            url: Some("http://localhost:5173/404".into()),
+            details: "browserType.connectOverCDP: Timeout 5000ms exceeded".into(),
+            hint: "retry the Playwright-sidecar tool or inspect with browser_get_html / browser_take_screenshot",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Playwright sidecar connection failed"));
+        assert!(msg.contains("not evidence that the page is hung"));
+        assert!(msg.contains("browser_get_html"));
     }
 
     #[tokio::test]

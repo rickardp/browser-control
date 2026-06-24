@@ -63,7 +63,7 @@ Layout:
 Column rules:
 
 1. **`domain`** — exact cookie domain. If the cookie applies to subdomains
-   (i.e. CDP `domain` starts with `.` or `Network.getAllCookies` reports
+   (i.e. CDP `domain` starts with `.` or the protocol reports
    `hostOnly == false`), a leading `.` is prepended; host-only cookies are
    written without one.
 2. **`include_subdomains`** — `TRUE` when the domain has the leading dot,

@@ -65,6 +65,7 @@ fn mcp_tools_list_returns_full_set() {
         "browser_tab_select",
         "browser_tab_close",
         // Browser management.
+        "browser_start",
         "browser_select",
         "browser_list",
         // Diagnostic CDP-shaped helper.
@@ -82,11 +83,11 @@ fn mcp_tools_list_returns_full_set() {
 }
 
 #[test]
-fn mcp_with_no_browser_errors_helpfully() {
+fn mcp_with_unknown_browser_name_errors_helpfully() {
     let tmp = TempDir::new().unwrap();
     let cfg = TempDir::new().unwrap();
     let out = Command::new(assert_cmd::cargo::cargo_bin("browser-control"))
-        .args(["mcp"])
+        .args(["mcp", "--browser", "definitely-missing"])
         .env("BROWSER_CONTROL_DATA_DIR", tmp.path())
         .env("BROWSER_CONTROL_CONFIG_DIR", cfg.path())
         .env_remove("BROWSER_CONTROL")
@@ -95,10 +96,8 @@ fn mcp_with_no_browser_errors_helpfully() {
     assert!(!out.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no browser selected")
-            || stderr.contains("BROWSER_CONTROL")
-            || stderr.contains("browser-control start"),
-        "stderr should hint at how to select a browser, got: {stderr}"
+        stderr.contains("no registered browser named definitely-missing"),
+        "stderr should explain the unknown browser, got: {stderr}"
     );
 }
 

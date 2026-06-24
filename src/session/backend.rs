@@ -535,16 +535,16 @@ impl TabBackend {
     /// one — required on Firefox, where BiDi permits only one session per
     /// browser, so a second `session.new` against a server-held browser
     /// fails or races. Cookies are browser-wide on both engines (CDP
-    /// `Network.getAllCookies` / BiDi `storage.getCookies`), so no target
-    /// id is needed.
+    /// `Storage.getCookies` with legacy fallback / BiDi `storage.getCookies`),
+    /// so no target id is needed.
     pub(crate) async fn cookies(&self) -> Result<Vec<NormalCookie>> {
         match self {
             TabBackend::Cdp(c) => {
-                let v = c.send("Network.getAllCookies", json!({})).await?;
+                let v = c.get_all_cookies().await?;
                 let arr = v
                     .get("cookies")
                     .and_then(|x| x.as_array())
-                    .ok_or_else(|| anyhow!("CDP Network.getAllCookies: missing `cookies` array"))?;
+                    .ok_or_else(|| anyhow!("CDP cookie export: missing `cookies` array"))?;
                 Ok(arr.iter().map(normalize_cdp).collect())
             }
             TabBackend::Bidi(c) => {

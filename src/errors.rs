@@ -52,6 +52,21 @@ pub enum SessionError {
         current_engine: String,
         hint: &'static str,
     },
+    /// A Playwright sidecar tool failed at the sidecar/CDP connection layer,
+    /// but browser-control's native backend was still able to wake and probe
+    /// the target tab. This is intentionally distinct from `TabHung`: agents
+    /// should not treat it as evidence that the page or app is stuck.
+    #[error(
+        "Playwright sidecar connection failed while running `{tool}` ({method}) against target {target_id:?} url {url:?}: {details}. browser-control reached the tab with native CDP, so this is a Playwright sidecar/CDP attachment failure, not evidence that the page is hung ({hint})"
+    )]
+    SidecarConnectionFailed {
+        tool: String,
+        method: String,
+        target_id: String,
+        url: Option<String>,
+        details: String,
+        hint: &'static str,
+    },
 }
 
 /// Which protocol surfaced a `TargetGone`. Useful for diagnostics; the

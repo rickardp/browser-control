@@ -99,6 +99,7 @@ async fn registered_tools_list_contains_full_playwright_shaped_set() {
         .collect();
     for expected in [
         "browser_navigate",
+        "browser_eval",
         "browser_get_html",
         "browser_take_screenshot",
         "browser_fetch",
@@ -349,15 +350,19 @@ async fn spawn_recording_cdp_mock_with_fetch_redirect(
                                             .push(RecordedEvaluate {
                                                 target_id: target_id.clone(),
                                             });
-                                        if let Some(url) = redirect_after_fetch.as_ref() {
-                                            live.insert(target_id, url.clone());
+                                        if expression == "1 + 2" {
+                                            json!(3)
+                                        } else {
+                                            if let Some(url) = redirect_after_fetch.as_ref() {
+                                                live.insert(target_id, url.clone());
+                                            }
+                                            json!(json!({
+                                                "ok": true,
+                                                "status": 200,
+                                                "body": "ok"
+                                            })
+                                            .to_string())
                                         }
-                                        json!(json!({
-                                            "ok": true,
-                                            "status": 200,
-                                            "body": "ok"
-                                        })
-                                        .to_string())
                                     };
                                     json!({"result": {"value": value}})
                                 }
@@ -702,6 +707,34 @@ async fn browser_navigate_rejects_both_tab_and_target() {
 }
 
 #[tokio::test]
+async fn browser_eval_returns_json_value_and_uses_active_tab() {
+    let (url, _stop, recorded) = spawn_recording_cdp_mock(vec![]).await;
+    let state = state_for_mock(&url);
+
+    let out = call_tool(
+        state.clone(),
+        "browser_eval",
+        json!({"expression": "1 + 2"}),
+    )
+    .await
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
+    assert_eq!(parsed, json!(3));
+
+    let rec = recorded.lock().await;
+    assert_eq!(
+        rec.created_targets,
+        vec![("NEW1".to_string(), "about:blank".to_string())]
+    );
+    assert_eq!(
+        rec.evaluations,
+        vec![RecordedEvaluate {
+            target_id: "NEW1".to_string()
+        }]
+    );
+}
+
+#[tokio::test]
 async fn browser_fetch_without_route_creates_url_origin_tab_without_setting_active() {
     let (url, _stop, recorded) = spawn_recording_cdp_mock(vec![]).await;
     let state = state_for_mock(&url);
@@ -1023,5 +1056,112 @@ async fn browser_select_switches_to_registered_browser() {
     assert_eq!(snap.endpoint, mock_url);
     // Active tab pointer cleared on swap.
     assert!(state.active_target_id.lock().await.is_none());
+    std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+}
+
+#[tokio::test]
+async fn browser_select_accepts_browser_slash_named_tab() {
+    use browser_control::detect::Kind;
+    use browser_control::registry::{BrowserRow, Registry};
+    use std::path::PathBuf;
+    let _guard = REGISTRY_TEST_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
+    let (mock_url, _stop) = spawn_cdp_mock(MockBehaviour::default()).await;
+    let mock_port: u16 = mock_url
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse().ok())
+        .expect("parse mock port");
+    {
+        let reg = Registry::open().unwrap();
+        reg.insert(&BrowserRow {
+            name: "chrome-fixture".into(),
+            kind: Kind::Chrome,
+            engine: Engine::Cdp,
+            pid: std::process::id(),
+            endpoint: mock_url.clone(),
+            port: mock_port,
+            profile_dir: PathBuf::from("/tmp/profiles/chrome"),
+            executable: PathBuf::from("/usr/bin/example"),
+            headless: false,
+            started_at: "2024-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+
+    let state = ServerState::new(ResolvedBrowser {
+        endpoint: "ws://127.0.0.1:1/unused".into(),
+        engine: Engine::Cdp,
+        source: Source::External,
+    });
+    let out = call_tool(
+        state.clone(),
+        "browser_select",
+        json!({"name": "chrome/cart"}),
+    )
+    .await
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
+    assert_eq!(parsed["name"], "chrome-fixture");
+    assert_eq!(parsed["selected_tab"]["name"], "cart");
+    assert_eq!(parsed["selected_tab"]["active"], true);
+    assert!(parsed["selected_tab"]["target_id"].as_str().is_some());
+    {
+        let reg = Registry::open().unwrap();
+        assert!(reg.tab_get("chrome-fixture", "cart").unwrap().is_some());
+    }
+    assert_eq!(
+        state.active_target_id.lock().await.as_deref(),
+        parsed["selected_tab"]["target_id"].as_str()
+    );
+    std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+}
+
+#[tokio::test]
+async fn active_browser_dead_pid_error_points_to_browser_start() {
+    use browser_control::detect::Kind;
+    use browser_control::registry::{BrowserRow, Registry};
+    use std::path::PathBuf;
+    let _guard = REGISTRY_TEST_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::env::set_var("BROWSER_CONTROL_DATA_DIR", tmp.path());
+    {
+        let reg = Registry::open().unwrap();
+        reg.insert(&BrowserRow {
+            name: "brave-cosmos".into(),
+            kind: Kind::Brave,
+            engine: Engine::Cdp,
+            pid: 99_999_999,
+            endpoint: "ws://127.0.0.1:9/devtools/browser/stale".into(),
+            port: 9,
+            profile_dir: PathBuf::from("/tmp/profiles/brave"),
+            executable: PathBuf::from("/usr/bin/example"),
+            headless: false,
+            started_at: "2024-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+    let state = ServerState::new(ResolvedBrowser {
+        endpoint: "ws://127.0.0.1:9/devtools/browser/stale".into(),
+        engine: Engine::Cdp,
+        source: Source::Registered {
+            name: "brave-cosmos".into(),
+        },
+    });
+    let err = call_tool(state, "browser_tab_list", json!({}))
+        .await
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("active browser `brave-cosmos` has exited"),
+        "{msg}"
+    );
+    assert!(msg.contains("browser_start"), "{msg}");
+    assert!(msg.contains("brave"), "{msg}");
+    {
+        let reg = Registry::open().unwrap();
+        assert!(reg.get_by_name("brave-cosmos").unwrap().is_none());
+    }
     std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
 }
