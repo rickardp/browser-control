@@ -1,6 +1,6 @@
 {
   "name": "browser-control",
-  "version": "1.0.1+codex.20260612053338",
+  "version": "1.0.2+codex.20260624221855",
   "description": "Expose browser-control's MCP server for controlling local browsers through CDP and WebDriver BiDi.",
   "author": {
     "name": "rickardp",

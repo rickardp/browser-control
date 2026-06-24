@@ -1,6 +1,6 @@
 [package]
 name = "browser-control"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 rust-version = "1.80"
 description = "CLI that manages browsers and exposes them over CDP/BiDi for agent-driven development. Includes an optional MCP server."
