@@ -68,8 +68,15 @@ async fn run_inner(
     trace: &mut CommandTrace,
 ) -> Result<()> {
     let header_map = parse_headers(&headers)?;
-    let expr = build_fetch_expr(&url, &method, &header_map, data.as_deref())?;
     let fetch_timeout = Duration::from_millis(timeout_ms);
+    let script_timeout_ms = script_fetch_timeout_ms(fetch_timeout);
+    let expr = build_fetch_expr(
+        &url,
+        &method,
+        &header_map,
+        data.as_deref(),
+        script_timeout_ms,
+    )?;
     let max_age = freshness::parse_max_age(&max_age)?;
 
     // Path-syntax parsing: `<browser>` or `<browser>/<tab>` in the
@@ -172,18 +179,25 @@ struct FetchEnvelope {
     body: String,
 }
 
-/// Wire shape of the `FETCH_JS` envelope. Deserialized directly; only `status`
-/// is required. `headers` is a `BTreeMap` so iteration is key-sorted, matching
-/// the previous `serde_json::Map` iteration order.
+/// Wire shape of the `FETCH_JS` envelope. `headers` is a `BTreeMap` so
+/// iteration is key-sorted, matching the previous `serde_json::Map` iteration
+/// order.
 #[derive(Deserialize)]
 struct RawFetchEnvelope {
-    status: u16,
+    #[serde(default)]
+    ok: Option<bool>,
+    #[serde(default)]
+    status: Option<u16>,
     #[serde(default, rename = "statusText")]
     status_text: String,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default, rename = "errorName")]
+    error_name: Option<String>,
 }
 
 fn parse_headers(headers: &[String]) -> Result<Map<String, Value>> {
@@ -215,16 +229,23 @@ fn build_fetch_expr(
     method: &str,
     headers: &Map<String, Value>,
     body: Option<&str>,
+    timeout_ms: u64,
 ) -> Result<String> {
     let args = json!({
         "url": url,
         "method": method,
         "headers": Value::Object(headers.clone()),
         "body": body,
+        "timeoutMs": timeout_ms,
     });
     let args_json = serde_json::to_string(&args)?;
     let args_literal = serde_json::to_string(&args_json)?;
     Ok(format!("({FETCH_JS})({args_literal})"))
+}
+
+pub(crate) fn script_fetch_timeout_ms(timeout: Duration) -> u64 {
+    let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    ms.saturating_sub(1_000).max(1)
 }
 
 /// `FETCH_JS` returns `JSON.stringify({...})`, so the evaluator hands us a
@@ -235,8 +256,20 @@ fn parse_envelope(v: &Value) -> Result<FetchEnvelope> {
         .ok_or_else(|| anyhow!("fetch script returned non-string value: {v}"))?;
     let raw: RawFetchEnvelope = serde_json::from_str(s)
         .with_context(|| format!("fetch script returned invalid JSON: {s}"))?;
+    if raw.ok == Some(false) {
+        let mut msg = raw.error.unwrap_or_else(|| "fetch failed".to_string());
+        if let Some(name) = raw.error_name {
+            if !name.is_empty() {
+                msg.push_str(&format!(" ({name})"));
+            }
+        }
+        bail!(msg);
+    }
+    let status = raw
+        .status
+        .ok_or_else(|| anyhow!("fetch script response missing status: {s}"))?;
     Ok(FetchEnvelope {
-        status: raw.status,
+        status,
         status_text: raw.status_text,
         headers: raw.headers.into_iter().collect(),
         body: raw.body,
@@ -317,7 +350,7 @@ mod tests {
         // break naive string interpolation.
         let url = "https://x.test/?q=\"hi\"";
         let body = "line1\n\"line2\"\\end";
-        let expr = build_fetch_expr(url, "POST", &h, Some(body)).unwrap();
+        let expr = build_fetch_expr(url, "POST", &h, Some(body), 59_750).unwrap();
         // The expression must wrap a single JSON-encoded string argument.
         let prefix = format!("({FETCH_JS})(");
         let inner = expr
@@ -335,13 +368,14 @@ mod tests {
         assert_eq!(args["url"], url);
         assert_eq!(args["body"], body);
         assert_eq!(args["method"], "POST");
+        assert_eq!(args["timeoutMs"], 59_750);
     }
 
     #[test]
     fn build_expr_method_and_headers_round_trip() {
         let mut h = Map::new();
         h.insert("Accept".to_string(), json!("*/*"));
-        let expr = build_fetch_expr("https://x.test/", "GET", &h, None).unwrap();
+        let expr = build_fetch_expr("https://x.test/", "GET", &h, None, 59_750).unwrap();
         // Extract the JSON-string literal argument and decode twice.
         let prefix = format!("({FETCH_JS})(");
         let inner = expr
@@ -355,11 +389,13 @@ mod tests {
         assert_eq!(args["method"], "GET");
         assert_eq!(args["headers"]["Accept"], "*/*");
         assert!(args["body"].is_null());
+        assert_eq!(args["timeoutMs"], 59_750);
     }
 
     #[test]
     fn parse_envelope_decodes_inner_json() {
         let inner = json!({
+            "ok": true,
             "status": 200,
             "statusText": "OK",
             "headers": {"content-type": "text/plain"},
@@ -380,6 +416,28 @@ mod tests {
     fn parse_envelope_rejects_non_string() {
         let v = json!({"status": 200});
         assert!(parse_envelope(&v).is_err());
+    }
+
+    #[test]
+    fn parse_envelope_reports_fetch_error() {
+        let inner = json!({
+            "ok": false,
+            "error": "fetch timed out after 9750ms",
+            "errorName": "AbortError"
+        });
+        let v = Value::String(inner.to_string());
+        let err = parse_envelope(&v).unwrap_err();
+        assert!(err.to_string().contains("fetch timed out after 9750ms"));
+        assert!(err.to_string().contains("AbortError"));
+    }
+
+    #[test]
+    fn script_timeout_leaves_outer_timeout_margin() {
+        assert_eq!(
+            script_fetch_timeout_ms(Duration::from_millis(10_000)),
+            9_000
+        );
+        assert_eq!(script_fetch_timeout_ms(Duration::from_millis(100)), 1);
     }
 
     #[test]

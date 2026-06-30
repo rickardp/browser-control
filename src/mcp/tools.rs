@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cli::fetch::script_fetch_timeout_ms;
 use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
 use crate::cli::wait_for_cookie::cookie_matches;
 use crate::detect::Engine;
@@ -366,6 +367,10 @@ fn make_fetch() -> RegisteredTool {
                 "method": { "type": "string" },
                 "headers": { "type": "object" },
                 "body": { "type": "string" },
+                "timeout_ms": {
+                    "type": "number",
+                    "description": "Per-call timeout in milliseconds for the in-page fetch. Default 60s."
+                },
                 "max_age": {
                     "type": "string",
                     "description": "Reload the page first if its document is older than this duration (default 10m)."
@@ -384,6 +389,14 @@ fn make_fetch() -> RegisteredTool {
                     obj.remove("tab");
                     obj.remove("target");
                     obj.remove("max_age");
+                    obj.remove("timeout_ms");
+                }
+                let timeout = timeout_ms_arg(&args, "timeout_ms", MCP_FETCH_TIMEOUT)?;
+                if let Some(obj) = for_js.as_object_mut() {
+                    obj.insert(
+                        "timeoutMs".to_string(),
+                        json!(script_fetch_timeout_ms(timeout)),
+                    );
                 }
                 let max_age = max_age_arg(&args)?;
                 let args_json = serde_json::to_string(&for_js)?;
@@ -403,12 +416,26 @@ fn make_fetch() -> RegisteredTool {
                     state.resolve_or_create_for_origin(url).await?
                 };
                 backend.ensure_fresh(&target_id, max_age).await?;
-                let value = backend
-                    .evaluate(&target_id, &expr, true, MCP_FETCH_TIMEOUT)
-                    .await?;
+                let value = backend.evaluate(&target_id, &expr, true, timeout).await?;
                 let raw = value.as_str().unwrap_or("").to_string();
-                let parsed: Value = serde_json::from_str(&raw)
+                let mut parsed: Value = serde_json::from_str(&raw)
                     .map_err(|e| anyhow!("invalid fetch response JSON: {e}"))?;
+                if parsed.get("ok").and_then(Value::as_bool) == Some(false) {
+                    let mut msg = parsed
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("fetch failed")
+                        .to_string();
+                    if let Some(name) = parsed.get("errorName").and_then(Value::as_str) {
+                        if !name.is_empty() {
+                            msg.push_str(&format!(" ({name})"));
+                        }
+                    }
+                    return Err(anyhow!(msg));
+                }
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.remove("ok");
+                }
                 let pretty = serde_json::to_string_pretty(&parsed)?;
                 Ok(text_content(pretty))
             })

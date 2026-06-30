@@ -69,15 +69,34 @@ pub const SELECT_ELEMENT_JS: &str = r#"
 pub const FETCH_JS: &str = r#"
 (async function(argsJson) {
     const args = JSON.parse(argsJson);
-    const r = await fetch(args.url, {
-        method: args.method || 'GET',
-        headers: args.headers || {},
-        body: args.body,
-        credentials: 'include',
-    });
-    const text = await r.text();
-    const headers = {};
-    r.headers.forEach((v,k) => { headers[k] = v; });
-    return JSON.stringify({ status: r.status, statusText: r.statusText, headers, body: text });
+    const timeoutMs = Number(args.timeoutMs || 0);
+    const controller = timeoutMs > 0 && typeof AbortController !== 'undefined'
+        ? new AbortController()
+        : null;
+    const timer = controller
+        ? setTimeout(() => controller.abort(), timeoutMs)
+        : null;
+    try {
+        const r = await fetch(args.url, {
+            method: args.method || 'GET',
+            headers: args.headers || {},
+            body: args.body,
+            credentials: 'include',
+            signal: controller ? controller.signal : undefined,
+        });
+        const text = await r.text();
+        const headers = {};
+        r.headers.forEach((v,k) => { headers[k] = v; });
+        return JSON.stringify({ ok: true, status: r.status, statusText: r.statusText, headers, body: text });
+    } catch (e) {
+        const aborted = controller && controller.signal.aborted;
+        return JSON.stringify({
+            ok: false,
+            error: aborted ? `fetch timed out after ${timeoutMs}ms` : String(e),
+            errorName: e && e.name ? e.name : null,
+        });
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 })
 "#;

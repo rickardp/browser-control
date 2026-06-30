@@ -19,6 +19,7 @@ use tokio::time::sleep;
 
 use crate::cli::cookies::{fetch_cookies, NormalCookie};
 use crate::cli::env_resolver;
+use crate::cli::fetch::script_fetch_timeout_ms;
 use crate::cli::mcp::{acquire_bidi_lock_if_needed, resolve_browser};
 use crate::cli::trace::CommandTrace;
 use crate::dom::scripts::FETCH_JS;
@@ -120,7 +121,12 @@ async fn run_validate_url(
     max_age: Duration,
     trace: &mut CommandTrace,
 ) -> Result<()> {
-    let args = serde_json::json!({ "url": url, "method": "GET" }).to_string();
+    let args = serde_json::json!({
+        "url": url,
+        "method": "GET",
+        "timeoutMs": script_fetch_timeout_ms(VALIDATE_TIMEOUT),
+    })
+    .to_string();
     let expr = format!("({})({})", FETCH_JS, serde_json::to_string(&args).unwrap());
 
     trace.route("attach-for-origin");
