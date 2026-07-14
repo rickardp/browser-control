@@ -1247,11 +1247,20 @@ fn make_browser_show() -> RegisteredTool {
                 let target_id = backend.target_for_show().await?;
                 let resolved = state.browser_snapshot().await;
                 let source = resolved.source.clone();
-                let os_activated = tokio::task::spawn_blocking(move || -> Result<bool> {
-                    let registry = crate::registry::Registry::open()?;
-                    crate::cli::show::activate_resolved_app(&registry, &source)
-                })
-                .await??;
+                // External endpoints have no registered executable to
+                // activate. Avoid opening the global registry in that case;
+                // besides being unnecessary I/O, it could race a concurrent
+                // browser switch or test-time data-directory override.
+                let os_activated = match source {
+                    crate::cli::env_resolver::Source::External => false,
+                    source @ crate::cli::env_resolver::Source::Registered { .. } => {
+                        tokio::task::spawn_blocking(move || -> Result<bool> {
+                            let registry = crate::registry::Registry::open()?;
+                            crate::cli::show::activate_resolved_app(&registry, &source)
+                        })
+                        .await??
+                    }
+                };
                 backend.show_tab(&target_id).await?;
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": target_id,
