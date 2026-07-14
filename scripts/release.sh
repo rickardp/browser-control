@@ -33,11 +33,18 @@ cd "$REPO_ROOT"
 LEVEL="$1"
 shift || true
 
-EXECUTE=(--execute)
+DRY_RUN=false
 for arg in "$@"; do
   if [ "$arg" = "--dry-run" ]; then
-    EXECUTE=()
+    DRY_RUN=true
+  else
+    echo "Usage: $0 <level|version> [--dry-run]" >&2
+    exit 2
   fi
 done
 
-exec cargo release "$LEVEL" "${EXECUTE[@]}" "$@"
+if [ "$DRY_RUN" = true ]; then
+  exec cargo release "$LEVEL"
+fi
+
+exec cargo release "$LEVEL" --execute
