@@ -54,6 +54,7 @@ fn mcp_tools_list_returns_full_set() {
         "browser_get_html",
         "browser_take_screenshot",
         "browser_fetch",
+        "browser_curl",
         "browser_select_element",
         "browser_cookies",
         "browser_storage_get",

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use browser_control::cli::{
-    agent_instructions, cookies, eval, fetch, list, set, show, storage, targets as cli_targets,
-    wait, wait_for_cookie,
+    agent_instructions, cookies, curl, eval, fetch, list, set, show, storage,
+    targets as cli_targets, wait, wait_for_cookie,
 };
 use clap::{Parser, Subcommand};
 
@@ -122,6 +122,18 @@ enum Command {
         /// Reload the page first if its document is older than this duration.
         #[arg(long, default_value = browser_control::session::freshness::DEFAULT_MAX_AGE_STR)]
         max_age: String,
+    },
+    /// Run the real curl with cookies and User-Agent from the browser.
+    Curl {
+        /// Browser, or browser/named-tab used as the User-Agent source.
+        /// This wrapper intentionally has no `-b` alias because curl reserves
+        /// `-b` for its own cookie option. Put this before curl's arguments.
+        #[arg(long, env = "BROWSER_CONTROL")]
+        browser: Option<String>,
+        /// Arguments forwarded unchanged to curl. Use `-- --help` for curl's
+        /// own help; `browser-control curl --help` shows wrapper help.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        args: Vec<std::ffi::OsString>,
     },
     /// Read or write localStorage / sessionStorage.
     Storage {
@@ -283,6 +295,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Curl { browser, args } => curl::run(browser, args).await,
         Command::Storage { action } => storage::run(action).await,
         Command::Eval {
             browser,

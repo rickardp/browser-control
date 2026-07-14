@@ -232,7 +232,7 @@ fn format_json(cookies: &[NormalCookie]) -> Result<String> {
     Ok(serde_json::to_string_pretty(cookies)?)
 }
 
-fn format_netscape(cookies: &[NormalCookie]) -> String {
+pub(crate) fn format_netscape(cookies: &[NormalCookie]) -> String {
     let mut out = String::from("# Netscape HTTP Cookie File\n");
     for c in cookies {
         let include_sub = if c.domain.starts_with('.') {

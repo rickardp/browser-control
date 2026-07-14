@@ -66,15 +66,17 @@ machine-readable output.
 
 ### Browser selection
 
-Page-context commands (`eval`, `fetch`, `storage`, …) and browser-wide
-commands (`targets`, `cookies`, `wait`, `wait-for-cookie`) accept a
-`--browser` / `-b` flag (with `$BROWSER_CONTROL` env fallback) to select
-the target browser:
+Page-context commands (`eval`, `fetch`, `storage`, …) and browser-wide commands
+(`targets`, `cookies`, `wait`, `wait-for-cookie`) accept a `--browser` / `-b`
+flag (with `$BROWSER_CONTROL` env fallback) to select the target browser. The
+external `curl` wrapper accepts `--browser` only because curl itself reserves
+`-b` for cookies:
 
 ```sh
 browser-control eval -b firefox 'document.title'
 BROWSER_CONTROL=chrome browser-control cookies --format netscape
 browser-control fetch --browser brave https://example.com/api/me
+browser-control curl --browser brave -L -o report.zip https://example.com/report.zip
 ```
 
 Resolution order: `--browser` flag → `$BROWSER_CONTROL` env →
@@ -175,7 +177,7 @@ Browser resolution order:
 3. Otherwise, exit with an error
 
 The server exposes engine-agnostic tools (`browser_navigate`, `browser_get_html`,
-`browser_eval`, `browser_fetch`, `browser_take_screenshot`, `browser_storage_get`,
+`browser_eval`, `browser_fetch`, `browser_curl`, `browser_take_screenshot`, `browser_storage_get`,
 `browser_cookies`, …) that work on every supported browser including Firefox.
 Playwright-only interaction tools (`browser_click`,
 `browser_type`, `browser_snapshot`, `browser_press_key`, `browser_drag`,
@@ -333,6 +335,39 @@ honours the CORS rules of the target site, regardless of which tab the
 user is currently looking at. The auto-opened tab is left open so
 subsequent fetches against the same origin reuse it. Pass `--target
 URLREGEX` to override and explicitly pick a tab by URL regex.
+
+### `curl`
+
+Run the real system curl outside the page context with a snapshot of the
+selected browser's cookies and User-Agent. Every argument after the wrapper's
+`--browser` option is forwarded unchanged to curl. `--browser` deliberately
+has no `-b` alias because curl uses `-b` for its own cookie option.
+
+```sh
+browser-control curl --browser brave -L --fail-with-body \
+    https://example.com/api/export
+browser-control curl --browser brave/work -L --fail-with-body \
+    -o archive.zip https://example.com/archive.zip
+browser-control curl --browser brave -- --help
+```
+
+Browser-derived `--cookie <temporary-netscape-jar>` and `--user-agent` options,
+plus `Origin` and `Referer` from the selected source tab, are prepended to the
+curl arguments. With a bare browser selector, a live tab supplies the request
+context when available. The temporary cookie file is mode 0600 and is deleted
+after curl exits. Cookies set by curl are not written back to the browser.
+
+Use `fetch` when browser-faithful behavior matters: it uses the browser's TLS
+stack and remains subject to page CORS/CSP. Use `curl` for large or binary
+responses and direct file downloads. Curl is not subject to browser CORS/CSP,
+but its TLS fingerprint, SameSite behavior, client hints, and partitioned-cookie
+handling can differ from the browser.
+
+The corresponding MCP tool is `browser_curl`. Its `args` array uses ordinary
+curl syntax. Stdout responses up to 8 MiB are returned through MCP as text or
+as a base64 embedded resource for binary data. Larger MCP responses are
+stopped with an error; pass curl `-o <path>` or `--output <path>` to stream an
+unrestricted download directly to disk.
 
 ### `storage`
 

@@ -1,5 +1,6 @@
 pub mod agent_instructions;
 pub mod cookies;
+pub mod curl;
 pub mod env_resolver;
 pub mod eval;
 pub mod fetch;

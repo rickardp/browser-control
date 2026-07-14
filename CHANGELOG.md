@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0 — 2026-07-14
+
+### Added
+
+- `browser-control curl` and MCP `browser_curl` invoke the real system curl
+  with a temporary cookie jar and User-Agent copied from the selected browser,
+  plus Origin and Referer derived from the selected source tab.
+  Curl arguments are forwarded unchanged. CLI output streams normally; MCP
+  returns text or binary responses up to 8 MiB and directs larger downloads to
+  use curl `-o`/`--output` for unrestricted file streaming.
+
 ## 0.3.5 — 2026-05-15
 
 ### Fixed

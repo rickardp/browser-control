@@ -557,6 +557,57 @@ impl TabBackend {
             }
         }
     }
+
+    /// Read the HTTP User-Agent exposed by the browser. When a target is
+    /// supplied, evaluate in that document so per-target emulation overrides
+    /// are preserved. Otherwise CDP can answer browser-wide; BiDi falls back
+    /// to a live (or temporary) browsing context.
+    pub(crate) async fn user_agent(&self, target_id: Option<&str>) -> Result<String> {
+        if let Some(target_id) = target_id {
+            let value = self
+                .evaluate(
+                    target_id,
+                    "navigator.userAgent",
+                    false,
+                    Duration::from_secs(5),
+                )
+                .await?;
+            return value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow!("navigator.userAgent returned a non-string value"));
+        }
+
+        if let TabBackend::Cdp(client) = self {
+            let value = client.send("Browser.getVersion", json!({})).await?;
+            return value
+                .get("userAgent")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .ok_or_else(|| anyhow!("Browser.getVersion returned no userAgent"));
+        }
+
+        let (target_id, temporary) = match self.live_targets().await?.into_iter().next() {
+            Some(target) => (target.id, false),
+            None => (self.create_tab("about:blank").await?, true),
+        };
+        let result = self
+            .evaluate(
+                &target_id,
+                "navigator.userAgent",
+                false,
+                Duration::from_secs(5),
+            )
+            .await;
+        if temporary {
+            let _ = self.close_tab(&target_id).await;
+        }
+        let value = result?;
+        value
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("navigator.userAgent returned a non-string value"))
+    }
 }
 
 /// Open the right [`TabBackend`] for a resolved browser endpoint, taking

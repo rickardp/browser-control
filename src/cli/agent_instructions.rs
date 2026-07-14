@@ -26,6 +26,7 @@ Page and network work
 - Navigate and inspect with MCP primitives first: `browser_navigate`, `browser_eval`, `browser_get_html`, `browser_take_screenshot`, `browser_select_element`.
 - CLI navigation: `browser-control tab open <browser>/<name> <url>` opens or navigates a named tab (re-running with a new url navigates the existing tab). This is how you go to a URL from the CLI — never navigate by evaling `location.href`, which bypasses the tab registry and races the page load.
 - Fetch authenticated APIs with `browser_fetch` or `browser-control fetch`; this runs inside the browser context so cookies, Origin, CORS, and the browser TLS stack apply.
+- For large responses, binary downloads, or requests that should not run under page CORS/CSP, use `browser_curl` or `browser-control curl`. It invokes the real curl with a temporary browser cookie jar plus User-Agent, Origin, and Referer derived from the source tab. MCP responses are capped at 8 MiB; pass curl `-o <path>` for unrestricted streaming to disk.
 - Read/write storage with `browser_storage_get` / `browser_storage_set` or `browser-control storage`.
 - Evaluate JavaScript with `browser_eval` or `browser-control eval` when no higher-level primitive fits.
 - Auth-sensitive reads reload HTTP(S) pages older than 10 minutes before evaluating so SSO can refresh tokens. CLI callers can override with `--max-age 1h`; MCP callers can pass `max_age`.

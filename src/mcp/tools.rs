@@ -61,6 +61,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_get_html());
     registry.register(make_take_screenshot());
     registry.register(make_fetch());
+    registry.register(make_curl());
     registry.register(make_select_element());
     registry.register(make_cookies());
     registry.register(make_storage_get());
@@ -358,7 +359,7 @@ fn make_fetch() -> RegisteredTool {
     RegisteredTool {
         name: "browser_fetch".into(),
         description:
-            "Perform an HTTP request from the page context (preserves cookies, bypasses CORS)."
+            "Perform an HTTP request from the page context. Preserves cookies and remains subject to browser CORS/CSP rules. Prefer `browser_curl` for large responses or direct file downloads."
                 .into(),
         input_schema: json!({
             "type": "object",
@@ -438,6 +439,70 @@ fn make_fetch() -> RegisteredTool {
                 }
                 let pretty = serde_json::to_string_pretty(&parsed)?;
                 Ok(text_content(pretty))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_curl
+// ---------------------------------------------------------------------------
+
+fn make_curl() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_curl".into(),
+        description: format!(
+            "Run the real curl out of page context with cookies and User-Agent copied from the active browser, plus Origin and Referer derived from the selected source tab. Arguments use ordinary curl syntax and are forwarded unchanged. Omit `-o` to return up to {} MiB through MCP; use `-o <path>`/`--output <path>` for unrestricted streaming downloads. Unlike browser_fetch, curl is not subject to browser CORS/CSP and does not reproduce the browser TLS fingerprint.",
+            crate::cli::curl::MCP_RESPONSE_LIMIT / (1024 * 1024)
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(json!({
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Exact curl arguments, including options and URL(s), e.g. [\"-L\", \"--fail-with-body\", \"-o\", \"/tmp/file.zip\", \"https://example.com/file.zip\"]."
+                }
+            })),
+            "required": ["args"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let curl_args = args
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("missing or invalid 'args': expected an array of strings"))?
+                    .iter()
+                    .map(|arg| {
+                        arg.as_str()
+                            .map(String::from)
+                            .ok_or_else(|| anyhow!("every curl argument must be a string"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if curl_args.is_empty() {
+                    return Err(anyhow!(
+                        "'args' must contain curl options and at least one URL"
+                    ));
+                }
+
+                // Cookies are browser-wide. Explicit tab/target routing
+                // selects the document used for navigator.userAgent, Origin,
+                // and Referer. Otherwise prefer the MCP active tab, falling
+                // back to any live tab inside `prepare`.
+                let (tab, target) = extract_tab_target(&args);
+                let has_route = tab.is_some() || target.is_some();
+                let (backend, target_id) = if has_route {
+                    let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                    (backend, Some(target_id))
+                } else {
+                    let backend = state.ensure_backend().await?;
+                    let target_id = state.active_target_id.lock().await.clone();
+                    (backend, target_id)
+                };
+                let prepared = crate::cli::curl::prepare(&backend, target_id.as_deref()).await?;
+                let output = crate::cli::curl::execute_mcp(&prepared, &curl_args).await?;
+                Ok(crate::cli::curl::mcp_result(output))
             })
         }),
     }
@@ -1656,6 +1721,7 @@ mod tests {
         "browser_get_html",
         "browser_take_screenshot",
         "browser_fetch",
+        "browser_curl",
         "browser_select_element",
         "browser_cookies",
         "browser_storage_get",
@@ -2178,6 +2244,28 @@ mod tests {
             .await
             .expect_err("missing url must error");
         assert!(err.to_string().contains("missing 'url'"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn curl_missing_args_errors_before_backend() {
+        let h = handler_for("browser_curl");
+        let err = h(unreached_state(), json!({}))
+            .await
+            .expect_err("missing args must error");
+        assert!(err.to_string().contains("'args'"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn curl_rejects_non_string_args_before_backend() {
+        let h = handler_for("browser_curl");
+        let err = h(unreached_state(), json!({"args": ["-L", 7]}))
+            .await
+            .expect_err("non-string args must error");
+        assert!(
+            err.to_string()
+                .contains("every curl argument must be a string"),
+            "got: {err:#}"
+        );
     }
 
     #[tokio::test]

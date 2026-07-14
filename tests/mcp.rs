@@ -103,6 +103,7 @@ async fn registered_tools_list_contains_full_playwright_shaped_set() {
         "browser_get_html",
         "browser_take_screenshot",
         "browser_fetch",
+        "browser_curl",
         "browser_select_element",
         "browser_cookies",
         "browser_storage_get",
@@ -747,7 +748,7 @@ async fn browser_fetch_without_route_creates_url_origin_tab_without_setting_acti
     .await
     .unwrap();
     let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
-    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["status"], 200);
 
     let rec = recorded.lock().await;
     assert_eq!(
@@ -778,7 +779,7 @@ async fn browser_fetch_without_route_reuses_matching_origin_tab_without_setting_
     .await
     .unwrap();
     let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
-    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["status"], 200);
 
     let rec = recorded.lock().await;
     assert!(
@@ -814,7 +815,7 @@ async fn browser_fetch_without_route_reuses_cached_origin_tab_after_redirect() {
         .await
         .unwrap();
         let parsed: Value = serde_json::from_str(&text_payload(&out)).unwrap();
-        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["status"], 200);
     }
 
     let rec = recorded.lock().await;
