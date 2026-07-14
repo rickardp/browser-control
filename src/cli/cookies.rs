@@ -181,10 +181,10 @@ fn bool_field(v: &Value, k: &str) -> bool {
 }
 
 pub(crate) fn normalize_cdp(v: &Value) -> NormalCookie {
-    let expires =
-        v.get("expires")
-            .and_then(|x| x.as_i64())
-            .and_then(|n| if n < 0 { None } else { Some(n) });
+    let expires = v
+        .get("expires")
+        .and_then(|x| x.as_i64())
+        .filter(|&n| n >= 0);
     let same_site = v
         .get("sameSite")
         .and_then(|x| x.as_str())
