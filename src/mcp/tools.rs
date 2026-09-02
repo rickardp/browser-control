@@ -1097,7 +1097,7 @@ fn make_browser_start() -> RegisteredTool {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "browser": { "type": "string", "description": "Optional browser kind (chrome, edge, chromium, brave, firefox). Defaults to the first installed Chromium-family browser." },
+                "browser": { "type": "string", "description": "Optional browser kind (chrome, edge, chromium, brave, firefox). Defaults to an already-running installed browser if any, otherwise the first installed Chromium-family browser." },
                 "headless": { "type": "boolean", "default": false },
                 "wait_timeout_seconds": { "type": "integer", "default": 30 }
             },

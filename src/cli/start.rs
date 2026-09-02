@@ -40,6 +40,12 @@ pub async fn run(
 /// This is the programmatic form of `browser-control start`: it reuses the
 /// most recent live registry row for the selected kind, otherwise launches a
 /// new browser with the same default profile semantics as the CLI command.
+///
+/// When no kind is requested, an installed browser the user already has
+/// running (even one browser-control never launched or registered) is
+/// preferred over the hardcoded detection order — so a manually-opened
+/// browser wins over blindly starting whichever kind is first on the
+/// platform's candidate list.
 pub async fn ensure_started(
     browser: Option<String>,
     headless: bool,
@@ -52,7 +58,7 @@ pub async fn ensure_started(
     }
 
     let resolved_kind: Kind = match browser.as_deref() {
-        None => first_chromium_or_first(&installed)
+        None => resolve_kind_when_unspecified(&installed)
             .ok_or_else(|| anyhow!("no chromium-based browser installed"))?,
         Some(s) => Kind::parse(s).ok_or_else(|| {
             anyhow!("unknown browser kind `{s}`; valid: chrome, edge, chromium, brave, firefox")
@@ -129,6 +135,18 @@ pub(crate) fn first_chromium_or_first(installed: &[Installed]) -> Option<Kind> {
         .or_else(|| installed.first().map(|i| i.kind))
 }
 
+/// Selection used by [`ensure_started`] when no `--browser` kind is given:
+/// prefer an installed kind that already has a live process over the
+/// hardcoded chromium-first fallback order.
+pub(crate) fn resolve_kind_when_unspecified(installed: &[Installed]) -> Option<Kind> {
+    let running = detect::list_running_kinds(installed);
+    installed
+        .iter()
+        .find(|i| running.contains(&i.kind))
+        .map(|i| i.kind)
+        .or_else(|| first_chromium_or_first(installed))
+}
+
 fn to_result(row: &BrowserRow, reused: bool) -> StartResult {
     StartResult {
         name: row.name.clone(),
@@ -156,4 +174,79 @@ fn emit(res: &StartResult, json: bool) -> Result<()> {
         println!("  profile:  {}", res.profile.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stands in for a "browser" that's actually running: we only care that a
+    // live process's exe path matches `Installed.executable`, not that it's
+    // a real browser. Mirrors the technique in detect::mod::tests.
+    fn spawn_stand_in_process() -> (std::process::Child, PathBuf) {
+        let exe = PathBuf::from(if cfg!(windows) {
+            r"C:\Windows\System32\timeout.exe"
+        } else {
+            "/bin/sleep"
+        });
+        assert!(exe.exists(), "test requires {exe:?} to exist");
+        let child = std::process::Command::new(&exe)
+            .arg("5")
+            .spawn()
+            .expect("spawn stand-in process");
+        (child, exe)
+    }
+
+    fn installed(kind: Kind, executable: PathBuf) -> Installed {
+        Installed {
+            kind,
+            executable,
+            version: "unknown".to_string(),
+            engine: kind.engine(),
+        }
+    }
+
+    #[test]
+    fn resolve_kind_when_unspecified_prefers_running_kind_over_hardcoded_order() {
+        let (mut child, exe) = spawn_stand_in_process();
+
+        // Firefox is running (matches the live process's exe) but is listed
+        // after Chrome, and `first_chromium_or_first` would otherwise pick
+        // Chrome first. The running browser must win regardless of order.
+        let candidates = vec![
+            installed(Kind::Chrome, PathBuf::from("/definitely/not/a/real/chrome")),
+            installed(Kind::Firefox, exe),
+        ];
+
+        let resolved = resolve_kind_when_unspecified(&candidates);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(resolved, Some(Kind::Firefox));
+    }
+
+    #[test]
+    fn resolve_kind_when_unspecified_falls_back_when_nothing_running() {
+        let candidates = vec![
+            installed(
+                Kind::Firefox,
+                PathBuf::from("/definitely/not/a/real/firefox"),
+            ),
+            installed(Kind::Chrome, PathBuf::from("/definitely/not/a/real/chrome")),
+        ];
+        assert_eq!(
+            resolve_kind_when_unspecified(&candidates),
+            first_chromium_or_first(&candidates)
+        );
+        assert_eq!(
+            resolve_kind_when_unspecified(&candidates),
+            Some(Kind::Chrome)
+        );
+    }
+
+    #[test]
+    fn resolve_kind_when_unspecified_none_when_nothing_installed() {
+        assert_eq!(resolve_kind_when_unspecified(&[]), None);
+    }
 }

@@ -147,6 +147,23 @@ fn parse_version(s: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Kinds among `installed` that currently have a live OS process, matched by
+/// exact executable path. Used to prefer a browser the user already has open
+/// (even if browser-control never launched or registered it) over the
+/// hardcoded detection-order fallback in [`crate::cli::start::ensure_started`].
+pub fn list_running_kinds(installed: &[Installed]) -> std::collections::HashSet<Kind> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut running = std::collections::HashSet::new();
+    for proc in sys.processes().values() {
+        let Some(exe) = proc.exe() else { continue };
+        if let Some(inst) = installed.iter().find(|i| i.executable == exe) {
+            running.insert(inst.kind);
+        }
+    }
+    running
+}
+
 pub fn list_installed() -> Vec<Installed> {
     list_installed_with(&RealProbe)
 }
@@ -175,6 +192,60 @@ pub fn list_installed_with<P: Probe>(probe: &P) -> Vec<Installed> {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn list_running_kinds_matches_live_process_by_exact_exe_path() {
+        // `sleep` stands in for a "browser" here: we only care that
+        // `list_running_kinds` matches a live process's exe path against
+        // `Installed.executable`, not that it's an actual browser.
+        let exe = PathBuf::from(if cfg!(windows) {
+            r"C:\Windows\System32\timeout.exe"
+        } else {
+            "/bin/sleep"
+        });
+        assert!(exe.exists(), "test requires {exe:?} to exist");
+
+        let mut child = if cfg!(windows) {
+            std::process::Command::new(&exe)
+                .arg("5")
+                .spawn()
+                .expect("spawn timeout")
+        } else {
+            std::process::Command::new(&exe)
+                .arg("5")
+                .spawn()
+                .expect("spawn sleep")
+        };
+
+        let installed = vec![Installed {
+            kind: Kind::Brave,
+            executable: exe.clone(),
+            version: "unknown".to_string(),
+            engine: Kind::Brave.engine(),
+        }];
+
+        let running = list_running_kinds(&installed);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            running.contains(&Kind::Brave),
+            "expected {exe:?} (pid {}) to be detected as a running Brave process",
+            child.id()
+        );
+    }
+
+    #[test]
+    fn list_running_kinds_empty_for_kind_with_no_live_process() {
+        let installed = vec![Installed {
+            kind: Kind::Firefox,
+            executable: PathBuf::from("/definitely/not/a/real/browser/path"),
+            version: "unknown".to_string(),
+            engine: Kind::Firefox.engine(),
+        }];
+        assert!(list_running_kinds(&installed).is_empty());
+    }
 
     #[derive(Default)]
     struct FakeProbe {
