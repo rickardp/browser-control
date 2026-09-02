@@ -74,6 +74,10 @@ fn mcp_tools_list_returns_full_set() {
         // Native accessibility tools.
         "browser_snapshot",
         "browser_find",
+        // Console / network capture.
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_network_body",
     ] {
         assert!(
             names.contains(expected),

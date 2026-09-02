@@ -73,6 +73,10 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_storage_get());
     registry.register(make_storage_set());
     registry.register(make_wait_for_cookie());
+    // Passive console/network capture (native CDP, Chromium-only).
+    registry.register(make_console_messages());
+    registry.register(make_network_requests());
+    registry.register(make_network_body());
     // Diagnostic enumeration (kept).
     registry.register(make_list_targets());
     // New tab-management tools.
@@ -216,6 +220,10 @@ fn make_navigate() -> RegisteredTool {
                     .ok_or_else(|| anyhow!("missing 'url'"))?
                     .to_string();
                 let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                // Make sure capture is live before the load starts so the
+                // document request and load-time console output land in
+                // the buffers. Bounded by `TOUCH_WAIT`; usually milliseconds.
+                state.capture.touch_and_wait(&backend, &target_id).await;
                 backend.navigate(&target_id, &url).await?;
                 Ok(text_content(format!("Navigated to {url}")))
             })
@@ -896,6 +904,7 @@ fn make_tab_new() -> RegisteredTool {
                 let backend = state.ensure_backend().await?;
                 let tid = backend.create_tab(&url).await?;
                 *state.active_target_id.lock().await = Some(tid.clone());
+                state.capture.touch(&backend, &tid);
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": tid,
                     "url": url,
@@ -937,6 +946,7 @@ async fn open_or_create_named_tab(
                 crate::mcp::server::sync_registry_op(move |reg| reg.tab_touch(&bn, &n)).await?;
             }
             *state.active_target_id.lock().await = Some(row.target_id.clone());
+            state.capture.touch(&backend, &row.target_id);
             return Ok(json!({
                 "name": name,
                 "target_id": row.target_id,
@@ -947,6 +957,7 @@ async fn open_or_create_named_tab(
         }
 
         let _ = backend.close_tab(&row.target_id).await;
+        state.capture.forget(&backend, &row.target_id);
         let bn = browser_name.clone();
         let n = name.to_string();
         crate::mcp::server::sync_registry_op(move |reg| reg.tab_delete(&bn, &n)).await?;
@@ -967,6 +978,7 @@ async fn open_or_create_named_tab(
     };
     if let Some(victim) = victim {
         let _ = backend.close_tab(&victim.target_id).await;
+        state.capture.forget(&backend, &victim.target_id);
         let bn = victim.browser_name;
         let n = victim.name;
         crate::mcp::server::sync_registry_op(move |reg| reg.tab_delete(&bn, &n)).await?;
@@ -980,6 +992,7 @@ async fn open_or_create_named_tab(
     crate::mcp::server::sync_registry_op(move |reg| reg.tab_upsert(&bn, &n, &tid, &u, true))
         .await?;
     *state.active_target_id.lock().await = Some(target_id.clone());
+    state.capture.touch(&backend, &target_id);
     Ok(json!({
         "name": name,
         "target_id": target_id,
@@ -1043,6 +1056,7 @@ fn make_tab_select() -> RegisteredTool {
                     .into());
                 }
                 *state.active_target_id.lock().await = Some(tid.clone());
+                state.capture.touch(&backend, &tid);
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": tid,
                     "active": true,
@@ -1079,9 +1093,13 @@ fn make_tab_close() -> RegisteredTool {
                         return Err(anyhow!("no `target_id` given and no active tab to close"));
                     }
                 };
-                backend.close_tab(&tid).await?;
-                // Element refs die with the tab.
+                let closed = backend.close_tab(&tid).await;
+                // Capture state and element refs die with the tab, whether
+                // or not the close RPC succeeded (the target is gone either
+                // way).
+                state.capture.forget(&backend, &tid);
                 state.refs.lock().await.remove(&tid);
+                closed?;
                 // If we just closed the active tab, clear the pointer.
                 let mut ptr = state.active_target_id.lock().await;
                 if ptr.as_deref() == Some(tid.as_str()) {
@@ -1429,6 +1447,263 @@ fn looks_like_sidecar_cdp_attach_failure(err: &anyhow::Error) -> bool {
         || msg.contains("sidecar stdout closed")
         || msg.contains("sidecar writer closed")
         || msg.contains("sidecar response channel dropped")
+}
+
+// ---------------------------------------------------------------------------
+// Console / network capture tools.
+// ---------------------------------------------------------------------------
+
+fn regex_arg(args: &Value, key: &str) -> Result<Option<Regex>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => Regex::new(s)
+            .map(Some)
+            .map_err(|e| anyhow!("invalid `{key}` regex: {e}")),
+        Some(_) => Err(anyhow!("`{key}` must be a string")),
+    }
+}
+
+fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(anyhow!("`{key}` must be a boolean")),
+    }
+}
+
+fn count_arg(args: &Value, key: &str, default: usize, min: usize, max: usize) -> Result<usize> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(n)) => {
+            let n = n
+                .as_u64()
+                .ok_or_else(|| anyhow!("`{key}` must be a non-negative integer"))?
+                as usize;
+            if n < min {
+                return Err(anyhow!("`{key}` must be at least {min}"));
+            }
+            Ok(n.min(max))
+        }
+        Some(_) => Err(anyhow!("`{key}` must be a non-negative integer")),
+    }
+}
+
+fn string_arg(args: &Value, key: &str) -> Result<Option<String>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(anyhow!("`{key}` must be a string")),
+    }
+}
+
+/// `format: "text" | "json"` (default text).
+fn wants_json(args: &Value) -> Result<bool> {
+    match args.get("format") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(s)) if s == "text" => Ok(false),
+        Some(Value::String(s)) if s == "json" => Ok(true),
+        Some(_) => Err(anyhow!("`format` must be \"text\" or \"json\"")),
+    }
+}
+
+fn capture_common_schema() -> Value {
+    json!({
+        "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Return the most recent N matching entries. Default 100. `limit: 0` with `clear: true` just clears."
+        },
+        "clear": {
+            "type": "boolean",
+            "description": "Clear the tab's buffer after reading. Use before an action to isolate its effects."
+        },
+        "format": {
+            "type": "string",
+            "enum": ["text", "json"],
+            "description": "Output format. Default text (one line per entry)."
+        }
+    })
+}
+
+fn make_console_messages() -> RegisteredTool {
+    use crate::session::capture::{format_console_text, ConsoleQuery, CONSOLE_CAP};
+    let mut props = capture_common_schema();
+    props["pattern"] = json!({
+        "type": "string",
+        "description": "Unanchored regex applied to the rendered line (level, source URL, message, page URL). Always pass one on busy pages."
+    });
+    props["only_errors"] = json!({
+        "type": "boolean",
+        "description": "Only error-level entries (console.error, uncaught exceptions, failed resources). Default false."
+    });
+    RegisteredTool {
+        name: "browser_console_messages".into(),
+        description: format!(
+            "Read console messages (console.*, uncaught exceptions, browser log entries such as \
+             failed resource loads and CSP violations) captured for a tab. Capture starts when \
+             the MCP server first touches a tab (browser_navigate, browser_tab_select, …) and \
+             keeps the last {CONSOLE_CAP} entries across navigations until `clear`. Pass \
+             `pattern` or `only_errors` to keep output small. Native CDP, Chromium-only."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(props),
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let q = ConsoleQuery {
+                    pattern: regex_arg(&args, "pattern")?,
+                    only_errors: bool_arg(&args, "only_errors", false)?,
+                    limit: count_arg(&args, "limit", 100, 0, CONSOLE_CAP)?,
+                    clear: bool_arg(&args, "clear", false)?,
+                };
+                let json_out = wants_json(&args)?;
+                state
+                    .ensure_capture_supported("browser_console_messages")
+                    .await?;
+                let (_backend, target_id) = state.resolve_target_for_args(&args).await?;
+                let report = state.capture.read_console(&target_id, &q).await?;
+                if json_out {
+                    Ok(text_content(serde_json::to_string_pretty(&report)?))
+                } else {
+                    Ok(text_content(format_console_text(&report)))
+                }
+            })
+        }),
+    }
+}
+
+fn make_network_requests() -> RegisteredTool {
+    use crate::session::capture::{format_network_text, NetworkQuery, StatusFilter, NETWORK_CAP};
+    let mut props = capture_common_schema();
+    props["url_pattern"] = json!({
+        "type": "string",
+        "description": "Unanchored regex applied to the request URL."
+    });
+    props["method"] = json!({
+        "type": "string",
+        "description": "Exact HTTP method (case-insensitive)."
+    });
+    props["status"] = json!({
+        "type": "string",
+        "description": "Exact code (\"404\"), class (\"2xx\"…\"5xx\"), \"failed\", or \"pending\"."
+    });
+    props["resource_type"] = json!({
+        "type": "string",
+        "description": "CDP resource type: Document, XHR, Fetch, Script, Stylesheet, Image, Font, WebSocket, …"
+    });
+    RegisteredTool {
+        name: "browser_network_requests".into(),
+        description: format!(
+            "List network requests captured for a tab: method, URL, status, MIME type, size, \
+             duration, failure reason, and the request id to pass to browser_network_body. \
+             Capture starts when the MCP server first touches a tab and keeps the last \
+             {NETWORK_CAP} requests across navigations until `clear`. Native CDP, Chromium-only."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(props),
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let q = NetworkQuery {
+                    url_pattern: regex_arg(&args, "url_pattern")?,
+                    method: string_arg(&args, "method")?,
+                    status: string_arg(&args, "status")?
+                        .map(|s| StatusFilter::parse(&s))
+                        .transpose()?,
+                    resource_type: string_arg(&args, "resource_type")?,
+                    limit: count_arg(&args, "limit", 100, 0, NETWORK_CAP)?,
+                    clear: bool_arg(&args, "clear", false)?,
+                };
+                let json_out = wants_json(&args)?;
+                state
+                    .ensure_capture_supported("browser_network_requests")
+                    .await?;
+                let (_backend, target_id) = state.resolve_target_for_args(&args).await?;
+                let report = state.capture.read_network(&target_id, &q).await?;
+                if json_out {
+                    Ok(text_content(serde_json::to_string_pretty(&report)?))
+                } else {
+                    Ok(text_content(format_network_text(&report)))
+                }
+            })
+        }),
+    }
+}
+
+fn make_network_body() -> RegisteredTool {
+    use crate::session::capture::{BODY_DEFAULT_MAX, BODY_HARD_MAX};
+    RegisteredTool {
+        name: "browser_network_body".into(),
+        description: "Fetch the response body of a captured request by the request id printed by \
+                      browser_network_requests. Text bodies come back as text, binary as an \
+                      embedded base64 resource, followed by a JSON metadata block. Default cap \
+                      256 KiB, hard max 8 MiB. Bodies are evicted by the browser after \
+                      navigation, so fetch promptly. Native CDP, Chromium-only."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(json!({
+                "request_id": {
+                    "type": "string",
+                    "description": "Request id from browser_network_requests (e.g. \"1234.56\")."
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": BODY_HARD_MAX,
+                    "description": "Truncate the body after this many bytes. Default 262144."
+                }
+            })),
+            "required": ["request_id"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let request_id = string_arg(&args, "request_id")?
+                    .ok_or_else(|| anyhow!("missing 'request_id'"))?;
+                let max_bytes = count_arg(&args, "max_bytes", BODY_DEFAULT_MAX, 1, BODY_HARD_MAX)?;
+                state
+                    .ensure_capture_supported("browser_network_body")
+                    .await?;
+                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                let body = state
+                    .capture
+                    .response_body(&backend, &target_id, &request_id, max_bytes, MCP_OP_TIMEOUT)
+                    .await?;
+                let mut content = Vec::new();
+                match std::str::from_utf8(&body.bytes) {
+                    Ok(text) => content.push(json!({ "type": "text", "text": text })),
+                    Err(_) => {
+                        use base64::Engine as _;
+                        content.push(json!({
+                            "type": "resource",
+                            "resource": {
+                                "uri": format!("browser-control://network/{}", body.request_id),
+                                "mimeType": body.mime_type.clone().unwrap_or_else(|| "application/octet-stream".into()),
+                                "blob": base64::engine::general_purpose::STANDARD.encode(&body.bytes),
+                            }
+                        }))
+                    }
+                }
+                content.push(json!({
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "request_id": body.request_id,
+                        "url": body.url,
+                        "status": body.status,
+                        "mime_type": body.mime_type,
+                        "bytes": body.bytes.len(),
+                        "total_bytes": body.total_bytes,
+                        "truncated": body.truncated,
+                    }))?
+                }));
+                Ok(json!({ "content": content }))
+            })
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2252,6 +2527,9 @@ mod tests {
         "browser_storage_get",
         "browser_storage_set",
         "browser_wait_for_cookie",
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_network_body",
         "list_targets",
         "browser_tab_list",
         "browser_tab_new",
@@ -2897,6 +3175,220 @@ mod tests {
             .any(|r| r["method"] == "Input.dispatchKeyEvent" && r["params"]["key"] == "Enter"));
         // Nothing was forwarded to a sidecar: no Node process, no `connect`.
         assert!(state.sidecar.lock().await.is_none());
+    }
+
+    /// CDP mock for the capture tools: hands out sessions, and after
+    /// `Network.enable` on a session pushes one console error and one
+    /// finished request on that session.
+    async fn spawn_capture_mock() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut next_session = 0u32;
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                let sid = req["sessionId"].as_str().unwrap_or("").to_string();
+                let result = match method.as_str() {
+                    "Target.getTargets" => json!({"targetInfos": [{
+                        "targetId": "T1", "type": "page",
+                        "url": "https://app.test/", "title": "App",
+                    }]}),
+                    "Target.attachToTarget" => {
+                        next_session += 1;
+                        json!({"sessionId": format!("S{next_session}")})
+                    }
+                    "Runtime.evaluate" => json!({"result": {"value": 1}}),
+                    "Page.getNavigationHistory" => json!({
+                        "currentIndex": 0, "entries": [{"url": "https://app.test/"}]
+                    }),
+                    "Network.getResponseBody" => {
+                        json!({"body": "{\"ok\":true}", "base64Encoded": false})
+                    }
+                    _ => json!({}),
+                };
+                ws.send(Message::Text(
+                    json!({"id": id, "result": result}).to_string(),
+                ))
+                .await
+                .unwrap();
+                if method == "Network.enable" {
+                    for ev in [
+                        json!({"method": "Runtime.consoleAPICalled", "sessionId": sid,
+                               "params": {"type": "error", "timestamp": 1756816496120.0,
+                                          "args": [{"type": "string", "value": "boom"}],
+                                          "stackTrace": {"callFrames": [{"url": "https://app.test/a.js", "lineNumber": 3, "columnNumber": 0}]}}}),
+                        json!({"method": "Network.requestWillBeSent", "sessionId": sid,
+                               "params": {"requestId": "9.1", "timestamp": 10.0, "wallTime": 1756816496.0, "type": "XHR",
+                                          "request": {"method": "GET", "url": "https://app.test/api/me"}}}),
+                        json!({"method": "Network.responseReceived", "sessionId": sid,
+                               "params": {"requestId": "9.1", "type": "XHR",
+                                          "response": {"status": 401, "mimeType": "application/json"}}}),
+                        json!({"method": "Network.loadingFinished", "sessionId": sid,
+                               "params": {"requestId": "9.1", "timestamp": 10.084, "encodedDataLength": 11}}),
+                    ] {
+                        ws.send(Message::Text(ev.to_string())).await.unwrap();
+                    }
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn capture_tools_read_buffered_console_and_network_after_navigate() {
+        let endpoint = spawn_capture_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint,
+            source: Source::External,
+        });
+        let route = json!({"target": "app\\.test"});
+        let mut nav = route.clone();
+        nav["url"] = json!("https://app.test/x");
+        handler_for("browser_navigate")(state.clone(), nav)
+            .await
+            .unwrap();
+
+        // Events are pushed by the mock right after Network.enable; give the
+        // router a moment (test-side bounded polling only).
+        let mut text = String::new();
+        for _ in 0..100 {
+            let out = handler_for("browser_console_messages")(state.clone(), route.clone())
+                .await
+                .unwrap();
+            text = out["content"][0]["text"].as_str().unwrap().to_string();
+            if text.contains("boom") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            text.starts_with("console tab=T1 page=https://app.test/  showing 1 of 1 matched (1 buffered, 0 evicted, 0 events lost)\n-- page: https://app.test/ --\n[error] 2025-09-02T12:34:56.120Z https://app.test/a.js:4:1  boom"),
+            "{text}"
+        );
+
+        // Pattern filtering and clear.
+        let mut q = route.clone();
+        q["pattern"] = json!("nomatch");
+        let out = handler_for("browser_console_messages")(state.clone(), q)
+            .await
+            .unwrap();
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("showing 0 of 0 matched (1 buffered"));
+        let mut q = route.clone();
+        q["pattern"] = json!("[");
+        let err = handler_for("browser_console_messages")(state.clone(), q)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid `pattern` regex"));
+        let mut q = route.clone();
+        q["limit"] = json!(0);
+        q["clear"] = json!(true);
+        handler_for("browser_console_messages")(state.clone(), q)
+            .await
+            .unwrap();
+        let out = handler_for("browser_console_messages")(state.clone(), route.clone())
+            .await
+            .unwrap();
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(0 buffered"));
+
+        // Network listing with filters.
+        let mut q = route.clone();
+        q["status"] = json!("4xx");
+        q["url_pattern"] = json!("/api/");
+        let out = handler_for("browser_network_requests")(state.clone(), q)
+            .await
+            .unwrap();
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "9.1  GET    https://app.test/api/me  → 401 application/json 11B 84ms [XHR]"
+            ),
+            "{text}"
+        );
+        let mut q = route.clone();
+        q["status"] = json!("2xx");
+        let out = handler_for("browser_network_requests")(state.clone(), q)
+            .await
+            .unwrap();
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("showing 0 of 0 matched (1 buffered"));
+        let mut q = route.clone();
+        q["format"] = json!("json");
+        let out = handler_for("browser_network_requests")(state.clone(), q)
+            .await
+            .unwrap();
+        let parsed: Value =
+            serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["entries"][0]["request_id"], "9.1");
+        assert_eq!(parsed["entries"][0]["state"], "finished");
+
+        // Body fetch.
+        let mut q = route.clone();
+        q["request_id"] = json!("9.1");
+        let out = handler_for("browser_network_body")(state.clone(), q)
+            .await
+            .unwrap();
+        assert_eq!(out["content"][0]["text"], "{\"ok\":true}");
+        let meta: Value =
+            serde_json::from_str(out["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["status"], 401);
+        assert_eq!(meta["truncated"], false);
+
+        // Closing the tab forgets its capture. (The mock keeps listing T1,
+        // so a later tool call would re-touch it; assert on the hub directly.)
+        assert_eq!(state.capture.captured_tabs(), vec!["T1".to_string()]);
+        handler_for("browser_tab_close")(state.clone(), json!({"target_id": "T1"}))
+            .await
+            .unwrap();
+        assert!(state.capture.captured_tabs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_tools_validate_before_backend_and_gate_on_engine() {
+        let h = handler_for("browser_network_requests");
+        let err = h(unreached_state(), json!({"status": "lots"}))
+            .await
+            .expect_err("must error");
+        assert!(err.to_string().contains("`status` must be"), "{err:#}");
+        let h = handler_for("browser_network_body");
+        let err = h(unreached_state(), json!({}))
+            .await
+            .expect_err("must error");
+        assert!(err.to_string().contains("missing 'request_id'"), "{err:#}");
+
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Bidi,
+            endpoint: "ws://127.0.0.1:0".into(),
+            source: Source::External,
+        });
+        for (tool, args) in [
+            ("browser_console_messages", json!({})),
+            ("browser_network_requests", json!({})),
+            ("browser_network_body", json!({"request_id": "1"})),
+        ] {
+            let err = handler_for(tool)(state.clone(), args)
+                .await
+                .expect_err("BiDi must error");
+            match err.downcast_ref::<SessionError>() {
+                Some(SessionError::EngineUnsupported { tool: t, hint, .. }) => {
+                    assert_eq!(t, tool);
+                    assert!(hint.contains("browser_eval") && hint.contains("browser_select"));
+                }
+                other => panic!("{tool}: expected EngineUnsupported, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

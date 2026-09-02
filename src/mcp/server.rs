@@ -74,6 +74,9 @@ pub struct ServerState {
     /// Cleared on `browser_select`; the entry for a tab is dropped when
     /// `browser_tab_close` closes it.
     pub refs: Arc<Mutex<HashMap<String, crate::a11y::RefTable>>>,
+    /// Passive console/network capture for every tab a tool call has
+    /// touched (see [`crate::session::capture`]). Reset on `browser_select`.
+    pub capture: Arc<crate::session::capture::CaptureHub>,
     /// Operation barrier. Non-exclusive tool calls acquire a **read**
     /// guard so they can run concurrently; `switch_browser` acquires a
     /// **write** guard which waits for all in-flight tool operations to
@@ -118,8 +121,19 @@ impl ServerState {
             sidecar: Arc::new(Mutex::new(None)),
             sidecar_config,
             refs: Arc::new(Mutex::new(HashMap::new())),
+            capture: Arc::new(crate::session::capture::CaptureHub::new()),
             op_barrier: Arc::new(RwLock::new(())),
         }
+    }
+
+    /// Engine gate for the capture tools (`browser_console_messages`,
+    /// `browser_network_requests`, `browser_network_body`).
+    pub async fn ensure_capture_supported(&self, tool_name: &str) -> Result<()> {
+        self.ensure_cdp_engine(
+            tool_name,
+            "console/network capture is native CDP; on Firefox use browser_eval (install a window.onerror hook, or read performance.getEntriesByType('resource')) or switch to a Chromium browser via browser_select",
+        )
+        .await
     }
 
     /// Validate that the active browser speaks CDP, without touching the
@@ -318,12 +332,14 @@ impl ServerState {
         if let Some(tid) = pointer.as_ref() {
             let live = backend.live_target_ids().await?;
             if live.contains(tid) {
+                self.capture.touch(&backend, tid);
                 return Ok((backend, tid.clone()));
             }
             // Dead — fall through to recreate.
         }
         let new_tid = backend.create_tab("about:blank").await?;
         *pointer = Some(new_tid.clone());
+        self.capture.touch(&backend, &new_tid);
         Ok((backend, new_tid))
     }
 
@@ -347,6 +363,7 @@ impl ServerState {
 
         if let Some(cached) = origin_targets.get(&origin_root) {
             if live_ids.contains(cached.as_str()) {
+                self.capture.touch(&backend, cached);
                 return Ok((backend, cached.clone()));
             }
             origin_targets.remove(&origin_root);
@@ -358,11 +375,13 @@ impl ServerState {
                 .unwrap_or(false)
         }) {
             origin_targets.insert(origin_root, existing.id.clone());
+            self.capture.touch(&backend, &existing.id);
             return Ok((backend, existing.id.clone()));
         }
 
         let new_tid = backend.create_tab(&origin_root).await?;
         origin_targets.insert(origin_root, new_tid.clone());
+        self.capture.touch(&backend, &new_tid);
         Ok((backend, new_tid))
     }
 
@@ -417,11 +436,13 @@ impl ServerState {
                 let bn = browser_name.clone();
                 let n = name.clone();
                 sync_registry_op(move |reg| reg.tab_touch(&bn, &n)).await?;
+                self.capture.touch(&backend, &row.target_id);
                 Ok((backend, row.target_id))
             }
             (None, Some(regex)) => {
                 let backend = self.ensure_backend().await?;
                 let target_id = resolve_target_by_regex(&backend, &regex).await?;
+                self.capture.touch(&backend, &target_id);
                 Ok((backend, target_id))
             }
             (None, None) => self.current_tab().await,
@@ -454,6 +475,9 @@ impl ServerState {
     /// [`handle_tools_call`] acquires the write guard for `browser_select`
     /// before invoking this method.
     pub async fn switch_browser(&self, new_browser: ResolvedBrowser) -> Result<()> {
+        // Capture state belongs to the old browser's sessions; dropping the
+        // backend below closes the socket, so no detach RPCs are needed.
+        self.capture.reset();
         // Close the cached BiDi session if any (best-effort).
         {
             let mut bidi = self.bidi.lock().await;

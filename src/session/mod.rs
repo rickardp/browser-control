@@ -8,6 +8,7 @@
 
 pub mod attach;
 pub mod backend;
+pub mod capture;
 pub mod cdp_session;
 pub mod crash;
 pub mod freshness;

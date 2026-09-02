@@ -29,7 +29,14 @@ use tokio_tungstenite::tungstenite::Message;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Capacity of the per-client event broadcast channel.
-pub const EVENT_CHANNEL_CAPACITY: usize = 256;
+///
+/// Sized for the capture hub (`crate::session::capture`): a page load
+/// emits several `Network.*` events per request plus per-chunk
+/// `dataReceived`, so a 200-request page can push well over a thousand
+/// events in under 100 ms. Receivers have independent cursors, so a lagging
+/// receiver only loses its own events (reported as `Lagged`), never another
+/// subscriber's. Entries are only retained while a receiver exists.
+pub const EVENT_CHANNEL_CAPACITY: usize = 2048;
 
 /// Bound on `connect_async` / HTTP discovery during initial bringup.
 ///
