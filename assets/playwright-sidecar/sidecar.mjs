@@ -159,6 +159,9 @@ async function methodType(params) {
   } else {
     await page.locator(selector).fill(text, opts);
   }
+  if (params.submit) {
+    await page.locator(selector).press("Enter", opts);
+  }
   return { ok: true };
 }
 

@@ -67,6 +67,43 @@ pub enum SessionError {
         details: String,
         hint: &'static str,
     },
+    /// An element ref (`e12`) was passed that this tab's ref table has
+    /// never handed out. Refs come from `browser_snapshot` / `browser_find`;
+    /// the agent must take one first.
+    #[error(
+        "unknown ref `{element}` for tab {target_id}; call browser_snapshot or browser_find first"
+    )]
+    RefUnknown { element: String, target_id: String },
+    /// A known ref no longer resolves: the page navigated (document token
+    /// changed) or the node was removed. The agent must re-snapshot.
+    #[error("ref `{element}` is stale ({reason}); the page navigated or the element was removed — take a new browser_snapshot")]
+    StaleRef {
+        element: String,
+        target_id: String,
+        reason: &'static str,
+    },
+    /// Native CDP input could not resolve a `backendDOMNodeId` (the node
+    /// left the document). Mapped to [`SessionError::StaleRef`] by the tool
+    /// layer, which knows the agent-facing ref.
+    #[error("DOM node {backend_node_id} no longer exists: {details}")]
+    NodeGone {
+        backend_node_id: u64,
+        details: String,
+    },
+}
+
+/// Substrings in CDP `DOM.*` error messages that mean the referenced
+/// `backendDOMNodeId` no longer belongs to a document.
+pub const CDP_NODE_GONE_NEEDLES: &[&str] = &[
+    "no node with given id",
+    "could not find node",
+    "does not belong to the document",
+    "node is detached",
+];
+
+pub fn is_cdp_node_gone(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    CDP_NODE_GONE_NEEDLES.iter().any(|n| m.contains(n))
 }
 
 /// Which protocol surfaced a `TargetGone`. Useful for diagnostics; the

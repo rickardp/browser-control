@@ -44,15 +44,15 @@ use crate::errors::SessionError;
 /// `timeout` bounds the whole operation; on expiry returns
 /// `SessionError::TabHung`. Pass `None` to defer bounding to the caller
 /// (matches the unbounded path in `PageSession::evaluate`).
-pub async fn evaluate_with_crash_detection<Fut>(
+pub async fn evaluate_with_crash_detection<T, Fut>(
     client: &CdpClient,
     target_id: &str,
     session_id: Option<&str>,
     fut: Fut,
     timeout: Option<Duration>,
-) -> Result<Value>
+) -> Result<T>
 where
-    Fut: std::future::Future<Output = Result<Value>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
     let events = client.subscribe();
     let crash_watch = watch_for_crash(
@@ -66,7 +66,7 @@ where
     let race = async {
         tokio::select! {
             biased;
-            crash = &mut crash_watch => Err::<Value, anyhow::Error>(crash),
+            crash = &mut crash_watch => Err::<T, anyhow::Error>(crash),
             result = &mut fut => result,
         }
     };

@@ -71,6 +71,9 @@ fn mcp_tools_list_returns_full_set() {
         "browser_list",
         // Diagnostic CDP-shaped helper.
         "list_targets",
+        // Native accessibility tools.
+        "browser_snapshot",
+        "browser_find",
     ] {
         assert!(
             names.contains(expected),

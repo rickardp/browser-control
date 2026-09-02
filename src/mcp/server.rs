@@ -68,6 +68,12 @@ pub struct ServerState {
     /// Sidecar config (Playwright version override etc.) — set once at
     /// server startup from CLI args, read on each sidecar spawn.
     pub sidecar_config: crate::sidecar::SidecarConfig,
+    /// Element refs handed out by `browser_snapshot` / `browser_find`,
+    /// keyed by target id. Each table is bound to one document (see
+    /// [`crate::a11y::RefTable::doc_token`]); a navigation replaces it.
+    /// Cleared on `browser_select`; the entry for a tab is dropped when
+    /// `browser_tab_close` closes it.
+    pub refs: Arc<Mutex<HashMap<String, crate::a11y::RefTable>>>,
     /// Operation barrier. Non-exclusive tool calls acquire a **read**
     /// guard so they can run concurrently; `switch_browser` acquires a
     /// **write** guard which waits for all in-flight tool operations to
@@ -111,8 +117,36 @@ impl ServerState {
             origin_target_ids: Arc::new(Mutex::new(HashMap::new())),
             sidecar: Arc::new(Mutex::new(None)),
             sidecar_config,
+            refs: Arc::new(Mutex::new(HashMap::new())),
             op_barrier: Arc::new(RwLock::new(())),
         }
+    }
+
+    /// Validate that the active browser speaks CDP, without touching the
+    /// backend. `hint` steers the agent to the engine-agnostic alternative.
+    pub async fn ensure_cdp_engine(&self, tool_name: &str, hint: &'static str) -> Result<()> {
+        self.ensure_active_browser_alive().await?;
+        let resolved = self.browser_snapshot().await;
+        if resolved.engine != crate::detect::Engine::Cdp {
+            return Err(crate::errors::SessionError::EngineUnsupported {
+                tool: tool_name.to_string(),
+                required_engine: "Chromium (CDP)".into(),
+                current_engine: format!("{:?}", resolved.engine),
+                hint,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Engine gate for the native ref-based tools (`browser_snapshot`,
+    /// `browser_find`, `ref` on click/type/hover/drag/screenshot).
+    pub async fn ensure_native_input_supported(&self, tool_name: &str) -> Result<()> {
+        self.ensure_cdp_engine(
+            tool_name,
+            "ref-based interaction and browser_snapshot are native CDP; on Firefox use browser_get_page_text, browser_get_html, or browser_eval, or switch to a Chromium browser via browser_select",
+        )
+        .await
     }
 
     /// Lazy-spawn the Playwright sidecar against the current browser.
@@ -137,18 +171,11 @@ impl ServerState {
     /// Validate that the active browser can use the Playwright sidecar without
     /// spawning Node or opening a Playwright CDP connection.
     pub async fn ensure_sidecar_supported(&self, tool_name: &str) -> Result<()> {
-        self.ensure_active_browser_alive().await?;
-        let resolved = self.browser_snapshot().await;
-        if resolved.engine != crate::detect::Engine::Cdp {
-            return Err(crate::errors::SessionError::EngineUnsupported {
-                tool: tool_name.to_string(),
-                required_engine: "Chromium (CDP)".into(),
-                current_engine: format!("{:?}", resolved.engine),
-                hint: "use engine-agnostic tools such as browser_get_html, browser_fetch, browser_take_screenshot, or switch to a Chromium browser via browser_select",
-            }
-            .into());
-        }
-        Ok(())
+        self.ensure_cdp_engine(
+            tool_name,
+            "use engine-agnostic tools such as browser_get_html, browser_fetch, browser_take_screenshot, or switch to a Chromium browser via browser_select",
+        )
+        .await
     }
 
     /// Drop the cached Playwright sidecar after a connection-layer failure.
@@ -454,6 +481,11 @@ impl ServerState {
         {
             let mut origins = self.origin_target_ids.lock().await;
             origins.clear();
+        }
+        // Element refs belong to the old browser's documents.
+        {
+            let mut refs = self.refs.lock().await;
+            refs.clear();
         }
         // Dispose the Playwright sidecar — different browser means
         // different CDP endpoint; the next sidecar tool spawns a fresh

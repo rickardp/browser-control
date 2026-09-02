@@ -1,5 +1,6 @@
 //! Library entry point for `browser-control`.
 
+pub mod a11y;
 pub mod bidi;
 pub mod cdp;
 pub mod cli;

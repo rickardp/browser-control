@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::a11y::{self, FindOptions, RefEntry, SnapshotOptions};
 use crate::cli::fetch::script_fetch_timeout_ms;
 use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
 use crate::cli::wait_for_cookie::cookie_matches;
@@ -53,6 +54,11 @@ const TAB_SELECT_PROBE: Duration = Duration::from_millis(500);
 /// Native wake/probe budget used only after a Playwright sidecar CDP failure.
 const SIDECAR_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Per-op timeout for `Accessibility.getFullAXTree`. Large pages serialise
+/// tens of thousands of nodes; 20 s keeps that below the 30 s transport
+/// timeout so a wedged renderer still surfaces as recoverable `TabHung`.
+const MCP_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Register the standard tool set onto the given registry.
 pub fn register_all(registry: &ToolRegistry) {
     // Renamed-from-Playwright tools.
@@ -79,10 +85,13 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_browser_select());
     registry.register(make_browser_list());
     registry.register(make_browser_show());
-    // Playwright-only interaction tools — Chromium-family only (route
-    // through the Node sidecar). Each errors with `EngineUnsupported`
-    // when the active browser is BiDi.
+    // Native-CDP accessibility tools (no sidecar). Chromium-only; error
+    // with `EngineUnsupported` on BiDi.
     registry.register(make_snapshot());
+    registry.register(make_find());
+    // Interaction tools — Chromium-family only. A `ref` routes through
+    // native CDP input; a CSS `selector` routes through the Node sidecar.
+    // Each errors with `EngineUnsupported` when the active browser is BiDi.
     registry.register(make_click());
     registry.register(make_type());
     registry.register(make_hover());
@@ -1071,6 +1080,8 @@ fn make_tab_close() -> RegisteredTool {
                     }
                 };
                 backend.close_tab(&tid).await?;
+                // Element refs die with the tab.
+                state.refs.lock().await.remove(&tid);
                 // If we just closed the active tab, clear the pointer.
                 let mut ptr = state.active_target_id.lock().await;
                 if ptr.as_deref() == Some(tid.as_str()) {
@@ -1420,33 +1431,463 @@ fn looks_like_sidecar_cdp_attach_failure(err: &anyhow::Error) -> bool {
         || msg.contains("sidecar response channel dropped")
 }
 
+// ---------------------------------------------------------------------------
+// Native accessibility snapshot, find, and ref resolution.
+// ---------------------------------------------------------------------------
+
+/// Parse the rendering options shared by `browser_snapshot`. Pure
+/// validation so bad args fail before any backend I/O.
+fn snapshot_opts(args: &Value) -> Result<SnapshotOptions> {
+    let interactive_only = match args.get("interactive_only") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(anyhow!("`interactive_only` must be a boolean")),
+    };
+    let max_chars = match args.get("max_chars") {
+        None | Some(Value::Null) => a11y::DEFAULT_MAX_CHARS,
+        Some(Value::Number(n)) => {
+            let n = n
+                .as_u64()
+                .ok_or_else(|| anyhow!("`max_chars` must be a positive integer"))?;
+            if n < 1000 {
+                return Err(anyhow!("`max_chars` must be at least 1000"));
+            }
+            n as usize
+        }
+        Some(_) => return Err(anyhow!("`max_chars` must be a positive integer")),
+    };
+    let depth = match args.get("depth") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .ok_or_else(|| anyhow!("`depth` must be a non-negative integer"))?
+                as usize,
+        ),
+        Some(_) => return Err(anyhow!("`depth` must be a non-negative integer")),
+    };
+    if let Some(v) = args.get("ref") {
+        if !v.is_null() && !v.is_string() {
+            return Err(anyhow!("`ref` must be a string such as \"e12\""));
+        }
+    }
+    Ok(SnapshotOptions {
+        interactive_only,
+        max_chars,
+        root_backend_id: None,
+        depth,
+    })
+}
+
+/// Fetch and parse the accessibility tree for `target_id`.
+async fn fetch_ax_tree(backend: &TabBackend, target_id: &str) -> Result<a11y::AxTree> {
+    let raw = backend
+        .accessibility_tree(target_id, None, MCP_SNAPSHOT_TIMEOUT)
+        .await?;
+    a11y::parse_full_ax_tree(&raw)
+}
+
+/// Run `f` against the ref table for `target_id`, replacing the table
+/// when the tree belongs to a different document than the stored refs.
+async fn with_ref_table<T>(
+    state: &ServerState,
+    target_id: &str,
+    tree: &a11y::AxTree,
+    f: impl FnOnce(&mut a11y::RefTable) -> Result<T>,
+) -> Result<T> {
+    let token = a11y::document_token(tree).unwrap_or(0);
+    let mut refs = state.refs.lock().await;
+    let table = refs
+        .entry(target_id.to_string())
+        .or_insert_with(|| a11y::RefTable::new(token));
+    if table.doc_token != token {
+        *table = a11y::RefTable::new(token);
+    }
+    f(table)
+}
+
+/// Resolve an agent-facing ref to its element, verifying the tab is still
+/// on the document the ref was taken from. A mismatch drops the table and
+/// reports `StaleRef` so the agent re-snapshots instead of hitting a
+/// recycled node id.
+async fn resolve_ref(
+    state: &ServerState,
+    backend: &TabBackend,
+    target_id: &str,
+    r: &str,
+) -> Result<RefEntry> {
+    let unknown = || SessionError::RefUnknown {
+        element: r.to_string(),
+        target_id: target_id.to_string(),
+    };
+    let (entry, doc_token) = {
+        let refs = state.refs.lock().await;
+        let table = refs.get(target_id).ok_or_else(unknown)?;
+        let entry = table.lookup(r).ok_or_else(unknown)?.clone();
+        (entry, table.doc_token)
+    };
+    let current = backend.document_token(target_id, MCP_OP_TIMEOUT).await?;
+    if current != doc_token {
+        state.refs.lock().await.remove(target_id);
+        return Err(SessionError::StaleRef {
+            element: r.to_string(),
+            target_id: target_id.to_string(),
+            reason: "document changed",
+        }
+        .into());
+    }
+    Ok(entry)
+}
+
+/// Translate the input layer's `NodeGone` into the agent-facing
+/// `StaleRef` for `r`.
+fn stale_on_node_gone(err: anyhow::Error, r: &str, target_id: &str) -> anyhow::Error {
+    if matches!(
+        err.downcast_ref::<SessionError>(),
+        Some(SessionError::NodeGone { .. })
+    ) {
+        return SessionError::StaleRef {
+            element: r.to_string(),
+            target_id: target_id.to_string(),
+            reason: "node no longer exists",
+        }
+        .into();
+    }
+    err
+}
+
+fn quote(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
+}
+
+fn describe_ref(entry: &RefEntry) -> String {
+    if entry.name.is_empty() {
+        entry.role.clone()
+    } else {
+        format!("{} {}", entry.role, quote(&entry.name))
+    }
+}
+
+/// `# <title> (<url>)` header for snapshot output, from the live target
+/// list (already fetched by tab routing, so effectively free).
+async fn page_header(backend: &TabBackend, target_id: &str) -> String {
+    match backend.live_targets().await {
+        Ok(targets) => targets
+            .iter()
+            .find(|t| t.id == target_id)
+            .map(|t| {
+                if t.title.is_empty() {
+                    format!("# {}\n", t.url)
+                } else {
+                    format!("# {} ({})\n", t.title, t.url)
+                }
+            })
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 fn make_snapshot() -> RegisteredTool {
     RegisteredTool {
         name: "browser_snapshot".into(),
-        description: "Capture an accessibility-tree snapshot (YAML) of the active page. \
-                      Chromium-only via Playwright sidecar."
+        description: "Accessibility snapshot of the page with stable element refs (`[ref=eN]`) \
+                      usable by browser_click / browser_type / browser_hover / browser_drag / \
+                      browser_take_screenshot. Prefer this over screenshots for reading page \
+                      structure. `interactive_only` keeps only actionable elements and their \
+                      ancestors (good for forms); `ref` renders one subtree; `depth` limits \
+                      nesting; `max_chars` caps output (default 50000, cut at a line boundary \
+                      with a note). Refs stay valid until the page navigates. Native CDP, \
+                      Chromium-only; iframe contents are not included."
             .into(),
         input_schema: json!({
             "type": "object",
-            "properties": tab_args_schema(),
+            "properties": tab_args_properties(json!({
+                "interactive_only": {
+                    "type": "boolean",
+                    "description": "Only interactive elements (buttons, links, inputs, …) and their ancestors. Default false."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "description": "Truncate output at a line boundary before this many characters. Default 50000."
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Render only the subtree rooted at this ref from a previous snapshot or find."
+                },
+                "depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Levels below the root to include; deeper content collapses to `… (N more)`."
+                }
+            })),
         }),
         handler: handler(|state, args| {
             Box::pin(async move {
-                let v = forward_to_sidecar(
-                    &state,
-                    "browser_snapshot",
-                    &args,
-                    "snapshot",
-                    serde_json::Map::new(),
-                )
+                let mut opts = snapshot_opts(&args)?;
+                state
+                    .ensure_native_input_supported("browser_snapshot")
+                    .await?;
+                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                if let Some(r) = args.get("ref").and_then(Value::as_str) {
+                    let entry = resolve_ref(&state, &backend, &target_id, r).await?;
+                    opts.root_backend_id = Some(entry.backend_node_id);
+                }
+                let tree = fetch_ax_tree(&backend, &target_id).await?;
+                let header = page_header(&backend, &target_id).await;
+                let snap = with_ref_table(&state, &target_id, &tree, |table| {
+                    a11y::render_snapshot(&tree, table, &opts)
+                })
                 .await?;
-                let yaml = v
-                    .get("snapshot")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default();
-                Ok(text_content(yaml))
+                Ok(text_content(format!("{header}{}", snap.text)))
             })
         }),
+    }
+}
+
+fn make_find() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_find".into(),
+        description:
+            "Find elements by a short description (\"search box\", \"add to cart button\", \
+                      \"Sign in\") and return their refs for browser_click / browser_type / etc. \
+                      Plain text matching against accessible name, value, description, and role; \
+                      no model call. Cheaper than a full browser_snapshot when you know what you \
+                      are looking for. Returns up to 20 matches, best first. Native CDP, \
+                      Chromium-only."
+                .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(json!({
+                "query": {
+                    "type": "string",
+                    "description": "Words describing the element: visible text, label, placeholder, or role."
+                },
+                "interactive_only": {
+                    "type": "boolean",
+                    "description": "Only interactive elements. Default true; set false to find headings, images, text regions."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Maximum matches to return. Default 20."
+                }
+            })),
+            "required": ["query"],
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                    .ok_or_else(|| anyhow!("missing 'query'"))?
+                    .to_string();
+                let interactive_only = match args.get("interactive_only") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err(anyhow!("`interactive_only` must be a boolean")),
+                };
+                let limit = match args.get("limit") {
+                    None | Some(Value::Null) => a11y::DEFAULT_FIND_LIMIT,
+                    Some(Value::Number(n)) => {
+                        n.as_u64()
+                            .filter(|n| *n >= 1)
+                            .ok_or_else(|| anyhow!("`limit` must be a positive integer"))?
+                            .min(a11y::DEFAULT_FIND_LIMIT as u64) as usize
+                    }
+                    Some(_) => return Err(anyhow!("`limit` must be a positive integer")),
+                };
+                state.ensure_native_input_supported("browser_find").await?;
+                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                let tree = fetch_ax_tree(&backend, &target_id).await?;
+                let opts = FindOptions {
+                    interactive_only,
+                    limit,
+                };
+                let hits = with_ref_table(&state, &target_id, &tree, |table| {
+                    Ok(a11y::find(&tree, table, &query, &opts))
+                })
+                .await?;
+                if hits.is_empty() {
+                    return Ok(text_content(format!(
+                        "no matches for {}; try fewer words, interactive_only: false, or browser_snapshot",
+                        quote(&query)
+                    )));
+                }
+                let mut out = format!(
+                    "{} match{} for {}:\n",
+                    hits.len(),
+                    if hits.len() == 1 { "" } else { "es" },
+                    quote(&query)
+                );
+                for m in &hits {
+                    out.push_str(&m.r#ref);
+                    out.push(' ');
+                    out.push_str(&m.role);
+                    if !m.name.is_empty() {
+                        out.push(' ');
+                        out.push_str(&quote(&m.name));
+                    }
+                    if let Some(v) = &m.value {
+                        out.push_str(&format!(" [value={}]", quote(v)));
+                    }
+                    if let Some(ctx) = &m.context {
+                        out.push_str(&format!(" — in {ctx}"));
+                    }
+                    out.push('\n');
+                }
+                Ok(text_content(out))
+            })
+        }),
+    }
+}
+
+/// Which native CDP action a `ref` routes to.
+#[derive(Clone, Copy, Debug)]
+enum NativeAction {
+    Click,
+    Type,
+    Hover,
+    Drag,
+}
+
+/// How an interaction tool call is routed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Native,
+    Sidecar,
+}
+
+/// Decide the route from the (selector, ref) argument pairs. Validation
+/// only — fires before any backend access. Every pair must carry exactly
+/// one side, and all pairs must agree.
+fn route_mode(args: &Value, ref_pairs: &[(&str, &str)]) -> Result<Route> {
+    if ref_pairs.is_empty() {
+        return Ok(Route::Sidecar);
+    }
+    let mut native = 0;
+    let mut sidecar = 0;
+    for (sel, r) in ref_pairs {
+        let has_sel = args.get(*sel).is_some_and(Value::is_string);
+        let has_ref = args.get(*r).is_some_and(Value::is_string);
+        match (has_sel, has_ref) {
+            (true, true) => {
+                return Err(anyhow!("`{sel}` and `{r}` are mutually exclusive; pass one of them"))
+            }
+            (false, false) => {
+                return Err(anyhow!(
+                    "exactly one of `{sel}` (CSS selector) or `{r}` (ref from browser_snapshot/browser_find) is required"
+                ))
+            }
+            (true, false) => sidecar += 1,
+            (false, true) => native += 1,
+        }
+    }
+    if native > 0 && sidecar > 0 {
+        return Err(anyhow!(
+            "use refs for every element or selectors for every element, not a mix"
+        ));
+    }
+    Ok(if native > 0 {
+        Route::Native
+    } else {
+        Route::Sidecar
+    })
+}
+
+/// Execute an interaction tool through native CDP input.
+async fn run_native(
+    state: &ServerState,
+    tool_name: &str,
+    action: NativeAction,
+    args: &Value,
+) -> Result<Value> {
+    state.ensure_native_input_supported(tool_name).await?;
+    let (backend, target_id) = state.resolve_target_for_args(args).await?;
+    let timeout = timeout_ms_arg(args, "timeout_ms", MCP_OP_TIMEOUT)?;
+    let ref_arg = |key: &str| -> Result<String> {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| anyhow!("missing '{key}'"))
+    };
+    match action {
+        NativeAction::Click => {
+            let r = ref_arg("ref")?;
+            let entry = resolve_ref(state, &backend, &target_id, &r).await?;
+            backend
+                .click_node(&target_id, entry.backend_node_id, timeout)
+                .await
+                .map_err(|e| stale_on_node_gone(e, &r, &target_id))?;
+            Ok(text_content(format!(
+                "clicked {r} ({})",
+                describe_ref(&entry)
+            )))
+        }
+        NativeAction::Hover => {
+            let r = ref_arg("ref")?;
+            let entry = resolve_ref(state, &backend, &target_id, &r).await?;
+            backend
+                .hover_node(&target_id, entry.backend_node_id, timeout)
+                .await
+                .map_err(|e| stale_on_node_gone(e, &r, &target_id))?;
+            Ok(text_content(format!(
+                "hovered {r} ({})",
+                describe_ref(&entry)
+            )))
+        }
+        NativeAction::Type => {
+            let r = ref_arg("ref")?;
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing 'text'"))?
+                .to_string();
+            let press_sequentially = args
+                .get("press_sequentially")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
+            let entry = resolve_ref(state, &backend, &target_id, &r).await?;
+            backend
+                .type_into_node(
+                    &target_id,
+                    entry.backend_node_id,
+                    &text,
+                    press_sequentially,
+                    submit,
+                    timeout,
+                )
+                .await
+                .map_err(|e| stale_on_node_gone(e, &r, &target_id))?;
+            Ok(text_content(format!(
+                "typed into {r} ({}){}",
+                describe_ref(&entry),
+                if submit { " and pressed Enter" } else { "" }
+            )))
+        }
+        NativeAction::Drag => {
+            let a = ref_arg("source_ref")?;
+            let b = ref_arg("target_ref")?;
+            let from = resolve_ref(state, &backend, &target_id, &a).await?;
+            let to = resolve_ref(state, &backend, &target_id, &b).await?;
+            backend
+                .drag_nodes(
+                    &target_id,
+                    from.backend_node_id,
+                    to.backend_node_id,
+                    timeout,
+                )
+                .await
+                .map_err(|e| stale_on_node_gone(e, &a, &target_id))?;
+            Ok(text_content(format!(
+                "dragged {a} ({}) to {b} ({})",
+                describe_ref(&from),
+                describe_ref(&to)
+            )))
+        }
     }
 }
 
@@ -1474,8 +1915,12 @@ struct SidecarParam {
     required: bool,
 }
 
-/// Declarative spec for a sidecar interaction tool. Both the input schema and
+/// Declarative spec for an interaction tool. Both the input schema and
 /// the param-forwarding are derived from the single `params` slice.
+///
+/// Tools with `ref_pairs` accept either a CSS selector (forwarded to the
+/// Playwright sidecar) or an element ref (handled natively over CDP by
+/// `run_native`). `route_mode` validates the pairing before any I/O.
 struct SidecarTool {
     name: &'static str,
     description: &'static str,
@@ -1484,7 +1929,15 @@ struct SidecarTool {
     params: Vec<SidecarParam>,
     /// Fixed success message returned as text content.
     success: &'static str,
+    /// Native action taken when the call carries refs instead of selectors.
+    native: Option<NativeAction>,
+    /// `(selector_param, ref_param)` pairs; empty for sidecar-only tools.
+    ref_pairs: &'static [(&'static str, &'static str)],
 }
+
+const REF_PARAM_DESC: &str = "Element ref from browser_snapshot or browser_find (e.g. \"e12\"); \
+                              handled natively over CDP, no Node needed. Mutually exclusive with \
+                              the CSS selector; exactly one is required.";
 
 impl SidecarTool {
     fn build(self) -> RegisteredTool {
@@ -1494,6 +1947,8 @@ impl SidecarTool {
             method,
             params,
             success,
+            native,
+            ref_pairs,
         } = self;
 
         // Schema: shared tab/target args plus this tool's params, with the
@@ -1518,8 +1973,12 @@ impl SidecarTool {
         }
 
         // Forwarding: copy exactly the params declared above — no second list
-        // to drift out of sync.
-        let param_names: Vec<&'static str> = params.iter().map(|p| p.name).collect();
+        // to drift out of sync. Ref params never reach the sidecar.
+        let param_names: Vec<&'static str> = params
+            .iter()
+            .map(|p| p.name)
+            .filter(|n| !ref_pairs.iter().any(|(_, r)| r == n))
+            .collect();
         RegisteredTool {
             name: name.into(),
             description: description.into(),
@@ -1527,12 +1986,20 @@ impl SidecarTool {
             handler: handler(move |state, args| {
                 let param_names = param_names.clone();
                 Box::pin(async move {
-                    let mut params = serde_json::Map::new();
-                    for key in &param_names {
-                        copy_arg(&args, key, &mut params);
+                    match (route_mode(&args, ref_pairs)?, native) {
+                        (Route::Native, Some(action)) => {
+                            run_native(&state, name, action, &args).await
+                        }
+                        (Route::Native, None) => Err(anyhow!("{name} has no native path")),
+                        (Route::Sidecar, _) => {
+                            let mut params = serde_json::Map::new();
+                            for key in &param_names {
+                                copy_arg(&args, key, &mut params);
+                            }
+                            forward_to_sidecar(&state, name, &args, method, params).await?;
+                            Ok(text_content(success))
+                        }
                     }
-                    forward_to_sidecar(&state, name, &args, method, params).await?;
-                    Ok(text_content(success))
                 })
             }),
         }
@@ -1542,13 +2009,19 @@ impl SidecarTool {
 fn make_click() -> RegisteredTool {
     SidecarTool {
         name: "browser_click",
-        description: "Click an element matched by CSS selector. Chromium-only.",
+        description: "Click an element by `ref` (from browser_snapshot/browser_find; native CDP) \
+                      or by CSS `selector` (Playwright sidecar). Chromium-only.",
         method: "click",
         params: vec![
             SidecarParam {
                 name: "selector",
-                schema: json!({"type": "string"}),
-                required: true,
+                schema: json!({"type": "string", "description": "CSS selector; mutually exclusive with `ref`."}),
+                required: false,
+            },
+            SidecarParam {
+                name: "ref",
+                schema: json!({"type": "string", "description": REF_PARAM_DESC}),
+                required: false,
             },
             SidecarParam {
                 name: "timeout_ms",
@@ -1557,6 +2030,8 @@ fn make_click() -> RegisteredTool {
             },
         ],
         success: "clicked",
+        native: Some(NativeAction::Click),
+        ref_pairs: &[("selector", "ref")],
     }
     .build()
 }
@@ -1564,15 +2039,20 @@ fn make_click() -> RegisteredTool {
 fn make_type() -> RegisteredTool {
     SidecarTool {
         name: "browser_type",
-        description: "Type text into an input matched by CSS selector. \
-                      `press_sequentially=true` simulates keystrokes; default uses fast `fill`. \
-                      Chromium-only.",
+        description: "Replace the content of an input with `text`, addressed by `ref` (native CDP) \
+                      or CSS `selector` (Playwright sidecar). `press_sequentially=true` sends one \
+                      character at a time; `submit=true` presses Enter afterwards. Chromium-only.",
         method: "type",
         params: vec![
             SidecarParam {
                 name: "selector",
-                schema: json!({"type": "string"}),
-                required: true,
+                schema: json!({"type": "string", "description": "CSS selector; mutually exclusive with `ref`."}),
+                required: false,
+            },
+            SidecarParam {
+                name: "ref",
+                schema: json!({"type": "string", "description": REF_PARAM_DESC}),
+                required: false,
             },
             SidecarParam {
                 name: "text",
@@ -1585,12 +2065,19 @@ fn make_type() -> RegisteredTool {
                 required: false,
             },
             SidecarParam {
+                name: "submit",
+                schema: json!({"type": "boolean", "description": "Press Enter after typing."}),
+                required: false,
+            },
+            SidecarParam {
                 name: "timeout_ms",
                 schema: json!({"type": "integer"}),
                 required: false,
             },
         ],
         success: "typed",
+        native: Some(NativeAction::Type),
+        ref_pairs: &[("selector", "ref")],
     }
     .build()
 }
@@ -1598,13 +2085,19 @@ fn make_type() -> RegisteredTool {
 fn make_hover() -> RegisteredTool {
     SidecarTool {
         name: "browser_hover",
-        description: "Hover an element matched by CSS selector. Chromium-only.",
+        description: "Hover an element by `ref` (native CDP) or CSS `selector` (Playwright \
+                      sidecar). Chromium-only.",
         method: "hover",
         params: vec![
             SidecarParam {
                 name: "selector",
-                schema: json!({"type": "string"}),
-                required: true,
+                schema: json!({"type": "string", "description": "CSS selector; mutually exclusive with `ref`."}),
+                required: false,
+            },
+            SidecarParam {
+                name: "ref",
+                schema: json!({"type": "string", "description": REF_PARAM_DESC}),
+                required: false,
             },
             SidecarParam {
                 name: "timeout_ms",
@@ -1613,6 +2106,8 @@ fn make_hover() -> RegisteredTool {
             },
         ],
         success: "hovered",
+        native: Some(NativeAction::Hover),
+        ref_pairs: &[("selector", "ref")],
     }
     .build()
 }
@@ -1620,21 +2115,38 @@ fn make_hover() -> RegisteredTool {
 fn make_drag() -> RegisteredTool {
     SidecarTool {
         name: "browser_drag",
-        description: "Drag from one CSS-selected element to another. Chromium-only.",
+        description: "Drag one element onto another, by refs (`source_ref`/`target_ref`, native \
+                      CDP pointer events) or CSS selectors (`source_selector`/`target_selector`, \
+                      Playwright sidecar). Chromium-only.",
         method: "drag",
         params: vec![
             SidecarParam {
                 name: "source_selector",
-                schema: json!({"type": "string"}),
-                required: true,
+                schema: json!({"type": "string", "description": "CSS selector; mutually exclusive with `source_ref`."}),
+                required: false,
             },
             SidecarParam {
                 name: "target_selector",
-                schema: json!({"type": "string"}),
-                required: true,
+                schema: json!({"type": "string", "description": "CSS selector; mutually exclusive with `target_ref`."}),
+                required: false,
+            },
+            SidecarParam {
+                name: "source_ref",
+                schema: json!({"type": "string", "description": REF_PARAM_DESC}),
+                required: false,
+            },
+            SidecarParam {
+                name: "target_ref",
+                schema: json!({"type": "string", "description": REF_PARAM_DESC}),
+                required: false,
             },
         ],
         success: "dragged",
+        native: Some(NativeAction::Drag),
+        ref_pairs: &[
+            ("source_selector", "source_ref"),
+            ("target_selector", "target_ref"),
+        ],
     }
     .build()
 }
@@ -1651,6 +2163,8 @@ fn make_press_key() -> RegisteredTool {
             required: true,
         }],
         success: "pressed",
+        native: None,
+        ref_pairs: &[],
     }
     .build()
 }
@@ -1670,6 +2184,8 @@ fn make_wait_for() -> RegisteredTool {
             SidecarParam { name: "timeout_ms", schema: json!({"type": "integer"}), required: false },
         ],
         success: "ok",
+        native: None,
+        ref_pairs: &[],
     }
     .build()
 }
@@ -1746,6 +2262,7 @@ mod tests {
         "browser_list",
         "browser_show",
         "browser_snapshot",
+        "browser_find",
         "browser_click",
         "browser_type",
         "browser_hover",
@@ -2044,20 +2561,18 @@ mod tests {
         }
     }
 
-    /// `browser_click` / `browser_type` etc. require their selector
-    /// args; `browser_snapshot` / `browser_pdf_save` / `browser_wait_for`
-    /// don't (snapshot is page-wide, wait_for has multiple alternative
-    /// conditions, pdf is page-wide).
+    /// `selector` is no longer statically required on the interaction
+    /// tools (a `ref` is the alternative; `route_mode` enforces exactly
+    /// one at call time). `text` stays required on `browser_type`;
+    /// `browser_snapshot` / `browser_pdf_save` have no required args.
     #[test]
     fn sidecar_tools_required_args() {
         let click = schema_for("browser_click");
-        let req: Vec<&str> = click["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(req.contains(&"selector"));
+        assert!(
+            click.get("required").is_none() || click["required"].as_array().unwrap().is_empty()
+        );
+        assert_eq!(click["properties"]["selector"]["type"], "string");
+        assert_eq!(click["properties"]["ref"]["type"], "string");
 
         let t = schema_for("browser_type");
         let req: Vec<&str> = t["required"]
@@ -2066,14 +2581,340 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(req.contains(&"selector"));
-        assert!(req.contains(&"text"));
+        assert_eq!(req, vec!["text"]);
+        assert_eq!(t["properties"]["ref"]["type"], "string");
+        assert_eq!(t["properties"]["submit"]["type"], "boolean");
+
+        let hover = schema_for("browser_hover");
+        assert_eq!(hover["properties"]["ref"]["type"], "string");
+        let drag = schema_for("browser_drag");
+        assert_eq!(drag["properties"]["source_ref"]["type"], "string");
+        assert_eq!(drag["properties"]["target_ref"]["type"], "string");
+        assert!(drag.get("required").is_none());
 
         // No required args on these.
         let snap = schema_for("browser_snapshot");
         assert!(snap.get("required").is_none() || snap["required"].as_array().unwrap().is_empty());
+        for key in ["interactive_only", "max_chars", "ref", "depth"] {
+            assert!(
+                snap["properties"][key].is_object(),
+                "snapshot missing {key}"
+            );
+        }
         let pdf = schema_for("browser_pdf_save");
         assert!(pdf.get("required").is_none() || pdf["required"].as_array().unwrap().is_empty());
+
+        let find = schema_for("browser_find");
+        assert_eq!(find["required"], json!(["query"]));
+        assert_eq!(find["properties"]["tab"]["type"], "string");
+    }
+
+    #[test]
+    fn route_mode_validates_selector_ref_pairs() {
+        let pairs = &[("selector", "ref")];
+        assert_eq!(
+            route_mode(&json!({"ref": "e1"}), pairs).unwrap(),
+            Route::Native
+        );
+        assert_eq!(
+            route_mode(&json!({"selector": "#x"}), pairs).unwrap(),
+            Route::Sidecar
+        );
+        let err = route_mode(&json!({}), pairs).unwrap_err().to_string();
+        assert!(err.contains("exactly one of `selector`"), "{err}");
+        let err = route_mode(&json!({"selector": "#x", "ref": "e1"}), pairs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+
+        let drag = &[
+            ("source_selector", "source_ref"),
+            ("target_selector", "target_ref"),
+        ];
+        let err = route_mode(&json!({"source_ref": "e1", "target_selector": "#y"}), drag)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a mix"), "{err}");
+        assert_eq!(
+            route_mode(&json!({"source_ref": "e1", "target_ref": "e2"}), drag).unwrap(),
+            Route::Native
+        );
+        // Sidecar-only tools never route natively.
+        assert_eq!(route_mode(&json!({}), &[]).unwrap(), Route::Sidecar);
+    }
+
+    #[tokio::test]
+    async fn click_without_selector_or_ref_errors_before_backend() {
+        let h = handler_for("browser_click");
+        let err = h(unreached_state(), json!({}))
+            .await
+            .expect_err("must error");
+        assert!(err.to_string().contains("exactly one of"), "got: {err:#}");
+        let h = handler_for("browser_drag");
+        let err = h(
+            unreached_state(),
+            json!({"source_ref": "e1", "target_selector": "#a"}),
+        )
+        .await
+        .expect_err("must error");
+        assert!(err.to_string().contains("not a mix"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_bad_options_before_backend() {
+        let h = handler_for("browser_snapshot");
+        let err = h(unreached_state(), json!({"max_chars": 10}))
+            .await
+            .expect_err("must error");
+        assert!(err.to_string().contains("at least 1000"), "got: {err:#}");
+        let h = handler_for("browser_find");
+        let err = h(unreached_state(), json!({"query": "  "}))
+            .await
+            .expect_err("must error");
+        assert!(err.to_string().contains("missing 'query'"), "got: {err:#}");
+    }
+
+    /// The native tools gate on the engine before touching the backend, so
+    /// Firefox users get a typed hint rather than a CDP-shaped failure.
+    #[tokio::test]
+    async fn native_tools_on_bidi_return_engine_unsupported() {
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Bidi,
+            endpoint: "ws://127.0.0.1:0".into(),
+            source: Source::External,
+        });
+        for (tool, args) in [
+            ("browser_snapshot", json!({})),
+            ("browser_find", json!({"query": "x"})),
+            ("browser_click", json!({"ref": "e1"})),
+        ] {
+            let h = handler_for(tool);
+            let err = h(state.clone(), args).await.expect_err("BiDi must error");
+            match err.downcast_ref::<SessionError>() {
+                Some(SessionError::EngineUnsupported { tool: t, hint, .. }) => {
+                    assert_eq!(t, tool);
+                    assert!(hint.contains("browser_get_page_text"));
+                }
+                other => panic!("{tool}: expected EngineUnsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// CDP mock serving an accessibility tree, document identity, and
+    /// element geometry; records every request.
+    struct A11yMock {
+        endpoint: String,
+        doc_token: Arc<std::sync::atomic::AtomicU64>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn spawn_a11y_mock() -> A11yMock {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let doc_token = Arc::new(AtomicU64::new(101));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn({
+            let doc_token = doc_token.clone();
+            let requests = requests.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut next_session = 0u32;
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    requests.lock().await.push(req.clone());
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("");
+                    let result = match method {
+                        "Target.getTargets" => json!({"targetInfos": [{
+                            "targetId": "T1", "type": "page",
+                            "url": "https://example.com/", "title": "Example",
+                        }]}),
+                        "Target.attachToTarget" => {
+                            next_session += 1;
+                            json!({"sessionId": format!("S{next_session}")})
+                        }
+                        "Runtime.evaluate" => json!({"result": {"value": 1}}),
+                        "Accessibility.getFullAXTree" => json!({"nodes": [
+                            {"nodeId": "1", "backendDOMNodeId": 101,
+                             "role": {"value": "RootWebArea"}, "name": {"value": "Example"},
+                             "childIds": ["2", "3"]},
+                            {"nodeId": "2", "parentId": "1", "backendDOMNodeId": 106,
+                             "role": {"value": "button"}, "name": {"value": "Submit"},
+                             "properties": [{"name": "focusable", "value": {"value": true}}],
+                             "childIds": []},
+                            {"nodeId": "3", "parentId": "1", "backendDOMNodeId": 108,
+                             "role": {"value": "link"}, "name": {"value": "Docs"},
+                             "properties": [{"name": "focusable", "value": {"value": true}}],
+                             "childIds": []},
+                        ]}),
+                        "DOM.getDocument" => {
+                            json!({"root": {"backendNodeId": doc_token.load(Ordering::SeqCst)}})
+                        }
+                        "DOM.getContentQuads" => {
+                            json!({"quads": [[10, 10, 50, 10, 50, 30, 10, 30]]})
+                        }
+                        "DOM.resolveNode" => json!({"object": {"objectId": "obj-1"}}),
+                        "Page.getLayoutMetrics" => json!({"cssLayoutViewport": {
+                            "pageX": 0, "pageY": 0, "clientWidth": 800, "clientHeight": 600
+                        }}),
+                        _ => json!({}),
+                    };
+                    let resp = json!({"id": id, "result": result});
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        A11yMock {
+            endpoint: format!("ws://{addr}"),
+            doc_token,
+            requests,
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_then_click_by_ref_dispatches_native_input() {
+        use std::sync::atomic::Ordering;
+        let mock = spawn_a11y_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint.clone(),
+            source: Source::External,
+        });
+        let route = json!({"target": "example\\.com"});
+
+        let snap = handler_for("browser_snapshot")(state.clone(), route.clone())
+            .await
+            .unwrap();
+        let text = snap["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            text,
+            "# Example (https://example.com/)\n- button \"Submit\" [ref=e1]\n- link \"Docs\" [ref=e2]\n"
+        );
+
+        // Refs are stable across a second snapshot of the same document.
+        let again = handler_for("browser_snapshot")(state.clone(), route.clone())
+            .await
+            .unwrap();
+        assert_eq!(again["content"][0]["text"], snap["content"][0]["text"]);
+
+        let mut args = route.clone();
+        args["ref"] = json!("e1");
+        let out = handler_for("browser_click")(state.clone(), args.clone())
+            .await
+            .unwrap();
+        assert_eq!(out["content"][0]["text"], "clicked e1 (button \"Submit\")");
+        {
+            let reqs = mock.requests.lock().await;
+            let mouse: Vec<&Value> = reqs
+                .iter()
+                .filter(|r| r["method"] == "Input.dispatchMouseEvent")
+                .collect();
+            assert_eq!(mouse.len(), 3);
+            assert_eq!(mouse[1]["params"]["type"], "mousePressed");
+            assert_eq!(mouse[1]["params"]["x"], 30.0);
+            assert_eq!(mouse[1]["params"]["y"], 20.0);
+            assert!(reqs
+                .iter()
+                .any(|r| r["method"] == "DOM.scrollIntoViewIfNeeded"
+                    && r["params"]["backendNodeId"] == 106));
+        }
+
+        // find hands out the same refs.
+        let mut find_args = route.clone();
+        find_args["query"] = json!("docs");
+        let out = handler_for("browser_find")(state.clone(), find_args)
+            .await
+            .unwrap();
+        assert_eq!(
+            out["content"][0]["text"],
+            "1 match for \"docs\":\ne2 link \"Docs\"\n"
+        );
+
+        // Unknown ref.
+        let mut bad = route.clone();
+        bad["ref"] = json!("e9");
+        let err = handler_for("browser_click")(state.clone(), bad)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::RefUnknown { .. })
+        ));
+
+        // The page navigates: document token changes, refs become stale.
+        mock.doc_token.store(202, Ordering::SeqCst);
+        let err = handler_for("browser_click")(state.clone(), args.clone())
+            .await
+            .unwrap_err();
+        match err.downcast_ref::<SessionError>() {
+            Some(SessionError::StaleRef { reason, .. }) => assert_eq!(*reason, "document changed"),
+            other => panic!("expected StaleRef, got {other:?}"),
+        }
+        assert!(err.to_string().contains("browser_snapshot"));
+        // The stale table was dropped, so the same ref is now unknown.
+        let err = handler_for("browser_click")(state.clone(), args)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::RefUnknown { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn type_by_ref_inserts_text_and_submits() {
+        let mock = spawn_a11y_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint.clone(),
+            source: Source::External,
+        });
+        let route = json!({"target": "example\\.com"});
+        handler_for("browser_snapshot")(state.clone(), route.clone())
+            .await
+            .unwrap();
+        let mut args = route.clone();
+        args["ref"] = json!("e1");
+        args["text"] = json!("hello");
+        args["submit"] = json!(true);
+        let out = handler_for("browser_type")(state.clone(), args)
+            .await
+            .unwrap();
+        assert_eq!(
+            out["content"][0]["text"],
+            "typed into e1 (button \"Submit\") and pressed Enter"
+        );
+        let reqs = mock.requests.lock().await;
+        let insert = reqs
+            .iter()
+            .find(|r| r["method"] == "Input.insertText")
+            .expect("insertText");
+        assert_eq!(insert["params"]["text"], "hello");
+        assert!(reqs
+            .iter()
+            .any(|r| r["method"] == "Input.dispatchKeyEvent" && r["params"]["key"] == "Enter"));
+        // Nothing was forwarded to a sidecar: no Node process, no `connect`.
+        assert!(state.sidecar.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tab_close_drops_refs() {
+        let mock = spawn_a11y_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint.clone(),
+            source: Source::External,
+        });
+        handler_for("browser_snapshot")(state.clone(), json!({"target": "example\\.com"}))
+            .await
+            .unwrap();
+        assert!(state.refs.lock().await.contains_key("T1"));
+        handler_for("browser_tab_close")(state.clone(), json!({"target_id": "T1"}))
+            .await
+            .unwrap();
+        assert!(!state.refs.lock().await.contains_key("T1"));
     }
 
     /// Sidecar tool against a BiDi browser must error with

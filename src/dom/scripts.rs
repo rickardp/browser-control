@@ -65,6 +65,44 @@ pub const SELECT_ELEMENT_JS: &str = r#"
 })()
 "#;
 
+/// Called via `Runtime.callFunctionOn` with `this` bound to the element
+/// about to receive typed text. Selects the element's current content so
+/// the following `Input.insertText` replaces it (like Playwright `fill`).
+/// With `clear=true` the content is emptied outright and `input`/`change`
+/// are dispatched, for the "type an empty string" case.
+pub const SELECT_ALL_JS: &str = r#"
+(function(clear) {
+    const el = this;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') {
+        if (clear) {
+            el.value = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+            try { el.select(); } catch (e) {
+                try { el.setSelectionRange(0, el.value.length); } catch (e2) {}
+            }
+        }
+        return 'field';
+    }
+    if (el.isContentEditable) {
+        if (clear) {
+            el.textContent = '';
+            el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        } else {
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            sel.addRange(range);
+        }
+        return 'contenteditable';
+    }
+    return 'other';
+})
+"#;
+
 /// Performs a fetch from the page context. Receives JSON-string args.
 pub const FETCH_JS: &str = r#"
 (async function(argsJson) {

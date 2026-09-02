@@ -529,6 +529,195 @@ impl TabBackend {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Native CDP accessibility + input (ref-based interaction).
+    //
+    // These are Chromium-only for now: the BiDi arm returns a typed
+    // `EngineUnsupported` so the seam stays in one place when a BiDi
+    // implementation (`browsingContext.locateNodes` + `input.performActions`)
+    // lands. The MCP tool layer checks the engine before calling, so the
+    // BiDi arms are a defensive fallback rather than the primary error path.
+    // -----------------------------------------------------------------
+
+    fn native_unsupported(&self, op: &str) -> anyhow::Error {
+        SessionError::EngineUnsupported {
+            tool: op.to_string(),
+            required_engine: "Chromium (CDP)".into(),
+            current_engine: "Bidi".into(),
+            hint: "ref-based interaction is native CDP only; use browser_get_page_text, browser_get_html, or browser_eval on Firefox, or switch to a Chromium browser via browser_select",
+        }
+        .into()
+    }
+
+    /// Full accessibility tree (`Accessibility.getFullAXTree`). `depth`
+    /// bounds the tree the browser serialises; `None` means everything.
+    pub async fn accessibility_tree(
+        &self,
+        target_id: &str,
+        depth: Option<u32>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        match self {
+            TabBackend::Cdp(c) => {
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move {
+                        let _ = c
+                            .send_with_session("Accessibility.enable", json!({}), Some(&sid))
+                            .await;
+                        let mut params = json!({});
+                        if let Some(d) = depth {
+                            params["depth"] = json!(d);
+                        }
+                        c.send_with_session("Accessibility.getFullAXTree", params, Some(&sid))
+                            .await
+                    },
+                )
+                .await
+            }
+            TabBackend::Bidi(_) => Err(self.native_unsupported("accessibility_tree")),
+        }
+    }
+
+    /// Identity of the current document (see [`crate::session::input::document_token`]).
+    pub async fn document_token(&self, target_id: &str, timeout: Duration) -> Result<u64> {
+        match self {
+            TabBackend::Cdp(c) => {
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move { crate::session::input::document_token(c, &sid).await },
+                )
+                .await
+            }
+            TabBackend::Bidi(_) => Err(self.native_unsupported("document_token")),
+        }
+    }
+
+    /// Click the element with `backend_node_id`. Returns the viewport point
+    /// that was clicked.
+    pub async fn click_node(
+        &self,
+        target_id: &str,
+        backend_node_id: u64,
+        timeout: Duration,
+    ) -> Result<crate::session::input::Point> {
+        match self {
+            TabBackend::Cdp(c) => crate::session::cdp_session::with_page_session(
+                c,
+                target_id,
+                timeout,
+                |sid| async move { crate::session::input::click(c, &sid, backend_node_id).await },
+            )
+            .await,
+            TabBackend::Bidi(_) => Err(self.native_unsupported("click_node")),
+        }
+    }
+
+    /// Hover the element with `backend_node_id`.
+    pub async fn hover_node(
+        &self,
+        target_id: &str,
+        backend_node_id: u64,
+        timeout: Duration,
+    ) -> Result<crate::session::input::Point> {
+        match self {
+            TabBackend::Cdp(c) => crate::session::cdp_session::with_page_session(
+                c,
+                target_id,
+                timeout,
+                |sid| async move { crate::session::input::hover(c, &sid, backend_node_id).await },
+            )
+            .await,
+            TabBackend::Bidi(_) => Err(self.native_unsupported("hover_node")),
+        }
+    }
+
+    /// Replace the element's content with `text` (see
+    /// [`crate::session::input::type_text`]).
+    pub async fn type_into_node(
+        &self,
+        target_id: &str,
+        backend_node_id: u64,
+        text: &str,
+        press_sequentially: bool,
+        submit: bool,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let text = text.to_string();
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move {
+                        crate::session::input::type_text(
+                            c,
+                            &sid,
+                            backend_node_id,
+                            &text,
+                            press_sequentially,
+                            submit,
+                        )
+                        .await
+                    },
+                )
+                .await
+            }
+            TabBackend::Bidi(_) => Err(self.native_unsupported("type_into_node")),
+        }
+    }
+
+    /// Pointer drag from one element to another.
+    pub async fn drag_nodes(
+        &self,
+        target_id: &str,
+        from: u64,
+        to: u64,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move { crate::session::input::drag(c, &sid, from, to).await },
+                )
+                .await
+            }
+            TabBackend::Bidi(_) => Err(self.native_unsupported("drag_nodes")),
+        }
+    }
+
+    /// Border box of the element in document coordinates, for clipped
+    /// screenshots.
+    pub async fn node_clip_rect(
+        &self,
+        target_id: &str,
+        backend_node_id: u64,
+        timeout: Duration,
+    ) -> Result<Value> {
+        match self {
+            TabBackend::Cdp(c) => {
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move {
+                        crate::session::input::node_clip_rect(c, &sid, backend_node_id).await
+                    },
+                )
+                .await
+            }
+            TabBackend::Bidi(_) => Err(self.native_unsupported("node_clip_rect")),
+        }
+    }
+
     /// Fetch the full cookie jar through this backend's *existing* client,
     /// normalised across engines. Unlike `cli::cookies::fetch_cookies`,
     /// this reuses the already-open session instead of opening a fresh
