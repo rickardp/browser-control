@@ -92,6 +92,56 @@ fn write_row<'a, W: Write, I: Iterator<Item = &'a str>>(
     writeln!(out)
 }
 
+/// Write `bytes` to `path` and restrict it to the current user (`0600` on
+/// Unix). Shared by the file-writing MCP tools; the cookie/fetch CLI
+/// writers follow the same contract.
+pub fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod 600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `(width, height)` of a PNG or JPEG from its header bytes, without an
+/// image crate. `None` for anything else or a truncated header.
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG: 8-byte signature, then the IHDR chunk (length, "IHDR", w, h).
+    if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return Some((w, h));
+    }
+    // JPEG: walk segments until a start-of-frame marker.
+    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut i = 2;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+            if is_sof {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                return Some((w, h));
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            i += 2 + len;
+        }
+    }
+    None
+}
+
 /// Print a serializable value as pretty JSON, followed by a newline.
 pub fn print_json<W: Write, T: Serialize>(out: &mut W, value: &T) -> anyhow::Result<()> {
     let s = serde_json::to_string_pretty(value)?;
@@ -143,6 +193,23 @@ mod tests {
         // Data row 1: "short" padded to 16.
         assert!(lines[2].starts_with("short           "));
         assert!(lines[3].starts_with("a-very-long-cell  y"));
+    }
+
+    #[test]
+    fn image_dimensions_parse_png_and_jpeg_headers() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1280u32.to_be_bytes());
+        png.extend_from_slice(&720u32.to_be_bytes());
+        assert_eq!(image_dimensions(&png), Some((1280, 720)));
+
+        // SOI, APP0 segment (length 4, two payload bytes), SOF0 with 100x50.
+        let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        jpg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x32, 0x00, 0x64, 0x03]);
+        assert_eq!(image_dimensions(&jpg), Some((100, 50)));
+
+        assert_eq!(image_dimensions(b"nope"), None);
     }
 
     #[test]

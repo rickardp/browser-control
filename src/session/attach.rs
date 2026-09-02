@@ -340,7 +340,7 @@ impl PageSession {
             PageSession::Bidi(p) => {
                 let _ = full_page; // BiDi captures the viewport by default
                 p.client
-                    .browsing_context_capture_screenshot(&p.context, None)
+                    .browsing_context_capture_screenshot(&p.context, None, None)
                     .await
             }
         }

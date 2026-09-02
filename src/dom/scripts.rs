@@ -65,6 +65,91 @@ pub const SELECT_ELEMENT_JS: &str = r#"
 })()
 "#;
 
+/// Readable-text extraction for `browser_get_page_text`. Called as
+/// `(fn)(maxChars, selectorOrNull)`; returns a JSON string
+/// `{title, url, source, text, truncated, total_chars}` or `{error}`.
+///
+/// Root selection: explicit selector → `main`/`article`/`[role=main]` →
+/// the largest text block with the lowest link density → `body`. Page
+/// chrome (nav/header/footer/aside and their ARIA equivalents), scripts,
+/// styles, hidden elements, and form controls are skipped; headings, list
+/// items, and table cells keep a little structure.
+pub const GET_PAGE_TEXT_JS: &str = r#"
+(function(maxChars, selector) {
+    const doc = document;
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'IFRAME', 'OBJECT', 'EMBED', 'INPUT', 'TEXTAREA', 'SELECT']);
+    const CHROME = new Set(['NAV', 'HEADER', 'FOOTER', 'ASIDE']);
+    const CHROME_ROLES = new Set(['navigation', 'banner', 'contentinfo', 'complementary']);
+    const BLOCK = new Set(['P', 'DIV', 'LI', 'TR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'SECTION', 'ARTICLE', 'BLOCKQUOTE', 'PRE', 'DT', 'DD', 'BR', 'HR', 'UL', 'OL', 'TABLE', 'MAIN', 'FORM', 'FIGURE', 'FIGCAPTION', 'DETAILS', 'SUMMARY', 'LABEL', 'OPTION', 'TD', 'TH']);
+    function visible(el) {
+        if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false;
+        try { if (typeof el.checkVisibility === 'function') return el.checkVisibility(); } catch (e) {}
+        const cs = getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden';
+    }
+    let root = null, source = 'body';
+    if (selector) {
+        root = doc.querySelector(selector);
+        if (!root) return JSON.stringify({ error: 'selector matched no element: ' + selector });
+        source = 'selector';
+    } else {
+        root = doc.querySelector('main, [role="main"], article');
+        if (root) {
+            source = root.tagName === 'ARTICLE' ? 'article' : 'main';
+        } else {
+            let best = null, bestScore = 0;
+            for (const el of doc.querySelectorAll('article, section, div')) {
+                const len = (el.innerText || '').length;
+                if (len < 200) continue;
+                let linkLen = 0;
+                for (const a of el.querySelectorAll('a')) linkLen += (a.innerText || '').length;
+                const score = len * (1 - Math.min(1, linkLen / len));
+                if (score > bestScore) { bestScore = score; best = el; }
+            }
+            if (best) { root = best; source = 'heuristic'; }
+            else root = doc.body || doc.documentElement;
+        }
+    }
+    const parts = [];
+    function walk(node, isRoot) {
+        if (node.nodeType === 3) {
+            const t = node.nodeValue;
+            if (t && t.trim()) parts.push(t.replace(/\s+/g, ' '));
+            return;
+        }
+        if (node.nodeType !== 1) return;
+        const tag = node.tagName;
+        if (SKIP.has(tag)) return;
+        if (!isRoot && (CHROME.has(tag) || CHROME_ROLES.has(node.getAttribute('role')))) return;
+        if (!visible(node)) return;
+        const block = BLOCK.has(tag);
+        if (block) parts.push('\n');
+        if (/^H[1-6]$/.test(tag)) parts.push('#'.repeat(+tag[1]) + ' ');
+        else if (tag === 'LI') parts.push('- ');
+        const kids = node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+        for (const c of kids) walk(c, false);
+        if (tag === 'TD' || tag === 'TH') parts.push(' | ');
+        if (block) parts.push('\n');
+    }
+    walk(root, true);
+    let text = parts.join('')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    const total = text.length;
+    let truncated = false;
+    if (text.length > maxChars) {
+        let cut = text.lastIndexOf('\n', maxChars);
+        if (cut < maxChars / 2) cut = maxChars;
+        text = text.slice(0, cut);
+        truncated = true;
+    }
+    return JSON.stringify({ title: doc.title, url: location.href, source, text, truncated, total_chars: total });
+})
+"#;
+
 /// Called via `Runtime.callFunctionOn` with `this` bound to the element
 /// about to receive typed text. Selects the element's current content so
 /// the following `Input.insertText` replaces it (like Playwright `fill`).

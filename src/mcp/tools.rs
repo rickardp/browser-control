@@ -22,10 +22,12 @@ use crate::cli::fetch::script_fetch_timeout_ms;
 use crate::cli::storage::{build_get_expr, build_set_expr, ns_global};
 use crate::cli::wait_for_cookie::cookie_matches;
 use crate::detect::Engine;
-use crate::dom::scripts::{FETCH_JS, GET_CLIP_RECT_JS, GET_DOM_JS, SELECT_ELEMENT_JS};
+use crate::dom::scripts::{
+    FETCH_JS, GET_CLIP_RECT_JS, GET_DOM_JS, GET_PAGE_TEXT_JS, SELECT_ELEMENT_JS,
+};
 use crate::errors::SessionError;
 use crate::mcp::server::{RegisteredTool, ServerState, ToolHandler, ToolRegistry};
-use crate::session::backend::TabBackend;
+use crate::session::backend::{ImageFormat, ScreenshotOptions, TabBackend};
 use crate::session::freshness;
 use crate::session::targets::TargetInfo;
 
@@ -65,6 +67,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_navigate());
     registry.register(make_eval());
     registry.register(make_get_html());
+    registry.register(make_get_page_text());
     registry.register(make_take_screenshot());
     registry.register(make_fetch());
     registry.register(make_curl());
@@ -113,9 +116,9 @@ fn text_content(text: impl Into<String>) -> Value {
     json!({ "content": [ { "type": "text", "text": text.into() } ] })
 }
 
-fn image_content(data: String) -> Value {
+fn image_content(data: String, mime: &str) -> Value {
     json!({
-        "content": [ { "type": "image", "data": data, "mimeType": "image/png" } ]
+        "content": [ { "type": "image", "data": data, "mimeType": mime } ]
     })
 }
 
@@ -324,31 +327,184 @@ fn make_get_html() -> RegisteredTool {
 }
 
 // ---------------------------------------------------------------------------
-// browser_take_screenshot
+// browser_get_page_text
 // ---------------------------------------------------------------------------
 
-fn make_take_screenshot() -> RegisteredTool {
+const PAGE_TEXT_DEFAULT_MAX: usize = 20_000;
+
+fn make_get_page_text() -> RegisteredTool {
     RegisteredTool {
-        name: "browser_take_screenshot".into(),
-        description: "Capture a PNG screenshot of the active page.".into(),
+        name: "browser_get_page_text".into(),
+        description: "Readable text of the page (article-first: main/article content, page \
+                      chrome and hidden elements stripped, headings and list items kept) as \
+                      plain text. The cheapest way to read a page; use browser_snapshot when you \
+                      need structure and refs, browser_get_html for markup. Works on every \
+                      engine including Firefox."
+            .into(),
         input_schema: json!({
             "type": "object",
             "properties": tab_args_properties(json!({
-                "full_page": { "type": "boolean", "default": false },
-                "selector": { "type": "string" }
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 500,
+                    "description": "Truncate at a line boundary before this many characters. Default 20000."
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector to extract from instead of the auto-detected main content."
+                }
             })),
         }),
         handler: handler(|state, args| {
             Box::pin(async move {
-                let full_page = args
-                    .get("full_page")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let selector = args.get("selector").and_then(|v| v.as_str());
+                let max_chars =
+                    count_arg(&args, "max_chars", PAGE_TEXT_DEFAULT_MAX, 500, usize::MAX)?;
+                let selector_literal = match string_arg(&args, "selector")? {
+                    Some(s) => serde_json::to_string(&s)?,
+                    None => "null".to_string(),
+                };
+                let expr = format!("({GET_PAGE_TEXT_JS})({max_chars}, {selector_literal})");
                 let (backend, target_id) = state.resolve_target_for_args(&args).await?;
-                // A selector clips the capture to that element's bounding box.
-                let clip = match selector {
-                    Some(sel) => {
+                let value = backend
+                    .evaluate(&target_id, &expr, false, MCP_OP_TIMEOUT)
+                    .await?;
+                let raw = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("page text script returned no result"))?;
+                let parsed: Value = serde_json::from_str(raw)
+                    .map_err(|e| anyhow!("page text script returned invalid JSON: {e}"))?;
+                if let Some(err) = parsed["error"].as_str() {
+                    return Err(anyhow!("{err}"));
+                }
+                let mut out = String::new();
+                if let Some(t) = parsed["title"].as_str().filter(|t| !t.is_empty()) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+                if let Some(u) = parsed["url"].as_str() {
+                    out.push_str(u);
+                    out.push('\n');
+                }
+                out.push('\n');
+                out.push_str(parsed["text"].as_str().unwrap_or_default());
+                if parsed["truncated"].as_bool().unwrap_or(false) {
+                    out.push_str(&format!(
+                        "\n… [truncated at {} of {} chars; pass max_chars or selector to narrow]",
+                        max_chars,
+                        parsed["total_chars"].as_u64().unwrap_or(0)
+                    ));
+                }
+                Ok(text_content(out))
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_take_screenshot
+// ---------------------------------------------------------------------------
+
+/// Parse and validate the screenshot arguments that do not need a
+/// backend, so bad input fails before any I/O.
+fn screenshot_opts(args: &Value) -> Result<(ScreenshotOptions, Option<std::path::PathBuf>)> {
+    let full_page = bool_arg(args, "full_page", false)?;
+    let format = match args.get("format") {
+        None | Some(Value::Null) => ImageFormat::Png,
+        Some(Value::String(s)) if s == "png" => ImageFormat::Png,
+        Some(Value::String(s)) if s == "jpeg" || s == "jpg" => ImageFormat::Jpeg,
+        Some(_) => return Err(anyhow!("`format` must be \"png\" or \"jpeg\"")),
+    };
+    let quality = match args.get("quality") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => {
+            let q = n
+                .as_u64()
+                .filter(|q| (1..=100).contains(q))
+                .ok_or_else(|| anyhow!("`quality` must be an integer from 1 to 100"))?;
+            if format != ImageFormat::Jpeg {
+                return Err(anyhow!("`quality` only applies to `format: \"jpeg\"`"));
+            }
+            Some(q as u8)
+        }
+        Some(_) => return Err(anyhow!("`quality` must be an integer from 1 to 100")),
+    };
+    let max_width = match args.get("max_width") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .filter(|w| *w >= 64)
+                .ok_or_else(|| anyhow!("`max_width` must be an integer of at least 64"))?
+                as u32,
+        ),
+        Some(_) => return Err(anyhow!("`max_width` must be an integer of at least 64")),
+    };
+    let save_to = match string_arg(args, "save_to")? {
+        None => None,
+        Some(p) => {
+            let path = std::path::PathBuf::from(&p);
+            if !path.is_absolute() {
+                return Err(anyhow!("`save_to` must be an absolute path, got `{p}`"));
+            }
+            match path.parent() {
+                Some(dir) if dir.is_dir() => {}
+                _ => return Err(anyhow!("`save_to` parent directory does not exist: `{p}`")),
+            }
+            Some(path)
+        }
+    };
+    if args.get("selector").is_some_and(Value::is_string)
+        && args.get("ref").is_some_and(Value::is_string)
+    {
+        return Err(anyhow!("`selector` and `ref` are mutually exclusive"));
+    }
+    Ok((
+        ScreenshotOptions {
+            full_page,
+            clip: None,
+            format,
+            quality,
+            max_width,
+        },
+        save_to,
+    ))
+}
+
+fn make_take_screenshot() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_take_screenshot".into(),
+        description: "Capture a screenshot of the page, or of one element via `selector` or \
+                      `ref`. Screenshots are expensive in context: prefer browser_snapshot or \
+                      browser_get_page_text for reading, and when you do need pixels use \
+                      `format: \"jpeg\"` with `max_width` (e.g. 1024), or `save_to` to write the \
+                      file to disk and keep it out of the conversation. Default output is an \
+                      unscaled PNG image."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(json!({
+                "full_page": { "type": "boolean", "default": false },
+                "selector": { "type": "string", "description": "CSS selector to clip to; mutually exclusive with `ref`." },
+                "ref": { "type": "string", "description": "Element ref from browser_snapshot/browser_find to clip to; mutually exclusive with `selector`." },
+                "format": { "type": "string", "enum": ["png", "jpeg"], "description": "Default png." },
+                "quality": { "type": "integer", "minimum": 1, "maximum": 100, "description": "JPEG quality (default 80). jpeg only." },
+                "max_width": { "type": "integer", "minimum": 64, "description": "Downscale so the image is at most this many pixels wide. Chromium only." },
+                "save_to": { "type": "string", "description": "Absolute file path. When set, the image is written there (0600) and only the path and dimensions are returned." }
+            })),
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let (mut opts, save_to) = screenshot_opts(&args)?;
+                let selector = args.get("selector").and_then(|v| v.as_str());
+                let r = args.get("ref").and_then(|v| v.as_str());
+                if r.is_some() {
+                    state
+                        .ensure_native_input_supported("browser_take_screenshot")
+                        .await?;
+                }
+                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                // A selector or ref clips the capture to that element's box.
+                opts.clip = match (selector, r) {
+                    (Some(sel), _) => {
                         let sel_literal = serde_json::to_string(sel)?;
                         let expr = format!("({GET_CLIP_RECT_JS})({sel_literal})");
                         let rect = backend
@@ -359,10 +515,37 @@ fn make_take_screenshot() -> RegisteredTool {
                         }
                         Some(rect)
                     }
-                    None => None,
+                    (None, Some(r)) => {
+                        let entry = resolve_ref(&state, &backend, &target_id, r).await?;
+                        Some(
+                            backend
+                                .node_clip_rect(&target_id, entry.backend_node_id, MCP_OP_TIMEOUT)
+                                .await
+                                .map_err(|e| stale_on_node_gone(e, r, &target_id))?,
+                        )
+                    }
+                    (None, None) => None,
                 };
-                let b64 = backend.screenshot(&target_id, full_page, clip).await?;
-                Ok(image_content(b64))
+                let b64 = backend.screenshot(&target_id, &opts).await?;
+                match save_to {
+                    None => Ok(image_content(b64, opts.format.mime())),
+                    Some(path) => {
+                        use base64::Engine as _;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(b64.as_bytes())
+                            .map_err(|e| anyhow!("decoding screenshot data: {e}"))?;
+                        crate::cli::output::write_private_file(&path, &bytes)?;
+                        let dims = crate::cli::output::image_dimensions(&bytes)
+                            .map(|(w, h)| format!("{w}x{h}, "))
+                            .unwrap_or_default();
+                        Ok(text_content(format!(
+                            "Saved screenshot to {} ({dims}{}, {} KiB)",
+                            path.display(),
+                            opts.format.mime(),
+                            bytes.len().div_ceil(1024)
+                        )))
+                    }
+                }
             })
         }),
     }
@@ -2519,6 +2702,7 @@ mod tests {
         "browser_navigate",
         "browser_eval",
         "browser_get_html",
+        "browser_get_page_text",
         "browser_take_screenshot",
         "browser_fetch",
         "browser_curl",
@@ -2580,6 +2764,24 @@ mod tests {
     }
 
     async fn spawn_screenshot_mock(selector_rect: Value) -> ScreenshotMock {
+        spawn_screenshot_mock_with_data(selector_rect, "PNGDATA".into()).await
+    }
+
+    /// Minimal PNG header (signature + IHDR) for a 1280x720 image; enough
+    /// for `image_dimensions`, not a decodable file.
+    fn fake_png_1280x720() -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1280u32.to_be_bytes());
+        png.extend_from_slice(&720u32.to_be_bytes());
+        png
+    }
+
+    /// `selector_rect` is returned by every `Runtime.evaluate` after the
+    /// first (the routing probe), so it doubles as the `devicePixelRatio`
+    /// answer for `max_width` tests. `data` is the capture payload.
+    async fn spawn_screenshot_mock_with_data(selector_rect: Value, data: String) -> ScreenshotMock {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let capture_params = Arc::new(Mutex::new(Vec::new()));
@@ -2619,8 +2821,12 @@ mod tests {
                         }
                         "Page.captureScreenshot" => {
                             capture_params.lock().await.push(req["params"].clone());
-                            json!({"data": "PNGDATA"})
+                            json!({"data": data})
                         }
+                        "Page.getLayoutMetrics" => json!({
+                            "cssLayoutViewport": {"pageX": 0, "pageY": 100, "clientWidth": 1000, "clientHeight": 500},
+                            "cssContentSize": {"width": 1000, "height": 3000},
+                        }),
                         _ => json!({}),
                     };
                     let resp = json!({"id": id, "result": result});
@@ -3034,6 +3240,10 @@ mod tests {
                             json!({"quads": [[10, 10, 50, 10, 50, 30, 10, 30]]})
                         }
                         "DOM.resolveNode" => json!({"object": {"objectId": "obj-1"}}),
+                        "DOM.getBoxModel" => {
+                            json!({"model": {"border": [10, 30, 110, 30, 110, 50, 10, 50]}})
+                        }
+                        "Page.captureScreenshot" => json!({"data": "PNGDATA"}),
                         "Page.getLayoutMetrics" => json!({"cssLayoutViewport": {
                             "pageX": 0, "pageY": 0, "clientWidth": 800, "clientHeight": 600
                         }}),
@@ -3509,6 +3719,204 @@ mod tests {
         assert_eq!(captures[0]["clip"]["width"], json!(56.0));
         assert_eq!(captures[0]["clip"]["height"], json!(78.0));
         assert_eq!(captures[0]["clip"]["scale"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn screenshot_jpeg_quality_and_max_width_scale_clip() {
+        // Every post-probe evaluate returns 2.0 → devicePixelRatio = 2.
+        let mock = spawn_screenshot_mock(json!(2.0)).await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        let out = handler_for("browser_take_screenshot")(
+            state.clone(),
+            json!({
+                "target": "example\\.com",
+                "format": "jpeg",
+                "quality": 60,
+                "max_width": 500,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["content"][0]["mimeType"], "image/jpeg");
+        let captures = mock.capture_params.lock().await;
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0]["format"], "jpeg");
+        assert_eq!(captures[0]["quality"], 60);
+        // Viewport is 1000 CSS px wide at DPR 2 → 2000 device px; 500 → 0.25.
+        assert_eq!(captures[0]["captureBeyondViewport"], true);
+        assert_eq!(captures[0]["clip"]["x"], json!(0.0));
+        assert_eq!(captures[0]["clip"]["y"], json!(100.0));
+        assert_eq!(captures[0]["clip"]["width"], json!(1000.0));
+        assert_eq!(captures[0]["clip"]["height"], json!(500.0));
+        assert_eq!(captures[0]["clip"]["scale"], json!(0.25));
+    }
+
+    #[tokio::test]
+    async fn screenshot_max_width_larger_than_page_keeps_default_params() {
+        let mock = spawn_screenshot_mock(json!(1.0)).await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        handler_for("browser_take_screenshot")(
+            state,
+            json!({"target": "example\\.com", "max_width": 4000, "full_page": true}),
+        )
+        .await
+        .unwrap();
+        let captures = mock.capture_params.lock().await;
+        assert_eq!(captures[0]["format"], "png");
+        assert!(captures[0].get("clip").is_none());
+        assert!(captures[0].get("quality").is_none());
+        assert_eq!(captures[0]["captureBeyondViewport"], true);
+    }
+
+    #[tokio::test]
+    async fn screenshot_save_to_writes_private_file_and_reports_dimensions() {
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(fake_png_1280x720());
+        let mock = spawn_screenshot_mock_with_data(Value::Null, data).await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("shot.png");
+        let out = handler_for("browser_take_screenshot")(
+            state,
+            json!({"target": "example\\.com", "save_to": path.to_str().unwrap()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["content"][0]["type"], "text");
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "Saved screenshot to {} (1280x720, image/png, 1 KiB)",
+                path.display()
+            )),
+            "{text}"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, fake_png_1280x720());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn screenshot_option_validation_fires_before_backend() {
+        let h = handler_for("browser_take_screenshot");
+        for (args, needle) in [
+            (json!({"quality": 50}), "only applies to"),
+            (json!({"format": "gif"}), "`format` must be"),
+            (json!({"max_width": 10}), "at least 64"),
+            (json!({"save_to": "relative.png"}), "absolute path"),
+            (
+                json!({"save_to": "/definitely/missing/dir/x.png"}),
+                "parent directory",
+            ),
+            (json!({"selector": "#a", "ref": "e1"}), "mutually exclusive"),
+        ] {
+            let err = h(unreached_state(), args.clone())
+                .await
+                .expect_err("must error");
+            assert!(err.to_string().contains(needle), "{args}: {err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn screenshot_by_ref_clips_to_node_box() {
+        let mock = spawn_a11y_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint.clone(),
+            source: Source::External,
+        });
+        let route = json!({"target": "example\\.com"});
+        handler_for("browser_snapshot")(state.clone(), route.clone())
+            .await
+            .unwrap();
+        let mut args = route.clone();
+        args["ref"] = json!("e1");
+        let out = handler_for("browser_take_screenshot")(state.clone(), args)
+            .await
+            .unwrap();
+        assert_eq!(out["content"][0]["type"], "image");
+        let reqs = mock.requests.lock().await;
+        let cap = reqs
+            .iter()
+            .find(|r| r["method"] == "Page.captureScreenshot")
+            .expect("capture");
+        assert_eq!(cap["params"]["clip"]["x"], json!(10.0));
+        assert_eq!(cap["params"]["clip"]["y"], json!(30.0));
+        assert_eq!(cap["params"]["clip"]["width"], json!(100.0));
+        assert_eq!(cap["params"]["clip"]["height"], json!(20.0));
+        assert!(reqs
+            .iter()
+            .any(|r| r["method"] == "DOM.getBoxModel" && r["params"]["backendNodeId"] == 106));
+    }
+
+    #[tokio::test]
+    async fn get_page_text_formats_result_and_truncation() {
+        let payload = json!({
+            "title": "Docs",
+            "url": "https://example.com/docs",
+            "source": "main",
+            "text": "# Welcome\nHello world",
+            "truncated": true,
+            "total_chars": 12345,
+        })
+        .to_string();
+        let mock = spawn_screenshot_mock(Value::String(payload)).await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        let out = handler_for("browser_get_page_text")(
+            state,
+            json!({"target": "example\\.com", "max_chars": 1000}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["content"][0]["text"],
+            "Docs\nhttps://example.com/docs\n\n# Welcome\nHello world\n… [truncated at 1000 of 12345 chars; pass max_chars or selector to narrow]"
+        );
+
+        let mock = spawn_screenshot_mock(Value::String(
+            json!({"error": "selector matched no element: #x"}).to_string(),
+        ))
+        .await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint,
+            source: Source::External,
+        });
+        let err = handler_for("browser_get_page_text")(
+            state,
+            json!({"target": "example\\.com", "selector": "#x"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("selector matched no element"));
+
+        let err = handler_for("browser_get_page_text")(unreached_state(), json!({"max_chars": 10}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 500"));
     }
 
     #[tokio::test]

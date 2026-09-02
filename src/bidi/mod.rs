@@ -215,12 +215,18 @@ impl BidiClient {
         .await
     }
 
+    /// `format` is the BiDi `browsingContext.ImageFormat` object
+    /// (`{type, quality}`); `None` keeps the protocol default (PNG).
     pub async fn browsing_context_capture_screenshot(
         &self,
         context: &str,
         clip: Option<Value>,
+        format: Option<Value>,
     ) -> Result<String> {
         let mut params = json!({ "context": context });
+        if let Some(f) = format {
+            params["format"] = f;
+        }
         if let Some(rect) = clip {
             // Box clip coordinates are in document space (matching
             // `GET_CLIP_RECT_JS`), so request the "document" origin.

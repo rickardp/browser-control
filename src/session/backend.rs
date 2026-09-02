@@ -42,6 +42,85 @@ use crate::session::targets::{BidiContext, CdpTarget};
 /// list) can fire and defeat recover-once.
 const NAV_OP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Output encoding for [`TabBackend::screenshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+impl ImageFormat {
+    pub fn mime(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+        }
+    }
+
+    pub fn cdp_name(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpeg",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+        }
+    }
+}
+
+/// JPEG quality used when the caller picks `jpeg` without a `quality`.
+pub const DEFAULT_JPEG_QUALITY: u8 = 80;
+
+/// Options for [`TabBackend::screenshot`]. The default is byte-for-byte
+/// the previous behaviour: viewport PNG, no clip, no downscale.
+#[derive(Debug, Clone, Default)]
+pub struct ScreenshotOptions {
+    pub full_page: bool,
+    /// `{x, y, width, height}` in document coordinates.
+    pub clip: Option<Value>,
+    pub format: ImageFormat,
+    /// JPEG only, 1-100.
+    pub quality: Option<u8>,
+    /// Downscale so the output is at most this many device pixels wide.
+    pub max_width: Option<u32>,
+}
+
+/// Document-coordinate rectangle a downscaled capture covers when no clip
+/// was given: the whole page for `full_page`, otherwise the layout
+/// viewport. Built from `Page.getLayoutMetrics`.
+fn capture_rect(metrics: &Value, full_page: bool) -> Value {
+    let vp = metrics
+        .get("cssLayoutViewport")
+        .or_else(|| metrics.get("layoutViewport"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if full_page {
+        let cs = metrics
+            .get("cssContentSize")
+            .or_else(|| metrics.get("contentSize"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        json!({
+            "x": 0,
+            "y": 0,
+            "width": cs["width"].as_f64().unwrap_or(0.0),
+            "height": cs["height"].as_f64().unwrap_or(0.0),
+        })
+    } else {
+        json!({
+            "x": vp["pageX"].as_f64().unwrap_or(0.0),
+            "y": vp["pageY"].as_f64().unwrap_or(0.0),
+            "width": vp["clientWidth"].as_f64().unwrap_or(0.0),
+            "height": vp["clientHeight"].as_f64().unwrap_or(0.0),
+        })
+    }
+}
+
 /// Engine-agnostic tab operations. Two variants because CDP and BiDi
 /// have different protocols and clients; the methods abstract over the
 /// difference.
@@ -431,90 +510,103 @@ impl TabBackend {
         }
     }
 
-    /// Capture a PNG screenshot of `target_id` and return base64-encoded
-    /// bytes.
+    /// Capture a screenshot of `target_id` and return base64-encoded bytes.
     ///
-    /// CDP path attaches a transient session, calls
-    /// `Page.captureScreenshot({format:"png", captureBeyondViewport:full_page})`,
-    /// detaches. BiDi path calls `browsingContext.captureScreenshot` —
-    /// the BiDi protocol always captures the viewport (no `full_page`
-    /// equivalent), so `full_page` is honoured only on CDP.
+    /// CDP path attaches a transient session, calls `Page.captureScreenshot`,
+    /// detaches. BiDi path calls `browsingContext.captureScreenshot` — the
+    /// BiDi protocol always captures the viewport (no `full_page`
+    /// equivalent) and has no downscale, so `full_page` and `max_width` are
+    /// honoured only on CDP.
     ///
-    /// When `clip` is `Some({x, y, width, height})` (document coordinates, as
-    /// produced by [`crate::dom::scripts::GET_CLIP_RECT_JS`]) the capture is
-    /// restricted to that rectangle, which takes precedence over `full_page`.
-    pub async fn screenshot(
-        &self,
-        target_id: &str,
-        full_page: bool,
-        clip: Option<Value>,
-    ) -> Result<String> {
+    /// When `opts.clip` is `Some({x, y, width, height})` (document
+    /// coordinates, as produced by [`crate::dom::scripts::GET_CLIP_RECT_JS`])
+    /// the capture is restricted to that rectangle, which takes precedence
+    /// over `full_page`. `opts.max_width` downscales through `clip.scale`,
+    /// which needs no emulation override and no restore step.
+    pub async fn screenshot(&self, target_id: &str, opts: &ScreenshotOptions) -> Result<String> {
         match self {
             TabBackend::Cdp(c) => {
-                let attach = c
-                    .send(
-                        "Target.attachToTarget",
-                        json!({ "targetId": target_id, "flatten": true }),
-                    )
-                    .await?;
-                let session_id = attach
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("attachToTarget returned no sessionId"))?
-                    .to_string();
-                // Enable the Inspector domain so `Inspector.targetCrashed`
-                // is delivered while the capture is in flight. Best-effort,
-                // same rationale as `evaluate`.
-                let _ = c
-                    .send_with_session("Inspector.enable", json!({}), Some(&session_id))
-                    .await;
-                // A clip rectangle lives outside the viewport in the general
-                // case (the element was scrolled into view by the caller, but
-                // may still be taller than the viewport), so force
-                // `captureBeyondViewport` whenever clipping.
-                let mut params = json!({
-                    "format": "png",
-                    "captureBeyondViewport": full_page || clip.is_some(),
-                });
-                if let Some(rect) = &clip {
-                    params["clip"] = json!({
-                        "x": rect["x"],
-                        "y": rect["y"],
-                        "width": rect["width"],
-                        "height": rect["height"],
-                        "scale": 1,
-                    });
-                }
-                let inner = async {
-                    c.send_with_session("Page.captureScreenshot", params, Some(&session_id))
-                        .await
-                };
-                // Bound by timeout + renderer-crash detection so a wedged
-                // capture surfaces as recoverable `TabHung`/`TabCrashed`,
-                // not a 30s non-recoverable client timeout.
-                let v = crate::session::crash::evaluate_with_crash_detection(
+                let opts = opts.clone();
+                crate::session::cdp_session::with_page_session(
                     c,
                     target_id,
-                    Some(&session_id),
-                    inner,
-                    Some(NAV_OP_TIMEOUT),
+                    NAV_OP_TIMEOUT,
+                    |sid| async move {
+                        // A clip rectangle lives outside the viewport in the
+                        // general case (the element was scrolled into view by
+                        // the caller, but may still be taller than the
+                        // viewport), so force `captureBeyondViewport` whenever
+                        // clipping.
+                        let mut params = json!({
+                            "format": opts.format.cdp_name(),
+                            "captureBeyondViewport": opts.full_page || opts.clip.is_some(),
+                        });
+                        if opts.format == ImageFormat::Jpeg {
+                            params["quality"] = json!(opts.quality.unwrap_or(DEFAULT_JPEG_QUALITY));
+                        }
+                        let mut clip = opts.clip.as_ref().map(|rect| {
+                            json!({
+                                "x": rect["x"],
+                                "y": rect["y"],
+                                "width": rect["width"],
+                                "height": rect["height"],
+                                "scale": 1,
+                            })
+                        });
+                        if let Some(max_w) = opts.max_width {
+                            let metrics = c
+                                .send_with_session("Page.getLayoutMetrics", json!({}), Some(&sid))
+                                .await?;
+                            let dpr = c
+                                .send_with_session(
+                                    "Runtime.evaluate",
+                                    json!({ "expression": "window.devicePixelRatio", "returnByValue": true }),
+                                    Some(&sid),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|v| v["result"]["value"].as_f64())
+                                .filter(|d| *d > 0.0)
+                                .unwrap_or(1.0);
+                            let rect = match &clip {
+                                Some(cl) => cl.clone(),
+                                None => capture_rect(&metrics, opts.full_page),
+                            };
+                            let width = rect["width"].as_f64().unwrap_or(0.0);
+                            if width > 0.0 {
+                                let scale = (max_w as f64 / (width * dpr)).min(1.0);
+                                if scale < 1.0 {
+                                    let mut scaled = rect;
+                                    scaled["scale"] = json!(scale);
+                                    clip = Some(scaled);
+                                    params["captureBeyondViewport"] = json!(true);
+                                }
+                            }
+                        }
+                        if let Some(cl) = clip {
+                            params["clip"] = cl;
+                        }
+                        let v = c
+                            .send_with_session("Page.captureScreenshot", params, Some(&sid))
+                            .await?;
+                        v["data"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| anyhow!("Page.captureScreenshot returned no data"))
+                    },
                 )
-                .await;
-                let _ = c
-                    .send(
-                        "Target.detachFromTarget",
-                        json!({ "sessionId": session_id }),
-                    )
-                    .await;
-                let v = v?;
-                v["data"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| anyhow!("Page.captureScreenshot returned no data"))
+                .await
             }
             TabBackend::Bidi(c) => {
-                let _ = full_page; // BiDi captures the viewport by default
-                let fut = c.browsing_context_capture_screenshot(target_id, clip);
+                let format = match opts.format {
+                    ImageFormat::Png => None,
+                    ImageFormat::Jpeg => Some(json!({
+                        "type": "image/jpeg",
+                        "quality": f64::from(opts.quality.unwrap_or(DEFAULT_JPEG_QUALITY)) / 100.0,
+                    })),
+                };
+                let fut =
+                    c.browsing_context_capture_screenshot(target_id, opts.clip.clone(), format);
                 match tokio::time::timeout(NAV_OP_TIMEOUT, fut).await {
                     Ok(r) => r,
                     Err(_) => Err(SessionError::TabHung {

@@ -78,6 +78,8 @@ fn mcp_tools_list_returns_full_set() {
         "browser_console_messages",
         "browser_network_requests",
         "browser_network_body",
+        // Cheap reads.
+        "browser_get_page_text",
     ] {
         assert!(
             names.contains(expected),
