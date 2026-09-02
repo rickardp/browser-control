@@ -55,8 +55,10 @@ $script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/sc
 
 Requires Rust 1.80 or newer when building from source. A Node runtime
 (`bun` preferred, `node`+`npm` accepted) is required only if you invoke the
-Playwright-only MCP tools (`browser_click`, `browser_snapshot`, etc.); the
-sidecar is spawned lazily on first use.
+Playwright-sidecar MCP tools (CSS-selector `browser_click`/`browser_type`,
+`browser_press_key`, `browser_wait_for`, `browser_pdf_save`); the sidecar is
+spawned lazily on first use. Snapshots, refs, and console/network capture
+are native and need no Node.
 
 ## Usage
 
@@ -176,17 +178,41 @@ Browser resolution order:
 2. The persisted default from `browser-control set default <value>`
 3. Otherwise, exit with an error
 
-The server exposes engine-agnostic tools (`browser_navigate`, `browser_get_html`,
-`browser_eval`, `browser_fetch`, `browser_curl`, `browser_take_screenshot`, `browser_storage_get`,
-`browser_cookies`, …) that work on every supported browser including Firefox.
-Playwright-only interaction tools (`browser_click`,
-`browser_type`, `browser_snapshot`, `browser_press_key`, `browser_drag`,
-`browser_hover`, `browser_wait_for`, `browser_pdf_save`) route through an
-internal Node sidecar that wraps `playwright-core`. On the first call to one
-of these tools the sidecar is spawned (prefers `bun`, falls back to `node`+`npm`)
-against the active browser's CDP endpoint; on Firefox they return
-`EngineUnsupported`. The `--playwright-version` flag overrides the pinned
-`playwright-core` version for the sidecar.
+The server exposes three groups of tools:
+
+- **Engine-agnostic** (every supported browser including Firefox):
+  `browser_navigate`, `browser_get_html`, `browser_get_page_text`,
+  `browser_eval`, `browser_fetch`, `browser_curl`, `browser_take_screenshot`,
+  `browser_storage_get` / `browser_storage_set`, `browser_cookies`,
+  `browser_wait_for_cookie`, tab and browser management.
+- **Native CDP** (Chromium family, no Node): `browser_snapshot` (accessibility
+  tree with stable `[ref=eN]` handles, `interactive_only`, `ref`, `depth`,
+  `max_chars`), `browser_find` (refs for a short description), the `ref` path
+  of `browser_click` / `browser_type` / `browser_hover` / `browser_drag` /
+  `browser_take_screenshot`, and console/network capture:
+  `browser_console_messages`, `browser_network_requests`,
+  `browser_network_body`. On Firefox these return `EngineUnsupported` with a
+  hint naming the engine-agnostic alternative.
+- **Playwright sidecar** (Chromium family, needs `bun` or `node`): CSS
+  `selector` interaction on `browser_click` / `browser_type` /
+  `browser_hover` / `browser_drag`, plus `browser_press_key`,
+  `browser_wait_for`, `browser_pdf_save`. On the first call the sidecar is
+  spawned (prefers `bun`, falls back to `node`+`npm`) against the active
+  browser's CDP endpoint. The `--playwright-version` flag overrides the pinned
+  `playwright-core` version.
+
+Console and network capture starts the moment a tool first touches a tab and
+keeps the last 1000 console entries and 500 requests per tab, across
+navigations, until `clear: true`, the tab closes, or the browser is switched.
+It is push-only: the server enables the CDP `Runtime`, `Log`, `Network`, and
+`Page` domains on a long-lived session per tab and buffers what the browser
+sends; nothing polls. Set `BROWSER_CONTROL_CAPTURE=0` to disable it (CDP
+`Runtime.enable` is detectable by some anti-bot scripts).
+
+`browser_take_screenshot` returns an unscaled PNG by default; pass
+`format: "jpeg"`, `quality`, `max_width` (downscale), or `save_to` (write the
+file with mode 0600 and return only its path and dimensions) to keep
+screenshots out of the conversation context.
 
 `browser_select` switches the MCP server's active browser before preparing
 engine-specific state such as the Firefox BiDi lock. If that preparation fails
@@ -464,11 +490,11 @@ them addressable via `-b <browser>/<name>` in `eval`, `fetch`, `storage`.
 `browser-control` is itself an MCP server when invoked as `mcp`. Add it to
 your host's `.mcp.json` like any other stdio server.
 
-Default tools (exposed by the Rust server) include `navigate`, `get_dom`,
-`screenshot`, `fetch`, `select_element`, plus the session ops introduced in
-this release: `list_targets`, `cookies`, `storage_get`, `storage_set`, and
-`wait_for_cookie`. See [docs/session-ops.md](docs/session-ops.md) for the
-underlying model.
+See the `mcp` subcommand section above for the full tool list. Session ops
+(`browser_cookies`, `browser_storage_*`, `browser_wait_for_cookie`,
+`browser_fetch`, `list_targets`) are described in
+[docs/session-ops.md](docs/session-ops.md); the native accessibility and
+capture tools in [docs/adrs/003-native-cdp-observe-and-interact.md](docs/adrs/003-native-cdp-observe-and-interact.md).
 
 ```json
 {

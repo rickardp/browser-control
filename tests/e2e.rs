@@ -179,6 +179,9 @@ fn agent_instructions_print_canonical_guidance() {
         "browser-control tab open",
         "browser_fetch",
         "wait-for-cookie",
+        "browser_snapshot",
+        "browser_console_messages",
+        "BROWSER_CONTROL_CAPTURE",
     ] {
         assert!(s.contains(expected), "missing {expected} in:\n{s}");
     }

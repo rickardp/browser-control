@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Console and network capture (ADR-003). The MCP server keeps one CDP
+  session per touched tab with `Runtime`, `Log`, `Network`, and `Page`
+  enabled and buffers browser-pushed events (last 1000 console entries and
+  500 requests per tab, across navigations). New tools
+  `browser_console_messages` (`pattern`, `only_errors`, `limit`, `clear`,
+  `format`), `browser_network_requests` (`url_pattern`, `method`, `status`,
+  `resource_type`, `limit`, `clear`, `format`), and `browser_network_body`
+  (on-demand `Network.getResponseBody`, capped at 256 KiB by default, 8 MiB
+  max). Chromium-only; `BROWSER_CONTROL_CAPTURE=0` disables attachment.
+- `browser_snapshot` is now native CDP (no Playwright sidecar) and returns
+  stable element refs (`[ref=eN]`), with `interactive_only`, `ref`, `depth`,
+  and `max_chars` options and a page header line.
+- `browser_find` returns refs for a short description of an element
+  ("search box", "Sign in button") by matching accessible name, value,
+  description, and role.
+- `browser_click`, `browser_type`, `browser_hover`, and `browser_drag` accept
+  a `ref` (native CDP input via `DOM.getContentQuads`,
+  `Input.dispatchMouseEvent`, `Input.insertText`) as an alternative to the
+  CSS selector. `browser_type` gains `submit` (press Enter afterwards) on
+  both paths. Refs are bound to a document token; after a navigation they
+  fail with a typed `StaleRef` instead of acting on a recycled node id.
+- `browser_get_page_text`: readable, article-first page text through a
+  single evaluate; works on every engine including Firefox.
+- `browser_take_screenshot` gains `format` (`png` | `jpeg`), `quality`,
+  `max_width` (downscale via `clip.scale`), `save_to` (write a 0600 file and
+  return only path and dimensions), and `ref` clipping. The default output
+  is unchanged.
+
+### Changed
+
+- The transport's event broadcast capacity is 2048 (was 256) so a page load's
+  burst of `Network.*` events does not lag the capture hub.
+- `browser-control --agent-instructions` documents the snapshot/ref workflow,
+  screenshot hygiene, and console/network capture.
+
 ## 1.1.0 — 2026-07-14
 
 ### Added
