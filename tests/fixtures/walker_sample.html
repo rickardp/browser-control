@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head><title>Walker Sample</title></head>
+<body>
+<header>
+  <nav aria-label="Primary">
+    <a href="/">Home</a>
+    <a href="/docs">Docs</a>
+  </nav>
+</header>
+<main>
+  <h1>Welcome</h1>
+  <p>Intro paragraph with <a href="/more">a link</a> inside.</p>
+  <form aria-label="Sign up">
+    <label for="email">Email address</label>
+    <input id="email" type="email" placeholder="you@example.com" required>
+    <input type="search" placeholder="Search the site">
+    <label><input type="checkbox" checked> Subscribe</label>
+    <fieldset>
+      <legend>Plan</legend>
+      <label><input type="radio" name="plan" value="free" checked> Free</label>
+      <label><input type="radio" name="plan" value="pro"> Pro</label>
+    </fieldset>
+    <select aria-label="Country">
+      <option>Sweden</option>
+      <option selected>Norway</option>
+    </select>
+    <textarea aria-label="Notes">Some notes</textarea>
+    <button type="submit">Create account</button>
+    <button type="button" disabled>Disabled</button>
+    <button type="button" aria-label="Close dialog"><svg width="10" height="10"></svg></button>
+  </form>
+  <div hidden>hidden block</div>
+  <div aria-hidden="true">aria hidden block</div>
+  <x-card></x-card>
+  <details open><summary>More info</summary><p>Details body</p></details>
+  <table>
+    <caption>Prices</caption>
+    <tr><th>Item</th><th>Cost</th></tr>
+    <tr><td>Widget</td><td>3</td></tr>
+  </table>
+  <iframe title="Embedded" src="about:blank"></iframe>
+</main>
+<footer>Footer text</footer>
+<script>
+  customElements.define('x-card', class extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = '<div><button>Shadow button</button><slot></slot></div>';
+    }
+  });
+</script>
+</body>
+</html>

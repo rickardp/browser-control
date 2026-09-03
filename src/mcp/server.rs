@@ -483,11 +483,13 @@ impl ServerState {
                 let _ = client.session_end().await;
             }
         }
-        // Drop the cached backend so the next call rebuilds against
-        // the new browser.
+        // Release the engine session and drop the cached backend so the
+        // next call rebuilds against the new browser.
         {
-            let mut backend = self.backend.lock().await;
-            *backend = None;
+            let old = self.backend.lock().await.take();
+            if let Some(b) = old {
+                b.shutdown().await;
+            }
         }
         // Release the BiDi lock guard (Drop releases it) and reset to Pending.
         {
@@ -831,8 +833,17 @@ where
             }
         }
     }
-    // stdin closed: drop our sender so the writer drains and exits, then
-    // wait for it so all buffered responses reach the wire before returning.
+    // stdin closed: wait for in-flight tool calls (write guard), release the
+    // engine session so Firefox accepts the next `session.new`, then drop
+    // our sender so the writer drains and exits, and wait for it so all
+    // buffered responses reach the wire before returning.
+    {
+        let _exclusive = state.op_barrier.write().await;
+        let backend = state.backend.lock().await.take();
+        if let Some(b) = backend {
+            b.shutdown().await;
+        }
+    }
     drop(tx);
     let _ = writer.await;
     Ok(())

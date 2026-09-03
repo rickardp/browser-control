@@ -188,6 +188,123 @@ pub const SELECT_ALL_JS: &str = r#"
 })
 "#;
 
+// ---------------------------------------------------------------------------
+// WebDriver BiDi (Firefox) accessibility snapshot + ref helpers.
+//
+// BiDi has no accessibility-tree command, so `SNAPSHOT_TREE_JS` walks the
+// DOM and emits `Accessibility.getFullAXTree`-shaped JSON with element refs
+// held in a page-side registry (`window.__bcRefs`). The helpers below take
+// a registry id and return a JSON string: `{"gone":true}` when the element
+// is no longer in the document, `{"error":"…"}` for a real failure.
+// ---------------------------------------------------------------------------
+
+/// The walker itself; see the header comment in the file.
+pub const SNAPSHOT_TREE_JS: &str = include_str!("js/snapshot_tree.js");
+
+/// Expression (for `script.evaluate`) yielding the per-document token as a
+/// decimal string; creates it when the walker has not run yet.
+pub const DOC_TOKEN_JS: &str = "String(window.__bcDocToken ?? (window.__bcDocToken = 4294967296 + Math.floor(Math.random() * (9007199254740992 - 4294967296))))";
+
+/// Expression yielding the document's scroll size as JSON, for full-page
+/// screenshots on BiDi.
+pub const DOC_SIZE_JS: &str = "JSON.stringify({width: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0), height: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)})";
+
+/// `(id)` → centre of the element in viewport CSS px after scrolling it
+/// into view, clipped to the viewport.
+pub const REF_CENTER_JS: &str = r#"
+/* bc:center */
+(function(id) {
+    const reg = window.__bcRefs;
+    const r = reg && reg.byId.get(Number(id));
+    const el = r && typeof r.deref === 'function' ? r.deref() : r;
+    if (!el || !el.isConnected) return JSON.stringify({ gone: true });
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+    const rect = el.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const x1 = Math.max(0, rect.left), y1 = Math.max(0, rect.top);
+    const x2 = Math.min(vw, rect.right), y2 = Math.min(vh, rect.bottom);
+    if (x2 - x1 <= 1 || y2 - y1 <= 1) {
+        return JSON.stringify({ error: 'element has no visible box (hidden, zero-size, or outside the viewport after scrolling)' });
+    }
+    return JSON.stringify({ x: (x1 + x2) / 2, y: (y1 + y2) / 2 });
+})
+"#;
+
+/// `(id)` → the element's border box in document coordinates (same
+/// contract as `GET_CLIP_RECT_JS`).
+pub const REF_CLIP_RECT_JS: &str = r#"
+/* bc:clip */
+(function(id) {
+    const reg = window.__bcRefs;
+    const r = reg && reg.byId.get(Number(id));
+    const el = r && typeof r.deref === 'function' ? r.deref() : r;
+    if (!el || !el.isConnected) return JSON.stringify({ gone: true });
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return JSON.stringify({ error: 'element has zero area' });
+    return JSON.stringify({
+        x: rect.left + window.scrollX,
+        y: rect.top + window.scrollY,
+        width: rect.width,
+        height: rect.height,
+    });
+})
+"#;
+
+/// `(id, text, mode)` with `mode` = `fill` | `select` | `clear`: focus the
+/// element, select its content (or clear it), and for `fill` insert `text`
+/// through `execCommand('insertText')` with a value-setter fallback that
+/// keeps framework value trackers in sync. Returns `{kind, method}`.
+pub const REF_TYPE_JS: &str = r#"
+/* bc:type */
+(function(id, text, mode) {
+    const reg = window.__bcRefs;
+    const r = reg && reg.byId.get(Number(id));
+    const el = r && typeof r.deref === 'function' ? r.deref() : r;
+    if (!el || !el.isConnected) return JSON.stringify({ gone: true });
+    try { el.focus(); } catch (e) {}
+    const tag = (el.tagName || '').toLowerCase();
+    const isField = tag === 'input' || tag === 'textarea';
+    const editable = !isField && el.isContentEditable;
+    const kind = isField ? 'field' : editable ? 'contenteditable' : 'other';
+    function setValue(v) {
+        const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const d = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (d && d.set) d.set.call(el, v); else el.value = v;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: v }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (mode === 'clear') {
+        if (isField) setValue('');
+        else if (editable) { el.textContent = ''; el.dispatchEvent(new InputEvent('input', { bubbles: true })); }
+        return JSON.stringify({ kind: kind, method: 'clear' });
+    }
+    if (isField) {
+        try { el.select(); } catch (e) { try { el.setSelectionRange(0, el.value.length); } catch (e2) {} }
+    } else if (editable) {
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.addRange(range);
+    }
+    if (mode === 'select') return JSON.stringify({ kind: kind, method: 'select' });
+    let ok = false;
+    try { ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
+    if (isField && el.value !== text) ok = false;
+    let method = 'execCommand';
+    if (!ok) {
+        method = 'fallback';
+        if (isField) setValue(text);
+        else if (editable) {
+            el.textContent = text;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+        }
+    }
+    return JSON.stringify({ kind: kind, method: method });
+})
+"#;
+
 /// Performs a fetch from the page context. Receives JSON-string args.
 pub const FETCH_JS: &str = r#"
 (async function(argsJson) {

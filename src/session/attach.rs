@@ -220,7 +220,9 @@ impl PageSession {
                 let inner = async {
                     let _ = await_promise; // BiDi always awaits per script_evaluate
                     let v = p.client.script_evaluate(&p.context, expression).await?;
-                    Ok::<Value, anyhow::Error>(v["result"]["value"].clone())
+                    Ok::<Value, anyhow::Error>(crate::bidi::remote_value_to_json(
+                        &crate::bidi::unwrap_script_result(v)?,
+                    ))
                 };
                 match timeout {
                     None => inner.await,

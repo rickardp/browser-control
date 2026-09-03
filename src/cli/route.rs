@@ -142,5 +142,7 @@ where
         _ => bail!("{no_external_msg}"),
     };
     let backend = open_backend(&route.resolved.endpoint, route.resolved.engine).await?;
-    with_named_tab_recovery(&backend, &route.registry, &browser_name, name, op).await
+    let result = with_named_tab_recovery(&backend, &route.registry, &browser_name, name, op).await;
+    backend.shutdown().await;
+    result
 }

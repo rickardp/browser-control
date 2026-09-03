@@ -141,6 +141,17 @@ pub struct LiveTarget {
 }
 
 impl TabBackend {
+    /// Release the engine session before the client goes away. Firefox
+    /// does not end a BiDi session when its WebSocket closes, so a backend
+    /// that is dropped without `session.end` leaves the browser refusing
+    /// every later `session.new` ("Maximum number of active sessions").
+    /// CDP has nothing to release. Best-effort and idempotent.
+    pub async fn shutdown(&self) {
+        if let TabBackend::Bidi(c) = self {
+            let _ = c.session_end().await;
+        }
+    }
+
     /// Create a fresh top-level tab. Returns the engine-specific id
     /// (CDP `targetId`, BiDi `context`) the registry stores verbatim.
     /// `url` defaults to `about:blank`.
@@ -496,7 +507,9 @@ impl TabBackend {
                 let _ = await_promise; // BiDi always awaits
                 let fut = c.script_evaluate(target_id, expression);
                 match tokio::time::timeout(timeout, fut).await {
-                    Ok(Ok(v)) => Ok(v["result"]["value"].clone()),
+                    Ok(Ok(v)) => Ok(crate::bidi::remote_value_to_json(
+                        &crate::bidi::unwrap_script_result(v)?,
+                    )),
                     Ok(Err(e)) => Err(e),
                     Err(_) => Err(SessionError::TabHung {
                         target_id: Some(target_id.to_string()),
@@ -1078,7 +1091,7 @@ mod tests {
                                     json!({})
                                 }
                                 "browsingContext.navigate" => json!({"navigation": "N1"}),
-                                "script.evaluate" => json!({"result": {"value": 9}}),
+                                "script.evaluate" => json!({"type": "success", "result": {"type": "number", "value": 9}, "realm": "R1"}),
                                 "browsingContext.getTree" => {
                                     let contexts: Vec<Value> = live
                                         .iter()

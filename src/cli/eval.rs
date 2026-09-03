@@ -118,14 +118,21 @@ async fn run_inner(
                 };
                 let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
                 let expr = expression.clone();
-                with_scratch_recovery(&backend, &r.registry, &browser_name, move |b, target_id| {
-                    let expr = expr.clone();
-                    async move {
-                        b.ensure_fresh(&target_id, max_age).await?;
-                        b.evaluate(&target_id, &expr, await_promise, timeout).await
-                    }
-                })
-                .await?
+                let value = with_scratch_recovery(
+                    &backend,
+                    &r.registry,
+                    &browser_name,
+                    move |b, target_id| {
+                        let expr = expr.clone();
+                        async move {
+                            b.ensure_fresh(&target_id, max_age).await?;
+                            b.evaluate(&target_id, &expr, await_promise, timeout).await
+                        }
+                    },
+                )
+                .await;
+                backend.shutdown().await;
+                value?
             }
         }
         // Path 3: bare browser, --target regex → legacy selector.

@@ -215,6 +215,49 @@ impl BidiClient {
         .await
     }
 
+    /// `script.callFunction` in the context's default realm. `args` are
+    /// plain JSON primitives (string / number / boolean / null) converted to
+    /// BiDi `LocalValue`s. A `{type:"exception"}` result becomes an error
+    /// carrying `exceptionDetails.text`; otherwise the `RemoteValue` result
+    /// is returned.
+    pub async fn script_call_function(
+        &self,
+        context: &str,
+        function_declaration: &str,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        let v = self
+            .send(
+                "script.callFunction",
+                json!({
+                    "functionDeclaration": function_declaration,
+                    "target": {"context": context},
+                    "arguments": args.iter().map(to_local_value).collect::<Vec<_>>(),
+                    "awaitPromise": true,
+                    "resultOwnership": "none",
+                }),
+            )
+            .await?;
+        unwrap_script_result(v)
+    }
+
+    /// `input.performActions` with a prebuilt `actions` array.
+    pub async fn input_perform_actions(&self, context: &str, actions: Value) -> Result<()> {
+        self.send(
+            "input.performActions",
+            json!({ "context": context, "actions": actions }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `input.releaseActions`: release any pressed keys / buttons.
+    pub async fn input_release_actions(&self, context: &str) -> Result<()> {
+        self.send("input.releaseActions", json!({ "context": context }))
+            .await?;
+        Ok(())
+    }
+
     /// `format` is the BiDi `browsingContext.ImageFormat` object
     /// (`{type, quality}`); `None` keeps the protocol default (PNG).
     pub async fn browsing_context_capture_screenshot(
@@ -246,6 +289,83 @@ impl BidiClient {
             .as_str()
             .ok_or_else(|| anyhow!("no data"))?
             .to_string())
+    }
+}
+
+/// JSON primitive → BiDi `script.LocalValue`.
+pub(crate) fn to_local_value(v: &Value) -> Value {
+    match v {
+        Value::String(s) => json!({ "type": "string", "value": s }),
+        Value::Number(n) => json!({ "type": "number", "value": n }),
+        Value::Bool(b) => json!({ "type": "boolean", "value": b }),
+        Value::Null => json!({ "type": "null" }),
+        // Arrays/objects are not needed by callers today; serialise them as
+        // a JSON string so the page can `JSON.parse` if it ever wants to.
+        other => json!({ "type": "string", "value": other.to_string() }),
+    }
+}
+
+/// Unwrap a `script.evaluate` / `script.callFunction` reply: a
+/// `type:"exception"` frame is a *successful* command whose script threw,
+/// so surface its text as an error; otherwise return the `RemoteValue`.
+pub(crate) fn unwrap_script_result(v: Value) -> Result<Value> {
+    if v["type"].as_str() == Some("exception") {
+        let text = v["exceptionDetails"]["text"]
+            .as_str()
+            .unwrap_or("script threw an exception")
+            .to_string();
+        return Err(anyhow!("script exception: {text}"));
+    }
+    Ok(v["result"].clone())
+}
+
+/// Flatten a BiDi `script.RemoteValue` into plain JSON so callers see the
+/// same shape CDP's `returnByValue` produces: objects become JSON objects
+/// (BiDi ships them as `[[key, value], …]` pairs), arrays become arrays,
+/// primitives pass through, and non-serialisable values (nodes, functions,
+/// windows) become `null`.
+pub fn remote_value_to_json(v: &Value) -> Value {
+    let key_of = |k: &Value| -> String {
+        match k {
+            Value::String(s) => s.clone(),
+            other => match remote_value_to_json(other) {
+                Value::String(s) => s,
+                j => j.to_string(),
+            },
+        }
+    };
+    match v["type"].as_str().unwrap_or("undefined") {
+        "string" | "boolean" => v["value"].clone(),
+        "number" => match &v["value"] {
+            n @ Value::Number(_) => n.clone(),
+            // "NaN", "Infinity", "-Infinity", "-0" have no JSON form.
+            Value::String(s) if s == "-0" => json!(0),
+            _ => Value::Null,
+        },
+        "bigint" | "date" => v["value"].clone(),
+        "regexp" => json!(format!(
+            "/{}/{}",
+            v["value"]["pattern"].as_str().unwrap_or(""),
+            v["value"]["flags"].as_str().unwrap_or("")
+        )),
+        "array" | "set" | "nodelist" | "htmlcollection" => match v["value"].as_array() {
+            Some(items) => Value::Array(items.iter().map(remote_value_to_json).collect()),
+            None => Value::Array(vec![]),
+        },
+        "object" | "map" => match v["value"].as_array() {
+            Some(pairs) => {
+                let mut m = serde_json::Map::new();
+                for pair in pairs {
+                    if let Some(k) = pair.get(0) {
+                        let val = pair.get(1).map(remote_value_to_json).unwrap_or(Value::Null);
+                        m.insert(key_of(k), val);
+                    }
+                }
+                Value::Object(m)
+            }
+            None => Value::Object(serde_json::Map::new()),
+        },
+        _ => Value::Null,
     }
 }
 
@@ -469,5 +589,133 @@ mod tests {
             .unwrap();
         let sid = client.session_new().await.unwrap();
         assert_eq!(sid, "S2");
+    }
+
+    #[test]
+    fn local_value_conversion() {
+        assert_eq!(
+            to_local_value(&json!("x")),
+            json!({"type": "string", "value": "x"})
+        );
+        assert_eq!(
+            to_local_value(&json!(7)),
+            json!({"type": "number", "value": 7})
+        );
+        assert_eq!(
+            to_local_value(&json!(true)),
+            json!({"type": "boolean", "value": true})
+        );
+        assert_eq!(to_local_value(&Value::Null), json!({"type": "null"}));
+    }
+
+    #[test]
+    fn remote_value_flattens_to_plain_json() {
+        let v = json!({"type": "object", "value": [
+            ["href", {"type": "string", "value": "https://x/"}],
+            ["ageMs", {"type": "number", "value": 12.5}],
+            ["nested", {"type": "array", "value": [{"type": "boolean", "value": true}, {"type": "null"}]}],
+            ["fn", {"type": "function"}],
+            ["nan", {"type": "number", "value": "NaN"}]
+        ]});
+        assert_eq!(
+            remote_value_to_json(&v),
+            json!({"href": "https://x/", "ageMs": 12.5, "nested": [true, null], "fn": null, "nan": null})
+        );
+        assert_eq!(
+            remote_value_to_json(&json!({"type": "string", "value": "s"})),
+            json!("s")
+        );
+        assert_eq!(
+            remote_value_to_json(&json!({"type": "undefined"})),
+            Value::Null
+        );
+        assert_eq!(remote_value_to_json(&json!({"type": "object"})), json!({}));
+    }
+
+    #[test]
+    fn script_result_unwrap() {
+        let ok = unwrap_script_result(json!({
+            "type": "success",
+            "result": {"type": "string", "value": "hi"},
+            "realm": "R1"
+        }))
+        .unwrap();
+        assert_eq!(ok["value"], "hi");
+        let err = unwrap_script_result(json!({
+            "type": "exception",
+            "exceptionDetails": {"text": "ReferenceError: nope"},
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("ReferenceError: nope"));
+    }
+
+    /// Records every request; answers `script.callFunction` with an
+    /// exception when the declaration mentions `throw`, else a string.
+    async fn spawn_recording_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    seen.lock().unwrap().push(v.clone());
+                    let id = v["id"].as_u64().unwrap();
+                    let decl = v["params"]["functionDeclaration"].as_str().unwrap_or("");
+                    let result = if decl.contains("throw") {
+                        json!({"type": "exception", "exceptionDetails": {"text": "boom"}, "realm": "R1"})
+                    } else if v["method"] == "script.callFunction" {
+                        json!({"type": "success", "result": {"type": "string", "value": "ok"}, "realm": "R1"})
+                    } else {
+                        json!({})
+                    };
+                    let reply = json!({"id": id, "type": "success", "result": result});
+                    ws.send(Message::Text(reply.to_string())).await.unwrap();
+                }
+            }
+        });
+        (format!("ws://{}", addr), seen)
+    }
+
+    #[tokio::test]
+    async fn call_function_and_input_actions_round_trip() {
+        let (url, seen) = spawn_recording_server().await;
+        let client = BidiClient::connect(&url).await.unwrap();
+        let v = client
+            .script_call_function(
+                "C1",
+                "(function(a){ return a })",
+                vec![json!(5), json!("s")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["value"], "ok");
+        let err = client
+            .script_call_function("C1", "(function(){ throw 1 })", vec![])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+        client
+            .input_perform_actions("C1", json!([{"type": "key", "id": "kb", "actions": []}]))
+            .await
+            .unwrap();
+        client.input_release_actions("C1").await.unwrap();
+        let reqs = seen.lock().unwrap();
+        let call = &reqs[0];
+        assert_eq!(call["method"], "script.callFunction");
+        assert_eq!(call["params"]["target"]["context"], "C1");
+        assert_eq!(call["params"]["awaitPromise"], true);
+        assert_eq!(call["params"]["resultOwnership"], "none");
+        assert_eq!(
+            call["params"]["arguments"],
+            json!([{"type": "number", "value": 5}, {"type": "string", "value": "s"}])
+        );
+        assert_eq!(reqs[2]["method"], "input.performActions");
+        assert_eq!(reqs[2]["params"]["context"], "C1");
+        assert_eq!(reqs[2]["params"]["actions"][0]["id"], "kb");
+        assert_eq!(reqs[3]["method"], "input.releaseActions");
     }
 }

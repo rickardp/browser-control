@@ -161,11 +161,13 @@ async fn run_inner(
         }
     };
 
-    let prepared = prepare(&backend, target_id.as_deref()).await?;
+    let prepared = prepare(&backend, target_id.as_deref()).await;
     // Curl no longer needs the browser protocol connection or registry lock.
     // Release both before a potentially long download.
+    backend.shutdown().await;
     drop(backend);
     drop(route);
+    let prepared = prepared?;
 
     let mut command = prepared.command(args.iter())?;
     command

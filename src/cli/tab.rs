@@ -116,7 +116,9 @@ async fn open(positional: &str, url: &str, json: bool, trace: &mut CommandTrace)
 
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
     let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-    let row = session_tabs::tab_open(&backend, &registry, &browser_name, name, url_opt).await?;
+    let row = session_tabs::tab_open(&backend, &registry, &browser_name, name, url_opt).await;
+    backend.shutdown().await;
+    let row = row?;
     trace.target_id(&row.target_id);
     if name.is_none() {
         // Capture the daemon-assigned name in the trace too.
@@ -149,26 +151,31 @@ async fn list(positional: &str, all: bool, json: bool, trace: &mut CommandTrace)
     trace.route(if all { "tab-list-all" } else { "tab-list" });
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
     let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-    let rows = session_tabs::tab_list(&backend, &registry, &browser_name).await?;
-
-    // With `--all`, fold in every live tab the browser knows about with
-    // an empty `name` column. Registered ids stay as-is; unregistered
-    // ones get synthesized rows. Sorted: named rows first (alpha), then
-    // unnamed (by url).
-    let merged = if all {
-        let live = backend.live_targets().await?;
-        let known_ids: std::collections::HashSet<&str> =
-            rows.iter().map(|r| r.target_id.as_str()).collect();
-        let mut out: Vec<DisplayRow> = rows.iter().map(DisplayRow::from_row).collect();
-        for t in &live {
-            if !known_ids.contains(t.id.as_str()) {
-                out.push(DisplayRow::from_live(t));
+    let merged = async {
+        let rows = session_tabs::tab_list(&backend, &registry, &browser_name).await?;
+        // With `--all`, fold in every live tab the browser knows about with
+        // an empty `name` column. Registered ids stay as-is; unregistered
+        // ones get synthesized rows. Sorted: named rows first (alpha), then
+        // unnamed (by url).
+        let merged: Vec<DisplayRow> = if all {
+            let live = backend.live_targets().await?;
+            let known_ids: std::collections::HashSet<&str> =
+                rows.iter().map(|r| r.target_id.as_str()).collect();
+            let mut out: Vec<DisplayRow> = rows.iter().map(DisplayRow::from_row).collect();
+            for t in &live {
+                if !known_ids.contains(t.id.as_str()) {
+                    out.push(DisplayRow::from_live(t));
+                }
             }
-        }
-        out
-    } else {
-        rows.iter().map(DisplayRow::from_row).collect()
-    };
+            out
+        } else {
+            rows.iter().map(DisplayRow::from_row).collect()
+        };
+        Ok::<_, anyhow::Error>(merged)
+    }
+    .await;
+    backend.shutdown().await;
+    let merged = merged?;
 
     if json {
         let arr: Vec<serde_json::Value> = merged.iter().map(DisplayRow::to_json).collect();
@@ -221,23 +228,29 @@ async fn adopt(
 
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
     let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-
-    // Verify the target ID actually exists in the browser.
-    let live_ids = backend.live_target_ids().await?;
-    if !live_ids.contains(target_id) {
-        return Err(anyhow!(
-            "target ID `{target_id}` not found among live tabs. \
-             Use `tab list --all` to see available target IDs."
-        ));
+    let looked_up = async {
+        // Verify the target ID actually exists in the browser.
+        let live_ids = backend.live_target_ids().await?;
+        if !live_ids.contains(target_id) {
+            return Err(anyhow!(
+                "target ID `{target_id}` not found among live tabs. \
+                 Use `tab list --all` to see available target IDs."
+            ));
+        }
+        // Get the URL of the live tab for the registry row.
+        let live_targets = backend.live_targets().await?;
+        Ok::<_, anyhow::Error>(
+            live_targets
+                .iter()
+                .find(|t| t.id == target_id)
+                .map(|t| t.url.clone())
+                .unwrap_or_else(|| "about:blank".to_string()),
+        )
     }
-
-    // Get the URL of the live tab for the registry row.
-    let live_targets = backend.live_targets().await?;
-    let url = live_targets
-        .iter()
-        .find(|t| t.id == target_id)
-        .map(|t| t.url.as_str())
-        .unwrap_or("about:blank");
+    .await;
+    backend.shutdown().await;
+    let url = looked_up?;
+    let url = url.as_str();
 
     // daemon_created = false because this is a user-adopted tab.
     registry.tab_upsert(&browser_name, name, target_id, url, false)?;
