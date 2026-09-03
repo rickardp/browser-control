@@ -4294,7 +4294,8 @@ mod tests {
             (json!({"max_width": 10}), "at least 64"),
             (json!({"save_to": "relative.png"}), "absolute path"),
             (
-                json!({"save_to": "/definitely/missing/dir/x.png"}),
+                // Absolute on every platform (`/x` is relative on Windows).
+                json!({"save_to": std::env::temp_dir().join("definitely/missing/dir/x.png")}),
                 "parent directory",
             ),
             (json!({"selector": "#a", "ref": "e1"}), "mutually exclusive"),

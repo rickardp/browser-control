@@ -152,13 +152,23 @@ fn parse_version(s: &str) -> Option<String> {
 /// (even if browser-control never launched or registered it) over the
 /// hardcoded detection-order fallback in [`crate::cli::start::ensure_started`].
 pub fn list_running_kinds(installed: &[Installed]) -> std::collections::HashSet<Kind> {
+    // A live process reports its resolved binary (`/proc/<pid>/exe`), while
+    // the installed path may be a symlink into it (`/bin -> /usr/bin` on
+    // merged-usr Linux, a launcher symlink in /usr/local/bin). Compare
+    // canonical paths so both spellings match.
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let wanted: Vec<(std::path::PathBuf, Kind)> = installed
+        .iter()
+        .map(|i| (canon(&i.executable), i.kind))
+        .collect();
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut running = std::collections::HashSet::new();
     for proc in sys.processes().values() {
         let Some(exe) = proc.exe() else { continue };
-        if let Some(inst) = installed.iter().find(|i| i.executable == exe) {
-            running.insert(inst.kind);
+        let exe = canon(exe);
+        if let Some((_, kind)) = wanted.iter().find(|(p, _)| *p == exe) {
+            running.insert(*kind);
         }
     }
     running
