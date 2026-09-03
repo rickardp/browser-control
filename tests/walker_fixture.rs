@@ -47,7 +47,9 @@ fn walker_output_renders_expected_snapshot() {
         eprintln!("updated {path}");
         return;
     }
-    assert_eq!(snap.text, SNAPSHOT_TXT);
+    // A Windows checkout with autocrlf turns the fixture's newlines into
+    // CRLF; the renderer always emits LF.
+    assert_eq!(snap.text, SNAPSHOT_TXT.replace("\r\n", "\n"));
     assert!(!snap.truncated);
 }
 
