@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 — 2026-09-03
 
 ### Added
 
@@ -72,6 +72,12 @@
   named-tab CLI paths left the browser refusing every later `session.new`
   ("Maximum number of active sessions"). They now send `session.end` before
   exiting.
+
+## 1.1.1
+
+### Fixed
+
+- Prefer an already-running browser over the hardcoded detection order.
 
 ## 1.1.0 — 2026-07-14
 
