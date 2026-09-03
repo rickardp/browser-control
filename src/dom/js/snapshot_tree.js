@@ -192,6 +192,12 @@
       const t = el.querySelector('title');
       if (t) return { name: collapse(t.textContent), from: 'title' };
     }
+    if (tag === 'OPTION') {
+      // Options are not "visible" while the select is closed, so the
+      // content walk below would skip them.
+      const t = collapse(el.label || el.textContent);
+      if (t) return { name: t, from: 'content' };
+    }
     if (NAME_FROM_CONTENT.has(role)) {
       const t = collapse(textOf(el));
       if (t) return { name: t, from: 'content' };

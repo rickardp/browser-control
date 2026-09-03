@@ -13,6 +13,7 @@ pub mod cdp_session;
 pub mod crash;
 pub mod freshness;
 pub mod input;
+pub mod input_bidi;
 pub mod scratch;
 pub mod tabs;
 pub mod targets;

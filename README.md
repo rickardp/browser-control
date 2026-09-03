@@ -185,14 +185,18 @@ The server exposes three groups of tools:
   `browser_eval`, `browser_fetch`, `browser_curl`, `browser_take_screenshot`,
   `browser_storage_get` / `browser_storage_set`, `browser_cookies`,
   `browser_wait_for_cookie`, tab and browser management.
-- **Native CDP** (Chromium family, no Node): `browser_snapshot` (accessibility
+- **Native, no Node** (Chromium and Firefox): `browser_snapshot` (accessibility
   tree with stable `[ref=eN]` handles, `interactive_only`, `ref`, `depth`,
   `max_chars`), `browser_find` (refs for a short description), the `ref` path
   of `browser_click` / `browser_type` / `browser_hover` / `browser_drag` /
-  `browser_take_screenshot`, and console/network capture:
-  `browser_console_messages`, `browser_network_requests`,
-  `browser_network_body`. On Firefox these return `EngineUnsupported` with a
-  hint naming the engine-agnostic alternative.
+  `browser_take_screenshot`, and console/network listing:
+  `browser_console_messages`, `browser_network_requests`. On Chromium the
+  tree comes from CDP's accessibility domain; on Firefox from an injected DOM
+  walker, so names and roles are approximate and closed shadow roots are not
+  visible.
+- **Chromium-only extras**: `browser_network_body` (Firefox exposes no
+  captured bodies; use `browser_fetch` there) and screenshot `max_width`
+  (BiDi has no scale).
 - **Playwright sidecar** (Chromium family, needs `bun` or `node`): CSS
   `selector` interaction on `browser_click` / `browser_type` /
   `browser_hover` / `browser_drag`, plus `browser_press_key`,
@@ -204,10 +208,12 @@ The server exposes three groups of tools:
 Console and network capture starts the moment a tool first touches a tab and
 keeps the last 1000 console entries and 500 requests per tab, across
 navigations, until `clear: true`, the tab closes, or the browser is switched.
-It is push-only: the server enables the CDP `Runtime`, `Log`, `Network`, and
-`Page` domains on a long-lived session per tab and buffers what the browser
-sends; nothing polls. Set `BROWSER_CONTROL_CAPTURE=0` to disable it (CDP
-`Runtime.enable` is detectable by some anti-bot scripts).
+It is push-only: on Chromium the server enables the CDP `Runtime`, `Log`,
+`Network`, and `Page` domains on a long-lived session per tab; on Firefox it
+holds one WebDriver BiDi `session.subscribe` for `log.*`, `network.*`
+(Firefox 124+; older builds degrade to console-only) and
+`browsingContext.*`. Nothing polls. Set `BROWSER_CONTROL_CAPTURE=0` to
+disable it (CDP `Runtime.enable` is detectable by some anti-bot scripts).
 
 `browser_take_screenshot` returns an unscaled PNG by default; pass
 `format: "jpeg"`, `quality`, `max_width` (downscale), or `save_to` (write the

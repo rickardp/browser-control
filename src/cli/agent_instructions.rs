@@ -36,7 +36,7 @@ Page and network work
 Console and network
 - The MCP server captures console output and network requests for every tab a tool has touched (navigate, select, snapshot, …), from that moment on. Read them with `browser_console_messages` and `browser_network_requests`; fetch a response body with `browser_network_body` and the printed request id.
 - Always pass `pattern` / `url_pattern` or `only_errors` on busy pages, and `clear: true` before an action to isolate its effects. Buffers persist across navigations; each entry shows the page it came from.
-- `browser_tab_new` with a URL cannot capture that very first load; use `browser_tab_new` then `browser_navigate` when the initial traffic matters. Chromium only; on Firefox use `browser_eval` (a `window.onerror` hook, `performance.getEntriesByType('resource')`).
+- `browser_tab_new` with a URL cannot capture that very first load; use `browser_tab_new` then `browser_navigate` when the initial traffic matters. Works on Chromium and Firefox; `browser_network_body` is Chromium-only (on Firefox re-issue the request with `browser_fetch`), and Firefox does not log failed resource loads to the console (check `browser_network_requests` with `status: "4xx"` instead).
 
 Cookies and login
 - Wait for login with `browser_wait_for_cookie` or `browser-control wait-for-cookie --domain <regex> --name <regex>`.
@@ -46,7 +46,7 @@ Cookies and login
 MCP server setup
 - Configure the host with command `browser-control` and args `["mcp"]`.
 - Set `BROWSER_CONTROL` in the MCP host env to scope that server to one browser, or rely on `browser-control set default`.
-- `browser_snapshot`, `browser_find`, ref-based interaction, and console/network capture are native CDP (no Node) but Chromium-only. CSS-selector interaction, `browser_press_key`, `browser_wait_for`, and `browser_pdf_save` route through a Playwright sidecar that needs `bun` or `node`. On Firefox, use the engine-agnostic primitives instead.
+- `browser_snapshot`, `browser_find`, ref-based interaction, and console/network listing are native (no Node) on Chromium and Firefox; on Firefox the accessibility tree is approximate. CSS-selector interaction, `browser_press_key`, `browser_wait_for`, and `browser_pdf_save` route through a Playwright sidecar that needs `bun` or `node` and a Chromium browser; on Firefox use refs instead of selectors.
 - Set `BROWSER_CONTROL_CAPTURE=0` in the MCP host env to disable console/network capture (it enables CDP `Runtime`, which some anti-bot scripts detect).
 
 Recovery

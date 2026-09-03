@@ -32,12 +32,32 @@
   return only path and dimensions), and `ref` clipping. The default output
   is unchanged.
 
+- Firefox (WebDriver BiDi) parity for the native tools: `browser_snapshot`,
+  `browser_find`, and ref-based `browser_click` / `browser_type` /
+  `browser_hover` / `browser_drag` / `browser_take_screenshot` work on Firefox
+  through an injected accessibility walker, a page-side ref registry, and
+  `input.performActions`; `browser_take_screenshot { full_page }` works on
+  Firefox via a document-origin clip. Console and network listing work on
+  Firefox through one BiDi `session.subscribe` (network needs Firefox 124+).
+  Still Chromium-only: `browser_network_body` and screenshot `max_width`.
+
 ### Changed
 
 - The transport's event broadcast capacity is 2048 (was 256) so a page load's
   burst of `Network.*` events does not lag the capture hub.
 - `browser-control --agent-instructions` documents the snapshot/ref workflow,
   screenshot hygiene, and console/network capture.
+- BiDi script results are flattened to plain JSON (objects arrive as
+  `[[key, value]]` pairs), so `browser_eval` and the page-freshness probe work
+  on Firefox; script exceptions surface as errors.
+
+### Fixed
+
+- Firefox does not end a WebDriver BiDi session when its WebSocket closes,
+  so the MCP server, `browser_select`, and the `tab` / `eval` / `curl` /
+  named-tab CLI paths left the browser refusing every later `session.new`
+  ("Maximum number of active sessions"). They now send `session.end` before
+  exiting.
 
 ## 1.1.0 — 2026-07-14
 

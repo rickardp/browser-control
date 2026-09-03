@@ -29,8 +29,9 @@ ref-based interaction).
   timers that fire while the user is idle. Push-only listeners are permitted
   (ADR-003): the MCP capture hub (`src/session/capture.rs`) keeps CDP
   `Runtime`/`Log`/`Network`/`Page` enabled on tabs the server has touched and
-  buffers browser-pushed events in memory; it never polls, never wakes on a
-  timer, and is torn down with the backend.
+  buffers browser-pushed events in memory (on Firefox it holds one BiDi
+  `session.subscribe` instead); it never polls, never wakes on a timer, and
+  is torn down with the backend.
 - **Always proceed.** Agent-facing tab/session ops must not surface
   `TabHung` / `TabCrashed` / `Closed` to the caller. Detect, recreate, retry
   once, and only then escalate with a typed error. The recover-once wrappers
@@ -66,14 +67,20 @@ ref-based interaction).
   `browser_get_page_text`, `browser_eval`, `browser_fetch`,
   `browser_take_screenshot`, `browser_storage_*`, `browser_cookies`, …) work
   on every supported browser including Firefox.
-- Native-CDP tools (`browser_snapshot`, `browser_find`, the `ref` path of
+- Native tools (`browser_snapshot`, `browser_find`, the `ref` path of
   `browser_click` / `browser_type` / `browser_hover` / `browser_drag` /
   `browser_take_screenshot`, `browser_console_messages`,
-  `browser_network_requests`, `browser_network_body`) are Chromium-only for
-  now and return `EngineUnsupported` on Firefox with a hint naming the
-  engine-agnostic alternative. Their BiDi arms live behind the `TabBackend`
-  seam (ADR-003). Element refs are `backendDOMNodeId`s bound to a document
-  token; a navigation makes them `StaleRef`, never a click on a recycled id.
+  `browser_network_requests`) work on both engines behind the `TabBackend`
+  seam (ADR-003): Chromium uses the CDP accessibility tree, `Input.*`, and
+  per-tab CDP sessions; Firefox uses an injected DOM walker with a page-side
+  ref registry, `input.performActions`, and one BiDi `session.subscribe`.
+  Element refs are bound to a document token; a navigation makes them
+  `StaleRef`, never a click on a recycled id. Chromium-only:
+  `browser_network_body` and screenshot `max_width`; both return
+  `EngineUnsupported` / are ignored on Firefox with a hint.
+- Any code path that opens a BiDi `TabBackend` must call
+  `TabBackend::shutdown` before exiting: Firefox keeps the session alive
+  after the socket closes and refuses the next `session.new` otherwise.
 - CSS-selector interaction, `browser_press_key`, `browser_wait_for`, and
   `browser_pdf_save` route through a lazily-spawned Node sidecar wrapping
   `playwright-core`; on Firefox they return `EngineUnsupported`.

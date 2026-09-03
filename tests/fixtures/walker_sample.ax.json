@@ -1,0 +1,1044 @@
+{
+ "nodes": [
+  {
+   "nodeId": "root",
+   "backendDOMNodeId": 4294967296,
+   "role": {
+    "value": "RootWebArea"
+   },
+   "name": {
+    "value": "Walker Sample"
+   },
+   "childIds": [
+    "n1",
+    "n5",
+    "n39"
+   ]
+  },
+  {
+   "nodeId": "n1",
+   "parentId": "root",
+   "backendDOMNodeId": 1,
+   "role": {
+    "value": "banner"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "n2"
+   ]
+  },
+  {
+   "nodeId": "n2",
+   "parentId": "n1",
+   "backendDOMNodeId": 2,
+   "role": {
+    "value": "navigation"
+   },
+   "name": {
+    "value": "Primary"
+   },
+   "childIds": [
+    "n3",
+    "n4"
+   ]
+  },
+  {
+   "nodeId": "n3",
+   "parentId": "n2",
+   "backendDOMNodeId": 3,
+   "role": {
+    "value": "link"
+   },
+   "name": {
+    "value": "Home"
+   },
+   "childIds": [
+    "t1"
+   ],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "url",
+     "value": {
+      "value": "file:///"
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t1",
+   "parentId": "n3",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Home"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n4",
+   "parentId": "n2",
+   "backendDOMNodeId": 4,
+   "role": {
+    "value": "link"
+   },
+   "name": {
+    "value": "Docs"
+   },
+   "childIds": [
+    "t2"
+   ],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "url",
+     "value": {
+      "value": "file:///docs"
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t2",
+   "parentId": "n4",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Docs"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n5",
+   "parentId": "root",
+   "backendDOMNodeId": 5,
+   "role": {
+    "value": "main"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "n6",
+    "n7",
+    "n9",
+    "n27",
+    "n28",
+    "n31",
+    "n38"
+   ]
+  },
+  {
+   "nodeId": "n6",
+   "parentId": "n5",
+   "backendDOMNodeId": 6,
+   "role": {
+    "value": "heading"
+   },
+   "name": {
+    "value": "Welcome"
+   },
+   "childIds": [
+    "t3"
+   ],
+   "properties": [
+    {
+     "name": "level",
+     "value": {
+      "value": 1
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t3",
+   "parentId": "n6",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Welcome"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n7",
+   "parentId": "n5",
+   "backendDOMNodeId": 7,
+   "role": {
+    "value": "paragraph"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "t4",
+    "n8",
+    "t6"
+   ]
+  },
+  {
+   "nodeId": "t4",
+   "parentId": "n7",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Intro paragraph with"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n8",
+   "parentId": "n7",
+   "backendDOMNodeId": 8,
+   "role": {
+    "value": "link"
+   },
+   "name": {
+    "value": "a link"
+   },
+   "childIds": [
+    "t5"
+   ],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "url",
+     "value": {
+      "value": "file:///more"
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t5",
+   "parentId": "n8",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "a link"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "t6",
+   "parentId": "n7",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "inside."
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n9",
+   "parentId": "n5",
+   "backendDOMNodeId": 9,
+   "role": {
+    "value": "form"
+   },
+   "name": {
+    "value": "Sign up"
+   },
+   "childIds": [
+    "n10",
+    "n11",
+    "n12",
+    "n13",
+    "n15",
+    "n20",
+    "n23",
+    "n24",
+    "n25",
+    "n26"
+   ]
+  },
+  {
+   "nodeId": "n10",
+   "parentId": "n9",
+   "backendDOMNodeId": 10,
+   "role": {
+    "value": "LabelText"
+   },
+   "name": {
+    "value": "Email address"
+   },
+   "childIds": [
+    "t7"
+   ]
+  },
+  {
+   "nodeId": "t7",
+   "parentId": "n10",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Email address"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n11",
+   "parentId": "n9",
+   "backendDOMNodeId": 11,
+   "role": {
+    "value": "textbox"
+   },
+   "name": {
+    "value": "Email address"
+   },
+   "childIds": [],
+   "description": {
+    "value": "you@example.com"
+   },
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "required",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "n12",
+   "parentId": "n9",
+   "backendDOMNodeId": 12,
+   "role": {
+    "value": "searchbox"
+   },
+   "name": {
+    "value": "Search the site"
+   },
+   "childIds": [],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "n13",
+   "parentId": "n9",
+   "backendDOMNodeId": 13,
+   "role": {
+    "value": "LabelText"
+   },
+   "name": {
+    "value": "Subscribe"
+   },
+   "childIds": [
+    "n14",
+    "t8"
+   ]
+  },
+  {
+   "nodeId": "n14",
+   "parentId": "n13",
+   "backendDOMNodeId": 14,
+   "role": {
+    "value": "checkbox"
+   },
+   "name": {
+    "value": "Subscribe"
+   },
+   "childIds": [],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "checked",
+     "value": {
+      "value": "true"
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t8",
+   "parentId": "n13",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Subscribe"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n15",
+   "parentId": "n9",
+   "backendDOMNodeId": 15,
+   "role": {
+    "value": "group"
+   },
+   "name": {
+    "value": "Plan"
+   },
+   "childIds": [
+    "t9",
+    "n16",
+    "n18"
+   ]
+  },
+  {
+   "nodeId": "t9",
+   "parentId": "n15",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Plan"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n16",
+   "parentId": "n15",
+   "backendDOMNodeId": 16,
+   "role": {
+    "value": "LabelText"
+   },
+   "name": {
+    "value": "Free"
+   },
+   "childIds": [
+    "n17",
+    "t10"
+   ]
+  },
+  {
+   "nodeId": "n17",
+   "parentId": "n16",
+   "backendDOMNodeId": 17,
+   "role": {
+    "value": "radio"
+   },
+   "name": {
+    "value": "Free"
+   },
+   "childIds": [],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "checked",
+     "value": {
+      "value": "true"
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t10",
+   "parentId": "n16",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Free"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n18",
+   "parentId": "n15",
+   "backendDOMNodeId": 18,
+   "role": {
+    "value": "LabelText"
+   },
+   "name": {
+    "value": "Pro"
+   },
+   "childIds": [
+    "n19",
+    "t11"
+   ]
+  },
+  {
+   "nodeId": "n19",
+   "parentId": "n18",
+   "backendDOMNodeId": 19,
+   "role": {
+    "value": "radio"
+   },
+   "name": {
+    "value": "Pro"
+   },
+   "childIds": [],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "checked",
+     "value": {
+      "value": "false"
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t11",
+   "parentId": "n18",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Pro"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n20",
+   "parentId": "n9",
+   "backendDOMNodeId": 20,
+   "role": {
+    "value": "combobox"
+   },
+   "name": {
+    "value": "Country"
+   },
+   "childIds": [
+    "n21",
+    "n22"
+   ],
+   "value": {
+    "value": "Norway"
+   },
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "n21",
+   "parentId": "n20",
+   "backendDOMNodeId": 21,
+   "role": {
+    "value": "option"
+   },
+   "name": {
+    "value": "Sweden"
+   },
+   "childIds": [
+    "t12"
+   ]
+  },
+  {
+   "nodeId": "t12",
+   "parentId": "n21",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Sweden"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n22",
+   "parentId": "n20",
+   "backendDOMNodeId": 22,
+   "role": {
+    "value": "option"
+   },
+   "name": {
+    "value": "Norway"
+   },
+   "childIds": [
+    "t13"
+   ],
+   "properties": [
+    {
+     "name": "selected",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t13",
+   "parentId": "n22",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Norway"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n23",
+   "parentId": "n9",
+   "backendDOMNodeId": 23,
+   "role": {
+    "value": "textbox"
+   },
+   "name": {
+    "value": "Notes"
+   },
+   "childIds": [],
+   "value": {
+    "value": "Some notes"
+   },
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "n24",
+   "parentId": "n9",
+   "backendDOMNodeId": 24,
+   "role": {
+    "value": "button"
+   },
+   "name": {
+    "value": "Create account"
+   },
+   "childIds": [
+    "t14"
+   ],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t14",
+   "parentId": "n24",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Create account"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n25",
+   "parentId": "n9",
+   "backendDOMNodeId": 25,
+   "role": {
+    "value": "button"
+   },
+   "name": {
+    "value": "Disabled"
+   },
+   "childIds": [
+    "t15"
+   ],
+   "properties": [
+    {
+     "name": "disabled",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t15",
+   "parentId": "n25",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Disabled"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n26",
+   "parentId": "n9",
+   "backendDOMNodeId": 26,
+   "role": {
+    "value": "button"
+   },
+   "name": {
+    "value": "Close dialog"
+   },
+   "childIds": [],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "n27",
+   "parentId": "n5",
+   "backendDOMNodeId": 27,
+   "role": {
+    "value": "button"
+   },
+   "name": {
+    "value": "Shadow button"
+   },
+   "childIds": [
+    "t16"
+   ],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t16",
+   "parentId": "n27",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Shadow button"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n28",
+   "parentId": "n5",
+   "backendDOMNodeId": 28,
+   "role": {
+    "value": "group"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "n29",
+    "n30"
+   ]
+  },
+  {
+   "nodeId": "n29",
+   "parentId": "n28",
+   "backendDOMNodeId": 29,
+   "role": {
+    "value": "button"
+   },
+   "name": {
+    "value": "More info"
+   },
+   "childIds": [
+    "t17"
+   ],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    },
+    {
+     "name": "expanded",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "t17",
+   "parentId": "n29",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "More info"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n30",
+   "parentId": "n28",
+   "backendDOMNodeId": 30,
+   "role": {
+    "value": "paragraph"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "t18"
+   ]
+  },
+  {
+   "nodeId": "t18",
+   "parentId": "n30",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Details body"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n31",
+   "parentId": "n5",
+   "backendDOMNodeId": 31,
+   "role": {
+    "value": "table"
+   },
+   "name": {
+    "value": "Prices"
+   },
+   "childIds": [
+    "t19",
+    "n32",
+    "n35"
+   ]
+  },
+  {
+   "nodeId": "t19",
+   "parentId": "n31",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Prices"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n32",
+   "parentId": "n31",
+   "backendDOMNodeId": 32,
+   "role": {
+    "value": "row"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "n33",
+    "n34"
+   ]
+  },
+  {
+   "nodeId": "n33",
+   "parentId": "n32",
+   "backendDOMNodeId": 33,
+   "role": {
+    "value": "columnheader"
+   },
+   "name": {
+    "value": "Item"
+   },
+   "childIds": [
+    "t20"
+   ]
+  },
+  {
+   "nodeId": "t20",
+   "parentId": "n33",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Item"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n34",
+   "parentId": "n32",
+   "backendDOMNodeId": 34,
+   "role": {
+    "value": "columnheader"
+   },
+   "name": {
+    "value": "Cost"
+   },
+   "childIds": [
+    "t21"
+   ]
+  },
+  {
+   "nodeId": "t21",
+   "parentId": "n34",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Cost"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n35",
+   "parentId": "n31",
+   "backendDOMNodeId": 35,
+   "role": {
+    "value": "row"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "n36",
+    "n37"
+   ]
+  },
+  {
+   "nodeId": "n36",
+   "parentId": "n35",
+   "backendDOMNodeId": 36,
+   "role": {
+    "value": "cell"
+   },
+   "name": {
+    "value": "Widget"
+   },
+   "childIds": [
+    "t22"
+   ]
+  },
+  {
+   "nodeId": "t22",
+   "parentId": "n36",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Widget"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n37",
+   "parentId": "n35",
+   "backendDOMNodeId": 37,
+   "role": {
+    "value": "cell"
+   },
+   "name": {
+    "value": "3"
+   },
+   "childIds": [
+    "t23"
+   ]
+  },
+  {
+   "nodeId": "t23",
+   "parentId": "n37",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "3"
+   },
+   "childIds": []
+  },
+  {
+   "nodeId": "n38",
+   "parentId": "n5",
+   "backendDOMNodeId": 38,
+   "role": {
+    "value": "Iframe"
+   },
+   "name": {
+    "value": "Embedded"
+   },
+   "childIds": [],
+   "properties": [
+    {
+     "name": "focusable",
+     "value": {
+      "value": true
+     }
+    }
+   ]
+  },
+  {
+   "nodeId": "n39",
+   "parentId": "root",
+   "backendDOMNodeId": 39,
+   "role": {
+    "value": "contentinfo"
+   },
+   "name": {
+    "value": ""
+   },
+   "childIds": [
+    "t24"
+   ]
+  },
+  {
+   "nodeId": "t24",
+   "parentId": "n39",
+   "role": {
+    "value": "StaticText"
+   },
+   "name": {
+    "value": "Footer text"
+   },
+   "childIds": []
+  }
+ ],
+ "truncated": false
+}

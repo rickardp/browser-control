@@ -594,17 +594,16 @@ fn console_entry_from_bidi(p: &Value) -> Option<ConsoleEntry> {
             "console.{}",
             if method == "warn" { "warning" } else { method }
         );
-        let text = match p["text"].as_str() {
-            Some(t) => t.to_string(),
-            None => p["args"]
-                .as_array()
-                .map(|args| {
-                    args.iter()
-                        .map(|a| render_bidi_value(a, false))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default(),
+        // Firefox formats object arguments in `text` as `[object Object]`,
+        // so render the structured `args` when present and fall back to
+        // `text` only when the entry carries none.
+        let text = match p["args"].as_array().filter(|a| !a.is_empty()) {
+            Some(args) => args
+                .iter()
+                .map(|a| render_bidi_value(a, false))
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => p["text"].as_str().unwrap_or_default().to_string(),
         };
         (level, source, text, None)
     };
@@ -2248,9 +2247,12 @@ mod tests {
                     },
                 )
                 .await
-                .map(|r| r.matched)
-                .unwrap_or(0)
-                > 0
+                .map(|r| {
+                    r.entries
+                        .first()
+                        .is_some_and(|e| e.state == NetState::Finished)
+                })
+                .unwrap_or(false)
             {
                 break;
             }

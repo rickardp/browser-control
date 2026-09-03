@@ -31,6 +31,7 @@ use crate::cdp::CdpClient;
 use crate::cli::cookies::{normalize_bidi, normalize_cdp, NormalCookie};
 use crate::errors::SessionError;
 use crate::session::freshness;
+use crate::session::input_bidi;
 use crate::session::targets::{BidiContext, CdpTarget};
 
 /// Wall-clock bound for `navigate`/`screenshot`. `evaluate` takes its
@@ -138,6 +139,25 @@ pub struct LiveTarget {
     pub id: String,
     pub url: String,
     pub title: String,
+}
+
+/// Bound a BiDi operation so a wedged context surfaces as recoverable
+/// `TabHung` rather than the 30 s transport timeout.
+async fn bidi_bounded<T>(
+    target_id: &str,
+    timeout: Duration,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(SessionError::TabHung {
+            target_id: Some(target_id.to_string()),
+            url: None,
+            timeout_ms: timeout.as_millis() as u64,
+            hint: "op-timeout",
+        }
+        .into()),
+    }
 }
 
 impl TabBackend {
@@ -618,41 +638,36 @@ impl TabBackend {
                         "quality": f64::from(opts.quality.unwrap_or(DEFAULT_JPEG_QUALITY)) / 100.0,
                     })),
                 };
-                let fut =
-                    c.browsing_context_capture_screenshot(target_id, opts.clip.clone(), format);
-                match tokio::time::timeout(NAV_OP_TIMEOUT, fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(SessionError::TabHung {
-                        target_id: Some(target_id.to_string()),
-                        url: None,
-                        timeout_ms: NAV_OP_TIMEOUT.as_millis() as u64,
-                        hint: "op-timeout",
-                    }
-                    .into()),
-                }
+                // BiDi has no full-page flag; a document-origin box clip of
+                // the document's scroll size captures the whole page.
+                // `max_width` has no BiDi equivalent (no `scale`) and is
+                // ignored here.
+                let full_page = opts.full_page && opts.clip.is_none();
+                let clip = opts.clip.clone();
+                bidi_bounded(target_id, NAV_OP_TIMEOUT, async move {
+                    let clip = if full_page {
+                        let (w, h) = input_bidi::document_size(c, target_id).await?;
+                        Some(json!({ "x": 0, "y": 0, "width": w, "height": h }))
+                    } else {
+                        clip
+                    };
+                    c.browsing_context_capture_screenshot(target_id, clip, format)
+                        .await
+                })
+                .await
             }
         }
     }
 
     // -----------------------------------------------------------------
-    // Native CDP accessibility + input (ref-based interaction).
+    // Native accessibility + input (ref-based interaction).
     //
-    // These are Chromium-only for now: the BiDi arm returns a typed
-    // `EngineUnsupported` so the seam stays in one place when a BiDi
-    // implementation (`browsingContext.locateNodes` + `input.performActions`)
-    // lands. The MCP tool layer checks the engine before calling, so the
-    // BiDi arms are a defensive fallback rather than the primary error path.
+    // CDP uses the browser's accessibility tree and `Input.*` on a transient
+    // session (`crate::session::input`); BiDi uses an injected DOM walker
+    // with a page-side ref registry and `input.performActions`
+    // (`crate::session::input_bidi`). Both feed the shared `crate::a11y`
+    // renderer and ref table.
     // -----------------------------------------------------------------
-
-    fn native_unsupported(&self, op: &str) -> anyhow::Error {
-        SessionError::EngineUnsupported {
-            tool: op.to_string(),
-            required_engine: "Chromium (CDP)".into(),
-            current_engine: "Bidi".into(),
-            hint: "ref-based interaction is native CDP only; use browser_get_page_text, browser_get_html, or browser_eval on Firefox, or switch to a Chromium browser via browser_select",
-        }
-        .into()
-    }
 
     /// Full accessibility tree (`Accessibility.getFullAXTree`). `depth`
     /// bounds the tree the browser serialises; `None` means everything.
@@ -682,7 +697,14 @@ impl TabBackend {
                 )
                 .await
             }
-            TabBackend::Bidi(_) => Err(self.native_unsupported("accessibility_tree")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::accessibility_tree(c, target_id),
+                )
+                .await
+            }
         }
     }
 
@@ -698,7 +720,9 @@ impl TabBackend {
                 )
                 .await
             }
-            TabBackend::Bidi(_) => Err(self.native_unsupported("document_token")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(target_id, timeout, input_bidi::document_token(c, target_id)).await
+            }
         }
     }
 
@@ -718,7 +742,14 @@ impl TabBackend {
                 |sid| async move { crate::session::input::click(c, &sid, backend_node_id).await },
             )
             .await,
-            TabBackend::Bidi(_) => Err(self.native_unsupported("click_node")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::click(c, target_id, backend_node_id),
+                )
+                .await
+            }
         }
     }
 
@@ -737,7 +768,14 @@ impl TabBackend {
                 |sid| async move { crate::session::input::hover(c, &sid, backend_node_id).await },
             )
             .await,
-            TabBackend::Bidi(_) => Err(self.native_unsupported("hover_node")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::hover(c, target_id, backend_node_id),
+                )
+                .await
+            }
         }
     }
 
@@ -773,7 +811,21 @@ impl TabBackend {
                 )
                 .await
             }
-            TabBackend::Bidi(_) => Err(self.native_unsupported("type_into_node")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::type_text(
+                        c,
+                        target_id,
+                        backend_node_id,
+                        text,
+                        press_sequentially,
+                        submit,
+                    ),
+                )
+                .await
+            }
         }
     }
 
@@ -795,7 +847,9 @@ impl TabBackend {
                 )
                 .await
             }
-            TabBackend::Bidi(_) => Err(self.native_unsupported("drag_nodes")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(target_id, timeout, input_bidi::drag(c, target_id, from, to)).await
+            }
         }
     }
 
@@ -819,7 +873,14 @@ impl TabBackend {
                 )
                 .await
             }
-            TabBackend::Bidi(_) => Err(self.native_unsupported("node_clip_rect")),
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::node_clip_rect(c, target_id, backend_node_id),
+                )
+                .await
+            }
         }
     }
 
@@ -1053,10 +1114,20 @@ mod tests {
     }
 
     async fn spawn_bidi_mock() -> (String, oneshot::Sender<()>) {
+        let (url, stop, _captures) = spawn_bidi_mock_with_captures().await;
+        (url, stop)
+    }
+
+    /// Same mock, also returning the recorded `captureScreenshot` params.
+    async fn spawn_bidi_mock_with_captures() -> (String, oneshot::Sender<()>, Arc<Mutex<Vec<Value>>>)
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        let captures = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captures_task = captures.clone();
         tokio::spawn(async move {
+            let captures = captures_task;
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut next_ctx = 0u32;
@@ -1091,7 +1162,18 @@ mod tests {
                                     json!({})
                                 }
                                 "browsingContext.navigate" => json!({"navigation": "N1"}),
+                                "script.evaluate"
+                                    if req["params"]["expression"]
+                                        .as_str()
+                                        .is_some_and(|e| e.contains("scrollWidth")) =>
+                                {
+                                    json!({"type": "success", "result": {"type": "string", "value": "{\"width\":1000,\"height\":3000}"}, "realm": "R1"})
+                                }
                                 "script.evaluate" => json!({"type": "success", "result": {"type": "number", "value": 9}, "realm": "R1"}),
+                                "browsingContext.captureScreenshot" => {
+                                    captures.lock().await.push(req["params"].clone());
+                                    json!({"data": "PNG"})
+                                }
                                 "browsingContext.getTree" => {
                                     let contexts: Vec<Value> = live
                                         .iter()
@@ -1110,7 +1192,7 @@ mod tests {
                 }
             }
         });
-        (format!("ws://{addr}"), stop_tx)
+        (format!("ws://{addr}"), stop_tx, captures)
     }
 
     async fn spawn_cdp_freshness_mock() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -1342,5 +1424,36 @@ mod tests {
         backend.close_tab(&c1).await.unwrap();
         let live = backend.live_target_ids().await.unwrap();
         assert!(!live.contains(&c1));
+    }
+
+    #[tokio::test]
+    async fn bidi_full_page_screenshot_uses_document_clip() {
+        let (url, _stop, captures) = spawn_bidi_mock_with_captures().await;
+        let backend = open_backend(&url, crate::detect::Engine::Bidi)
+            .await
+            .unwrap();
+        let c1 = backend.create_tab("about:blank").await.unwrap();
+        backend
+            .screenshot(
+                &c1,
+                &ScreenshotOptions {
+                    full_page: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .screenshot(&c1, &ScreenshotOptions::default())
+            .await
+            .unwrap();
+        let caps = captures.lock().await;
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0]["origin"], "document");
+        assert_eq!(caps[0]["clip"]["type"], "box");
+        assert_eq!(caps[0]["clip"]["width"], json!(1000.0));
+        assert_eq!(caps[0]["clip"]["height"], json!(3000.0));
+        assert!(caps[1].get("clip").is_none());
+        backend.shutdown().await;
     }
 }

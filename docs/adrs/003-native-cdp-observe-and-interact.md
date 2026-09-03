@@ -87,6 +87,29 @@ dependency on the path agents use most (clicking what they just read).
 5. **Chromium first, BiDi behind the seam.** Every new `TabBackend` method
    has a BiDi arm returning `EngineUnsupported` with a hint naming the
    engine-agnostic alternative. `browser_get_page_text` is engine-agnostic.
+
+   *Addendum 2026-09-03.* The BiDi arms landed. Capture on Firefox rides one
+   global `session.subscribe` per backend (`log.entryAdded`,
+   `browsingContext.navigationStarted` / `contextDestroyed`, and, when the
+   browser accepts it, `network.beforeRequestSent` / `responseCompleted` /
+   `fetchError`); the browsing-context id is the target id. Refs on Firefox
+   come from an injected DOM walker (`src/dom/js/snapshot_tree.js`) that
+   emits `getFullAXTree`-shaped JSON with integer ids held in a page-side
+   registry and a random per-document token, rather than from
+   `browsingContext.locateNodes`: `locateNodes` yields node handles but no
+   roles or names, so JS is needed anyway, and a page-side integer registry
+   avoids `resultOwnership: "root"` handle bookkeeping. Input is
+   `input.performActions` at JS-computed viewport coordinates; typing goes
+   through in-page `execCommand('insertText')` with a value-setter fallback.
+   Remaining Chromium-only surface: `browser_network_body` (BiDi exposes
+   bodies only through browser-side data collectors, which the owner chose
+   not to enable) and screenshot `max_width` (BiDi has no scale). Known
+   Firefox gaps: approximate accessible names, closed shadow roots and
+   cross-origin iframes are invisible to the walker, iframe traffic is not
+   captured (child contexts), and Firefox does not log failed resource loads
+   to the console. Firefox also does not end a BiDi session when its socket
+   closes, so `TabBackend::shutdown` now sends `session.end` at MCP exit,
+   browser switch, and CLI command end.
 6. **Screenshot defaults are unchanged.** `browser_take_screenshot` keeps its
    viewport PNG; `format`, `quality`, `max_width`, `save_to`, and `ref` are
    opt-in so agents can keep pixels small or out of context entirely.
@@ -124,9 +147,12 @@ dependency on the path agents use most (clicking what they just read).
 
 ### Follow-ups
 
-- BiDi arms for capture (`session.subscribe` to `log.entryAdded`,
-  `network.*`) and for refs (`browsingContext.locateNodes`,
-  `input.performActions`). **Status:** deferred.
+- BiDi arms for capture and refs. **Status:** landed 2026-09-03 (see the
+  addendum under Decision 5).
+- Iframe capture on Firefox via `browsingContext.contextCreated` (has
+  `parent`) and a child→top context map. **Status:** deferred.
+- Run the BiDi walker in a sandbox realm so pages cannot clobber the
+  registry. **Status:** deferred.
 - Occlusion check before ref clicks (`DOM.getNodeForLocation`). **Status:**
   deferred.
 - OOPIF and worker capture via `Target.setAutoAttach` on the hub session.

@@ -151,14 +151,13 @@ impl ServerState {
         Ok(())
     }
 
-    /// Engine gate for the native ref-based tools (`browser_snapshot`,
-    /// `browser_find`, `ref` on click/type/hover/drag/screenshot).
-    pub async fn ensure_native_input_supported(&self, tool_name: &str) -> Result<()> {
-        self.ensure_cdp_engine(
-            tool_name,
-            "ref-based interaction and browser_snapshot are native CDP; on Firefox use browser_get_page_text, browser_get_html, or browser_eval, or switch to a Chromium browser via browser_select",
-        )
-        .await
+    /// Preflight for the native ref-based tools (`browser_snapshot`,
+    /// `browser_find`, `ref` on click/type/hover/drag/screenshot). Both
+    /// engines are supported (CDP accessibility tree + `Input.*`, or the
+    /// BiDi DOM walker + `input.performActions`), so this only checks that
+    /// the active browser is still alive before any protocol I/O.
+    pub async fn ensure_native_ready(&self, _tool_name: &str) -> Result<()> {
+        self.ensure_active_browser_alive().await
     }
 
     /// Lazy-spawn the Playwright sidecar against the current browser.

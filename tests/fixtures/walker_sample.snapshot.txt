@@ -1,0 +1,63 @@
+- banner
+  - navigation "Primary" [ref=e1]
+    - link "Home" [ref=e2] [url="file:///"]
+      - text: Home
+    - link "Docs" [ref=e3] [url="file:///docs"]
+      - text: Docs
+- main
+  - heading "Welcome" [ref=e4] [level=1]
+    - text: Welcome
+  - paragraph
+    - text: Intro paragraph with
+    - link "a link" [ref=e5] [url="file:///more"]
+      - text: a link
+    - text: inside.
+  - form "Sign up" [ref=e6]
+    - LabelText "Email address" [ref=e7]
+      - text: Email address
+    - textbox "Email address" [ref=e8] [required]
+    - searchbox "Search the site" [ref=e9]
+    - LabelText "Subscribe" [ref=e10]
+      - checkbox "Subscribe" [ref=e11] [checked]
+      - text: Subscribe
+    - group "Plan" [ref=e12]
+      - text: Plan
+      - LabelText "Free" [ref=e13]
+        - radio "Free" [ref=e14] [checked]
+        - text: Free
+      - LabelText "Pro" [ref=e15]
+        - radio "Pro" [ref=e16]
+        - text: Pro
+    - combobox "Country" [ref=e17] [value="Norway"]
+      - option "Sweden" [ref=e18]
+        - text: Sweden
+      - option "Norway" [ref=e19] [selected]
+        - text: Norway
+    - textbox "Notes" [ref=e20] [value="Some notes"]
+    - button "Create account" [ref=e21]
+      - text: Create account
+    - button "Disabled" [ref=e22] [disabled]
+      - text: Disabled
+    - button "Close dialog" [ref=e23]
+  - button "Shadow button" [ref=e24]
+    - text: Shadow button
+  - group
+    - button "More info" [ref=e25] [expanded]
+      - text: More info
+    - paragraph
+      - text: Details body
+  - table "Prices" [ref=e26]
+    - text: Prices
+    - row
+      - columnheader "Item" [ref=e27]
+        - text: Item
+      - columnheader "Cost" [ref=e28]
+        - text: Cost
+    - row
+      - cell "Widget" [ref=e29]
+        - text: Widget
+      - cell "3" [ref=e30]
+        - text: 3
+  - Iframe "Embedded" [ref=e31]
+- contentinfo
+  - text: Footer text
