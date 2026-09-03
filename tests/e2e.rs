@@ -65,6 +65,7 @@ fn mcp_tools_list_returns_full_set() {
         "browser_tab_new",
         "browser_tab_select",
         "browser_tab_close",
+        "browser_tab_foreground",
         // Browser management.
         "browser_start",
         "browser_select",

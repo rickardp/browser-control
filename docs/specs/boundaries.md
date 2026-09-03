@@ -4,8 +4,8 @@ Rules and constraints for AI agents working in this codebase. This describes
 the current Rust CLI. The original TypeScript implementation is preserved on
 the `legacy-ts` branch (tag `v0-final-ts`); its boundaries are archived in
 `docs/adrs/archive/`. The authoritative design records are ADR-001 (Rust CLI
-rewrite), ADR-002 (CLI lifecycle), and ADR-003 (native CDP observation and
-ref-based interaction).
+rewrite), ADR-002 (CLI lifecycle), ADR-003 (native CDP observation and
+ref-based interaction), and ADR-004 (foreground emulation).
 
 ## Code Style
 

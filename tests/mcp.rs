@@ -113,6 +113,7 @@ async fn registered_tools_list_contains_full_playwright_shaped_set() {
         "browser_tab_new",
         "browser_tab_select",
         "browser_tab_close",
+        "browser_tab_foreground",
         "browser_select",
         "browser_list",
         "browser_show",

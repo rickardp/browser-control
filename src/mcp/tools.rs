@@ -87,6 +87,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_tab_new());
     registry.register(make_tab_select());
     registry.register(make_tab_close());
+    registry.register(make_tab_foreground());
     // New browser-management tools.
     registry.register(make_browser_start());
     registry.register(make_browser_select());
@@ -1022,7 +1023,8 @@ fn make_tab_list() -> RegisteredTool {
     RegisteredTool {
         name: "browser_tab_list".into(),
         description: "List open tabs in the active browser, Playwright-shaped \
-                      (`[{target_id, url, title, active}]`). Titles are empty on Firefox."
+                      (`[{target_id, url, title, active, foreground}]`). Titles are empty on \
+                      Firefox; `foreground` reports foreground emulation."
             .into(),
         input_schema: json!({"type": "object", "properties": {}}),
         handler: handler(|state, _args| {
@@ -1041,6 +1043,7 @@ async fn tab_list_value(state: &ServerState) -> Result<Value> {
     let backend = state.ensure_backend().await?;
     let targets = backend.live_targets().await?;
     let active = state.active_target_id.lock().await.clone();
+    let foreground = state.capture.foreground_tabs();
     let arr: Vec<Value> = targets
         .into_iter()
         .map(|t| {
@@ -1049,6 +1052,7 @@ async fn tab_list_value(state: &ServerState) -> Result<Value> {
                 "url": t.url,
                 "title": t.title,
                 "active": active.as_deref() == Some(t.id.as_str()),
+                "foreground": foreground.contains(&t.id),
             })
         })
         .collect();
@@ -1066,14 +1070,31 @@ fn make_tab_new() -> RegisteredTool {
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Optional named-tab id (a-z, 0-9, '-', '_')." },
-                "url": { "type": "string", "description": "Optional URL; defaults to about:blank." }
+                "url": { "type": "string", "description": "Optional URL; defaults to about:blank." },
+                "foreground": { "type": "boolean", "description": "Emulate a focused, visible foreground for this tab (see browser_tab_foreground). Chromium only." }
             },
         }),
         handler: handler(|state, args| {
             Box::pin(async move {
+                let foreground = match args.get("foreground") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => return Err(anyhow!("`foreground` must be a boolean")),
+                };
+                if foreground.is_some() {
+                    state
+                        .ensure_cdp_engine("browser_tab_new", FOREGROUND_HINT)
+                        .await?;
+                }
                 if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
                     let url = args.get("url").and_then(|v| v.as_str());
-                    let opened = open_or_create_named_tab(&state, name, url).await?;
+                    let mut opened = open_or_create_named_tab(&state, name, url).await?;
+                    if let Some(fg) = foreground {
+                        let backend = state.ensure_backend().await?;
+                        let tid = opened["target_id"].as_str().unwrap_or_default().to_string();
+                        state.capture.set_foreground(&backend, &tid, fg).await?;
+                        opened["foreground"] = json!(fg);
+                    }
                     return Ok(text_content(serde_json::to_string_pretty(&opened)?));
                 }
                 let url = args
@@ -1084,11 +1105,15 @@ fn make_tab_new() -> RegisteredTool {
                 let backend = state.ensure_backend().await?;
                 let tid = backend.create_tab(&url).await?;
                 *state.active_target_id.lock().await = Some(tid.clone());
-                state.capture.touch(&backend, &tid);
+                state.capture.touch_with(&backend, &tid, foreground);
+                if let Some(fg) = foreground {
+                    state.capture.set_foreground(&backend, &tid, fg).await?;
+                }
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": tid,
                     "url": url,
                     "active": true,
+                    "foreground": state.capture.foreground_tabs().contains(&tid),
                 }))?))
             })
         }),
@@ -1192,7 +1217,8 @@ fn make_tab_select() -> RegisteredTool {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "target_id": { "type": "string" }
+                "target_id": { "type": "string" },
+                "foreground": { "type": "boolean", "description": "Emulate a focused, visible foreground for this tab (see browser_tab_foreground). Chromium only." }
             },
             "required": ["target_id"],
         }),
@@ -1204,6 +1230,16 @@ fn make_tab_select() -> RegisteredTool {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing 'target_id'"))?
                     .to_string();
+                let foreground = match args.get("foreground") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => return Err(anyhow!("`foreground` must be a boolean")),
+                };
+                if foreground.is_some() {
+                    state
+                        .ensure_cdp_engine("browser_tab_select", FOREGROUND_HINT)
+                        .await?;
+                }
                 let backend = state.ensure_backend().await?;
                 let live = backend.live_target_ids().await?;
                 if !live.contains(&tid) {
@@ -1236,11 +1272,58 @@ fn make_tab_select() -> RegisteredTool {
                     .into());
                 }
                 *state.active_target_id.lock().await = Some(tid.clone());
-                state.capture.touch(&backend, &tid);
+                state.capture.touch_with(&backend, &tid, foreground);
+                if let Some(fg) = foreground {
+                    state.capture.set_foreground(&backend, &tid, fg).await?;
+                }
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": tid,
                     "active": true,
+                    "foreground": state.capture.foreground_tabs().contains(&tid),
                 }))?))
+            })
+        }),
+    }
+}
+
+const FOREGROUND_HINT: &str = "foreground emulation uses CDP Emulation.setFocusEmulationEnabled; Firefox has no WebDriver BiDi equivalent, so switch to a Chromium browser via browser_select";
+
+fn make_tab_foreground() -> RegisteredTool {
+    RegisteredTool {
+        name: "browser_tab_foreground".into(),
+        description: "Make a tab behave as if it were the focused, visible foreground tab on an \
+                      unlocked display, even while the browser window is minimized or the \
+                      machine's display is locked: `document.visibilityState` reports \
+                      `visible`, `document.hasFocus()` is true, `requestAnimationFrame` and \
+                      timers run at full rate, and screenshots show live content. Use it for \
+                      games, canvas apps, and anything that pauses in the background. Stays on \
+                      until disabled, the tab closes, or the MCP server exits; `browser-control \
+                      set foreground always` turns it on for every tab. Chromium only."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": tab_args_properties(json!({
+                "enabled": { "type": "boolean", "description": "Default true; false turns emulation off again." }
+            })),
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let enabled = bool_arg(&args, "enabled", true)?;
+                state
+                    .ensure_cdp_engine("browser_tab_foreground", FOREGROUND_HINT)
+                    .await?;
+                let (backend, target_id) = state.resolve_target_for_args(&args).await?;
+                state
+                    .capture
+                    .set_foreground(&backend, &target_id, enabled)
+                    .await?;
+                Ok(text_content(if enabled {
+                    format!(
+                        "foreground emulation on for tab {target_id}: the page reports visible and focused, and requestAnimationFrame/timers run at full rate while the window is minimized or the display is locked. Stays on until disabled, the tab closes, or the MCP server exits."
+                    )
+                } else {
+                    format!("foreground emulation off for tab {target_id}")
+                }))
             })
         }),
     }
@@ -2726,6 +2809,7 @@ mod tests {
         "browser_tab_new",
         "browser_tab_select",
         "browser_tab_close",
+        "browser_tab_foreground",
         "browser_start",
         "browser_select",
         "browser_list",
@@ -3924,6 +4008,82 @@ mod tests {
             .await
             .unwrap();
         assert!(state.capture.captured_tabs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tab_foreground_toggles_emulation_and_shows_in_tab_list() {
+        let mock = spawn_a11y_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Cdp,
+            endpoint: mock.endpoint.clone(),
+            source: Source::External,
+        });
+        let route = json!({"target": "example\\.com"});
+        let out = handler_for("browser_tab_foreground")(state.clone(), route.clone())
+            .await
+            .unwrap();
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("foreground emulation on for tab T1"));
+        {
+            let reqs = mock.requests.lock().await;
+            let focus = reqs
+                .iter()
+                .find(|r| r["method"] == "Emulation.setFocusEmulationEnabled")
+                .expect("focus emulation");
+            assert_eq!(focus["params"]["enabled"], true);
+            assert!(focus["sessionId"].is_string());
+            assert!(reqs
+                .iter()
+                .any(|r| r["method"] == "Emulation.setIdleOverride"
+                    && r["params"]["isScreenUnlocked"] == true));
+        }
+        let list = handler_for("browser_tab_list")(state.clone(), json!({}))
+            .await
+            .unwrap();
+        let rows: Value =
+            serde_json::from_str(list["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(rows[0]["foreground"], true);
+
+        let mut off = route.clone();
+        off["enabled"] = json!(false);
+        handler_for("browser_tab_foreground")(state.clone(), off)
+            .await
+            .unwrap();
+        let reqs = mock.requests.lock().await;
+        assert!(reqs
+            .iter()
+            .any(|r| r["method"] == "Emulation.setFocusEmulationEnabled"
+                && r["params"]["enabled"] == false));
+        assert!(state.capture.foreground_tabs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tab_foreground_is_chromium_only() {
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Bidi,
+            endpoint: "ws://127.0.0.1:0".into(),
+            source: Source::External,
+        });
+        for (tool, args) in [
+            ("browser_tab_foreground", json!({})),
+            ("browser_tab_new", json!({"foreground": true})),
+            (
+                "browser_tab_select",
+                json!({"target_id": "C1", "foreground": true}),
+            ),
+        ] {
+            let err = handler_for(tool)(state.clone(), args)
+                .await
+                .expect_err("BiDi must error");
+            match err.downcast_ref::<SessionError>() {
+                Some(SessionError::EngineUnsupported { hint, .. }) => {
+                    assert!(hint.contains("setFocusEmulationEnabled"))
+                }
+                other => panic!("{tool}: expected EngineUnsupported, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

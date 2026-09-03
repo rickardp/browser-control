@@ -43,6 +43,15 @@
   Every remaining Chromium/Firefox difference is listed in
   `docs/engine-parity.md`.
 
+- `browser_tab_foreground` (ADR-004): make a Chromium tab behave as the
+  focused, visible foreground tab while the window is minimized or the
+  display is locked, so `requestAnimationFrame` and timers run at full rate,
+  `document.visibilityState` / `document.hasFocus()` report foreground, and
+  screenshots show live content. Also `foreground: true` on `browser_tab_new`
+  / `browser_tab_select`, a `foreground` flag in `browser_tab_list`, and a
+  server-wide default via `browser-control set foreground always` or
+  `BROWSER_CONTROL_FOREGROUND=1`. Rides the capture hub's long-lived session.
+
 ### Changed
 
 - The transport's event broadcast capacity is 2048 (was 256) so a page load's

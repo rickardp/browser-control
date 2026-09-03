@@ -196,8 +196,8 @@ The server exposes three groups of tools:
   walker, so names and roles are approximate and closed shadow roots are not
   visible.
 - **Chromium-only extras**: `browser_network_body` (Firefox exposes no
-  captured bodies; use `browser_fetch` there) and screenshot `max_width`
-  (BiDi has no scale).
+  captured bodies; use `browser_fetch` there), screenshot `max_width` (BiDi
+  has no scale), and `browser_tab_foreground` (foreground emulation, below).
 
 Where the engines differ in detail (accessible-name approximation on Firefox,
 typing semantics, which console entries exist, iframe capture, session
@@ -209,6 +209,21 @@ lifecycle), see [docs/engine-parity.md](docs/engine-parity.md).
   spawned (prefers `bun`, falls back to `node`+`npm`) against the active
   browser's CDP endpoint. The `--playwright-version` flag overrides the pinned
   `playwright-core` version.
+
+#### Foreground emulation
+
+Chromium treats a tab in a minimized window, or any tab while the display is
+locked, as hidden: `document.visibilityState` is `hidden`, `document.hasFocus()`
+is false, `requestAnimationFrame` never fires, and timers run once per second.
+Games and canvas apps stop, and screenshots show a frozen frame.
+`browser_tab_foreground` (or `foreground: true` on `browser_tab_new` /
+`browser_tab_select`) flips that for one tab: the page reports visible and
+focused, animation frames and timers run at full rate, and screenshots show
+live content, all without revealing the browser. It stays on until disabled,
+the tab closes, or the MCP server exits; `browser-control set foreground always`
+turns it on for every tab. Chromium only (Firefox has no BiDi equivalent). An
+emulated tab uses CPU as if it were visible, and pages that gate autoplay or
+notifications on focus will consider the user present.
 
 Console and network capture starts the moment a tool first touches a tab and
 keeps the last 1000 console entries and 500 requests per tab, across
@@ -267,10 +282,16 @@ codex plugin add browser-control@personal
 
 ### `set | get | unset <KEY> [VALUE]`
 
-Manage persistent settings. The only key today is `default`, which selects the
-browser used by `mcp` when no positional argument and no `BROWSER_CONTROL` env
-var is present. Values accept the full `BROWSER_CONTROL` grammar (URL / kind /
-friendly name / absolute path) and are validated at set-time.
+Manage persistent settings. Keys:
+
+- `default` selects the browser used by `mcp` when no positional argument and
+  no `BROWSER_CONTROL` env var is present. Values accept the full
+  `BROWSER_CONTROL` grammar (URL / kind / friendly name / absolute path) and
+  are validated at set-time.
+- `foreground` (`always` | `off`) makes the MCP server emulate a focused,
+  visible foreground on every Chromium tab it touches (see
+  [Foreground emulation](#foreground-emulation)). `BROWSER_CONTROL_FOREGROUND=1`
+  in the MCP host env does the same for one server.
 
 ```sh
 browser-control set default firefox
