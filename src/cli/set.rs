@@ -1,9 +1,7 @@
 //! `set` / `get` / `unset` subcommand handlers.
 //!
-//! Keys: `default` selects the browser to use when `BROWSER_CONTROL` is unset
-//! and no positional argument is given; `foreground` (`always` | `off`) makes
-//! the MCP server emulate a focused, visible foreground on every tab it
-//! touches (see `browser_tab_foreground`).
+//! Currently the only supported key is `default`, which selects the browser
+//! to use when `BROWSER_CONTROL` is unset and no positional argument is given.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -16,18 +14,12 @@ use crate::config::{self, Config};
 pub enum Key {
     /// Default browser to connect to when `BROWSER_CONTROL` and CLI args are absent.
     Default,
-    /// `always` to emulate a focused, visible foreground on every tab the MCP
-    /// server touches (requestAnimationFrame and timers keep running while
-    /// the window is minimized or the display is locked); `off` to opt in per
-    /// tab with `browser_tab_foreground` instead.
-    Foreground,
 }
 
 impl Key {
     pub fn as_str(self) -> &'static str {
         match self {
             Key::Default => "default",
-            Key::Foreground => "foreground",
         }
     }
 }
@@ -116,21 +108,18 @@ pub fn run_unset(key: Key, json: bool) -> Result<()> {
 fn get(key: Key, cfg: &Config) -> Option<String> {
     match key {
         Key::Default => cfg.default.clone(),
-        Key::Foreground => cfg.foreground.clone(),
     }
 }
 
 fn set(key: Key, cfg: &mut Config, value: Option<String>) {
     match key {
         Key::Default => cfg.default = value,
-        Key::Foreground => cfg.foreground = value,
     }
 }
 
 fn take(key: Key, cfg: &mut Config) -> Option<String> {
     match key {
         Key::Default => cfg.default.take(),
-        Key::Foreground => cfg.foreground.take(),
     }
 }
 
@@ -146,13 +135,6 @@ fn canonicalize(key: Key, value: &str) -> Result<String> {
                 BrowserSelector::Name(n) => n,
             })
         }
-        Key::Foreground => match value.trim().to_ascii_lowercase().as_str() {
-            "always" | "on" | "true" | "1" => Ok("always".into()),
-            "off" | "false" | "0" | "never" => Ok("off".into()),
-            other => Err(anyhow!(
-                "`foreground` must be `always` or `off`, got `{other}`"
-            )),
-        },
     }
 }
 
@@ -227,24 +209,6 @@ mod tests {
             run_unset(Key::Default, true).unwrap();
             let cfg = config::load().unwrap();
             assert!(cfg.default.is_none());
-        });
-    }
-
-    #[test]
-    fn set_foreground_canonicalizes_and_rejects_garbage() {
-        with_tmp_config(|| {
-            run_set(Key::Foreground, Some("ON".into()), true).unwrap();
-            let cfg = config::load().unwrap();
-            assert_eq!(cfg.foreground.as_deref(), Some("always"));
-            assert!(cfg.foreground_always());
-            assert!(config::foreground_default());
-            run_set(Key::Foreground, Some("off".into()), true).unwrap();
-            assert!(!config::foreground_default());
-            let err = run_set(Key::Foreground, Some("maybe".into()), true).unwrap_err();
-            assert!(format!("{err:#}").contains("`always` or `off`"));
-            std::env::set_var("BROWSER_CONTROL_FOREGROUND", "1");
-            assert!(config::foreground_default());
-            std::env::remove_var("BROWSER_CONTROL_FOREGROUND");
         });
     }
 

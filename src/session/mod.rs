@@ -11,6 +11,7 @@ pub mod backend;
 pub mod capture;
 pub mod cdp_session;
 pub mod crash;
+pub mod foreground;
 pub mod freshness;
 pub mod input;
 pub mod input_bidi;

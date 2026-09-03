@@ -216,14 +216,25 @@ Chromium treats a tab in a minimized window, or any tab while the display is
 locked, as hidden: `document.visibilityState` is `hidden`, `document.hasFocus()`
 is false, `requestAnimationFrame` never fires, and timers run once per second.
 Games and canvas apps stop, and screenshots show a frozen frame.
-`browser_tab_foreground` (or `foreground: true` on `browser_tab_new` /
-`browser_tab_select`) flips that for one tab: the page reports visible and
-focused, animation frames and timers run at full rate, and screenshots show
-live content, all without revealing the browser. It stays on until disabled,
-the tab closes, or the MCP server exits; `browser-control set foreground always`
-turns it on for every tab. Chromium only (Firefox has no BiDi equivalent). An
-emulated tab uses CPU as if it were visible, and pages that gate autoplay or
-notifications on focus will consider the user present.
+`browser_tab_foreground` (MCP) and `browser-control tab foreground` (CLI) flip
+that for one tab: the page reports visible and focused, animation frames and
+timers run at full rate, and screenshots show live content, all without
+revealing the browser. Both surfaces share one mechanism: a small detached
+holder process (`browser-control tab foreground-hold`) keeps the CDP session
+that carries the emulation open, and records its PID in the registry so either
+surface can turn it off and `tab list` shows the flag. It stays on until turned
+off, its timeout elapses (default 1 hour, `timeout` / `--timeout`), the tab
+closes, or the browser exits. `browser_tab_foreground { enabled: false, all:
+true }` or `browser-control tab foreground <browser> off` stops every holder on
+a browser, for cleaning up after agents that forgot. Chromium only (Firefox has
+no BiDi equivalent). An emulated tab uses CPU as if it were visible, and pages
+that gate autoplay or notifications on focus will consider the user present.
+
+```sh
+browser-control tab foreground brave/game on --timeout 2h
+browser-control tab foreground brave/game off
+browser-control tab foreground brave off      # every tab on the browser
+```
 
 Console and network capture starts the moment a tool first touches a tab and
 keeps the last 1000 console entries and 500 requests per tab, across
@@ -288,10 +299,6 @@ Manage persistent settings. Keys:
   no `BROWSER_CONTROL` env var is present. Values accept the full
   `BROWSER_CONTROL` grammar (URL / kind / friendly name / absolute path) and
   are validated at set-time.
-- `foreground` (`always` | `off`) makes the MCP server emulate a focused,
-  visible foreground on every Chromium tab it touches (see
-  [Foreground emulation](#foreground-emulation)). `BROWSER_CONTROL_FOREGROUND=1`
-  in the MCP host env does the same for one server.
 
 ```sh
 browser-control set default firefox

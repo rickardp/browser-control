@@ -2,6 +2,7 @@
 
 pub mod bidi_lock;
 mod db;
+pub mod foreground;
 pub mod naming;
 pub mod schema;
 pub mod scratches;
@@ -9,6 +10,7 @@ pub mod tabs;
 pub mod words;
 
 pub use bidi_lock::{BidiLockBusy, BidiLockGuard, BidiLockRow};
+pub use foreground::ForegroundRow;
 pub use scratches::ScratchRow;
 pub use tabs::TabRow;
 

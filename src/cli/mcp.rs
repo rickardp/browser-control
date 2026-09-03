@@ -17,9 +17,6 @@ pub async fn run_cli(
         version: playwright_version,
     };
     let state = ServerState::with_sidecar_config(resolved, sidecar_config);
-    state
-        .capture
-        .set_foreground_default(crate::config::foreground_default());
     let tools = ToolRegistry::new();
     crate::mcp::tools::register_all(&tools);
     run(state, tools).await
@@ -279,7 +276,6 @@ mod tests {
             reg.insert(&live_row).unwrap();
             config::save(&Config {
                 default: Some("brave-cosmos".into()),
-                ..Default::default()
             })
             .unwrap();
             drop(reg);
@@ -315,7 +311,6 @@ mod tests {
             reg.insert(&live_row).unwrap();
             config::save(&Config {
                 default: Some("brave-cosmos".into()),
-                ..Default::default()
             })
             .unwrap();
             drop(reg);

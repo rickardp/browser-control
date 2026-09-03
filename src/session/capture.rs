@@ -29,18 +29,8 @@
 //! available on BiDi (no `getResponseBody` equivalent without browser-side
 //! retention), so `browser_network_body` stays Chromium-only.
 //!
-//! The same long-lived CDP session also carries **foreground emulation**
-//! (`browser_tab_foreground`, or the `foreground` config default): with
-//! `Emulation.setFocusEmulationEnabled` on, Chromium treats the tab as
-//! visible and focused even when its window is minimized or the display is
-//! locked, so `requestAnimationFrame` and timers keep running and screenshots
-//! show live content. The emulation lives exactly as long as the session that
-//! enabled it, which is why it is managed here rather than per tool call.
-//! Firefox has no BiDi equivalent.
-//!
-//! Opt-out: `BROWSER_CONTROL_CAPTURE=0` (or `false`) disables event capture
-//! on both engines (a tab that asks for foreground emulation still gets a
-//! session, with no domains enabled). `Runtime.enable` is observable by some anti-bot
+//! Opt-out: `BROWSER_CONTROL_CAPTURE=0` (or `false`) disables attachment
+//! entirely on both engines. `Runtime.enable` is observable by some anti-bot
 //! scripts, and a user logging into such a site through `browser_show` may
 //! prefer the server not to touch their tabs.
 
@@ -167,8 +157,6 @@ struct TabCapture {
     session_id: Option<String>,
     /// Domains enabled and `page_url` seeded.
     ready: bool,
-    /// Foreground emulation requested for this tab (CDP only).
-    foreground: bool,
     notify: Arc<Notify>,
     page_url: String,
     console: VecDeque<ConsoleEntry>,
@@ -183,7 +171,6 @@ impl TabCapture {
         Self {
             session_id: None,
             ready: false,
-            foreground: false,
             notify: Arc::new(Notify::new()),
             page_url: String::new(),
             console: VecDeque::new(),
@@ -243,8 +230,6 @@ struct HubInner {
     bidi: Option<Arc<OnceCell<BidiCapabilities>>>,
     lost_events: u64,
     disabled: bool,
-    /// Emulate foreground on every touched CDP tab unless told otherwise.
-    foreground_default: bool,
 }
 
 impl HubInner {
@@ -1279,44 +1264,16 @@ impl CaptureHub {
         self.lock().disabled
     }
 
-    /// Server-wide default for foreground emulation on newly touched tabs.
-    pub fn set_foreground_default(&self, on: bool) {
-        self.lock().foreground_default = on;
-    }
-
-    /// Target ids currently under foreground emulation.
-    pub fn foreground_tabs(&self) -> Vec<String> {
-        self.lock()
-            .tabs
-            .iter()
-            .filter(|(_, t)| t.foreground)
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
-
     /// Start capturing `target_id` if not already. Synchronous and
     /// non-blocking: the attach (CDP) or subscribe + seed (BiDi) runs on a
     /// background task.
     pub fn touch(&self, backend: &TabBackend, target_id: &str) {
-        self.touch_with(backend, target_id, None);
-    }
-
-    /// `touch` with an explicit foreground-emulation choice for a tab that
-    /// is being attached for the first time (`None` = server default).
-    pub fn touch_with(&self, backend: &TabBackend, target_id: &str, foreground: Option<bool>) {
         let weak = Arc::downgrade(&self.inner);
         let mut g = self.lock();
-        if g.tabs.contains_key(target_id) {
+        if g.disabled || g.tabs.contains_key(target_id) {
             return;
         }
-        let want_foreground =
-            matches!(backend, TabBackend::Cdp(_)) && foreground.unwrap_or(g.foreground_default);
-        if g.disabled && !want_foreground {
-            return;
-        }
-        let mut tab = TabCapture::new();
-        tab.foreground = want_foreground;
-        g.tabs.insert(target_id.to_string(), tab);
+        g.tabs.insert(target_id.to_string(), TabCapture::new());
         match backend {
             TabBackend::Cdp(client) => {
                 if g.router.is_none() {
@@ -1386,42 +1343,6 @@ impl CaptureHub {
                 return;
             }
         }
-    }
-
-    /// Turn foreground emulation on or off for a CDP tab. Attaches the tab
-    /// first when needed; the emulation is sent on the hub's long-lived
-    /// session and re-applied if the tab is attached again later.
-    pub async fn set_foreground(
-        &self,
-        backend: &TabBackend,
-        target_id: &str,
-        enabled: bool,
-    ) -> Result<()> {
-        let TabBackend::Cdp(client) = backend else {
-            return Err(anyhow!(
-                "foreground emulation is Chromium-only: Firefox has no WebDriver BiDi equivalent of Emulation.setFocusEmulationEnabled"
-            ));
-        };
-        self.touch_with(backend, target_id, Some(enabled));
-        {
-            let mut g = self.lock();
-            if let Some(tab) = g.tabs.get_mut(target_id) {
-                tab.foreground = enabled;
-            }
-        }
-        self.wait_ready(target_id).await;
-        let sid = {
-            let g = self.lock();
-            g.tabs
-                .get(target_id)
-                .and_then(|t| t.session_id.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "could not attach a session to tab {target_id} for foreground emulation; the tab may be closed or the browser unreachable"
-                    )
-                })?
-        };
-        apply_foreground(client, &sid, enabled).await
     }
 
     /// Drop the state for a closed tab and detach the hub session.
@@ -1713,80 +1634,28 @@ async fn attach_task(client: Arc<CdpClient>, target_id: String, weak: Weak<Mutex
                 }
             }
         }
-        let (capture_enabled, foreground) = match weak.upgrade() {
-            Some(inner) => {
-                let g = inner.lock().unwrap_or_else(|p| p.into_inner());
-                (
-                    !g.disabled,
-                    g.tabs
-                        .get(&target_id)
-                        .map(|t| t.foreground)
-                        .unwrap_or(false),
-                )
-            }
-            None => return Err(anyhow!("hub gone")),
-        };
-        if capture_enabled {
-            for (method, params) in [
-                ("Inspector.enable", json!({})),
-                ("Page.enable", json!({})),
-                ("Runtime.enable", json!({})),
-                ("Log.enable", json!({})),
-                (
-                    "Network.enable",
-                    json!({
-                        "maxTotalBufferSize": NET_MAX_TOTAL_BUFFER,
-                        "maxResourceBufferSize": NET_MAX_RESOURCE_BUFFER,
-                        "maxPostDataSize": 0,
-                    }),
-                ),
-            ] {
-                if let Err(e) = client.send_with_session(method, params, Some(&sid)).await {
-                    tracing::debug!(target = %target_id, %method, error = %e, "capture enable failed");
-                }
-            }
-        }
-        if foreground {
-            if let Err(e) = apply_foreground(&client, &sid, true).await {
-                tracing::warn!(target = %target_id, error = %e, "foreground emulation failed");
+        for (method, params) in [
+            ("Inspector.enable", json!({})),
+            ("Page.enable", json!({})),
+            ("Runtime.enable", json!({})),
+            ("Log.enable", json!({})),
+            (
+                "Network.enable",
+                json!({
+                    "maxTotalBufferSize": NET_MAX_TOTAL_BUFFER,
+                    "maxResourceBufferSize": NET_MAX_RESOURCE_BUFFER,
+                    "maxPostDataSize": 0,
+                }),
+            ),
+        ] {
+            if let Err(e) = client.send_with_session(method, params, Some(&sid)).await {
+                tracing::debug!(target = %target_id, %method, error = %e, "capture enable failed");
             }
         }
         Ok::<_, anyhow::Error>(())
     };
     let outcome = tokio::time::timeout(ATTACH_TIMEOUT, attempt).await;
     finish_attach(&weak, &target_id, outcome);
-}
-
-/// Make Chromium treat the tab as focused and visible (or stop doing so).
-/// `setFocusEmulationEnabled` is what flips `document.visibilityState`,
-/// `document.hasFocus()`, `requestAnimationFrame`, and timer throttling for a
-/// minimized window or a locked display; `setIdleOverride` additionally
-/// answers the Idle Detection API with "active, unlocked".
-async fn apply_foreground(client: &CdpClient, sid: &str, enabled: bool) -> Result<()> {
-    client
-        .send_with_session(
-            "Emulation.setFocusEmulationEnabled",
-            json!({ "enabled": enabled }),
-            Some(sid),
-        )
-        .await?;
-    let idle = if enabled {
-        client
-            .send_with_session(
-                "Emulation.setIdleOverride",
-                json!({ "isUserActive": true, "isScreenUnlocked": true }),
-                Some(sid),
-            )
-            .await
-    } else {
-        client
-            .send_with_session("Emulation.clearIdleOverride", json!({}), Some(sid))
-            .await
-    };
-    if let Err(e) = idle {
-        tracing::debug!(error = %e, "idle override unavailable");
-    }
-    Ok(())
 }
 
 /// Shared tail of the attach tasks: mark the tab ready, or drop it so the
@@ -2502,72 +2371,6 @@ mod tests {
         hub.touch_and_wait(&backend, "T1").await;
         assert!(hub.captured_tabs().is_empty());
         assert!(seen.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn foreground_emulation_applies_on_attach_and_toggles() {
-        let (url, seen) = spawn_event_mock(false).await;
-        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
-        let backend = TabBackend::Cdp(client);
-        let hub = CaptureHub::new();
-        hub.set_foreground_default(true);
-        hub.touch_and_wait(&backend, "T1").await;
-        assert_eq!(hub.foreground_tabs(), vec!["T1".to_string()]);
-        {
-            let methods = seen.lock().unwrap();
-            assert!(methods.iter().any(|m| m == "Network.enable"));
-            assert!(methods
-                .iter()
-                .any(|m| m == "Emulation.setFocusEmulationEnabled"));
-            assert!(methods.iter().any(|m| m == "Emulation.setIdleOverride"));
-        }
-        hub.set_foreground(&backend, "T1", false).await.unwrap();
-        assert!(hub.foreground_tabs().is_empty());
-        let methods = seen.lock().unwrap();
-        assert_eq!(
-            methods
-                .iter()
-                .filter(|m| *m == "Emulation.setFocusEmulationEnabled")
-                .count(),
-            2
-        );
-        assert!(methods.iter().any(|m| m == "Emulation.clearIdleOverride"));
-    }
-
-    #[tokio::test]
-    async fn foreground_works_with_capture_disabled_and_is_cdp_only() {
-        let hub = {
-            let _guard = crate::test_support::ENV_LOCK.lock().unwrap();
-            std::env::set_var("BROWSER_CONTROL_CAPTURE", "0");
-            let hub = CaptureHub::new();
-            std::env::remove_var("BROWSER_CONTROL_CAPTURE");
-            hub
-        };
-        let (url, seen) = spawn_event_mock(false).await;
-        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
-        let backend = TabBackend::Cdp(client);
-        hub.set_foreground(&backend, "T1", true).await.unwrap();
-        {
-            let methods = seen.lock().unwrap();
-            assert!(methods.iter().any(|m| m == "Target.attachToTarget"));
-            assert!(methods
-                .iter()
-                .any(|m| m == "Emulation.setFocusEmulationEnabled"));
-            assert!(
-                !methods.iter().any(|m| m == "Network.enable"),
-                "capture stays disabled: {methods:?}"
-            );
-        }
-        let err = hub
-            .read_console("T1", &ConsoleQuery::default())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("BROWSER_CONTROL_CAPTURE"), "{err}");
-
-        let (burl, _) = spawn_bidi_event_mock(Reject::None).await;
-        let bidi = bidi_backend(&burl).await;
-        let err = hub.set_foreground(&bidi, "C1", true).await.unwrap_err();
-        assert!(err.to_string().contains("Chromium-only"));
     }
 
     // -- WebDriver BiDi ingress ----------------------------------------------

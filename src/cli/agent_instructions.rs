@@ -20,7 +20,7 @@ Tabs
   CLI: `browser-control tab open <browser>/<name> [url]`, `tab list <browser> --all`, `tab adopt <browser>/<name> <target-id>`.
 - For repeatable work, create or select a named tab, then address it as `<browser>/<tab>` in page-context CLI commands.
 - Use target IDs only to adopt an existing unnamed tab or as a last-resort diagnostic.
-- Background tabs (minimized window, locked display) are hidden to the page: no `requestAnimationFrame`, throttled timers, `document.hidden` true. For games, canvas apps, or anything that pauses in the background, call `browser_tab_foreground` (or pass `foreground: true` to `browser_tab_new` / `browser_tab_select`); the tab then reports visible and focused and runs at full rate while the browser stays hidden. Chromium only.
+- Background tabs (minimized window, locked display) are hidden to the page: no `requestAnimationFrame`, throttled timers, `document.hidden` true. For games, canvas apps, or anything that pauses in the background, call `browser_tab_foreground` (MCP) or `browser-control tab foreground <browser>/<tab> on` (CLI); the tab then reports visible and focused and runs at full rate while the browser stays hidden, held by a small detached process until `enabled: false` / `off`, the timeout (default 1h), or the tab closes. `browser_tab_foreground {enabled: false, all: true}` or `tab foreground <browser> off` stops every holder. Chromium only.
 - Browser-wide operations do not take tab names. Page-context operations do.
 
 Page and network work

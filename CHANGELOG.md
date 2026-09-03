@@ -43,14 +43,17 @@
   Every remaining Chromium/Firefox difference is listed in
   `docs/engine-parity.md`.
 
-- `browser_tab_foreground` (ADR-004): make a Chromium tab behave as the
-  focused, visible foreground tab while the window is minimized or the
-  display is locked, so `requestAnimationFrame` and timers run at full rate,
-  `document.visibilityState` / `document.hasFocus()` report foreground, and
-  screenshots show live content. Also `foreground: true` on `browser_tab_new`
-  / `browser_tab_select`, a `foreground` flag in `browser_tab_list`, and a
-  server-wide default via `browser-control set foreground always` or
-  `BROWSER_CONTROL_FOREGROUND=1`. Rides the capture hub's long-lived session.
+- Foreground emulation (ADR-004): `browser_tab_foreground` (MCP) and
+  `browser-control tab foreground <browser>/<tab> on|off` (CLI) make a
+  Chromium tab behave as the focused, visible foreground tab while the window
+  is minimized or the display is locked, so `requestAnimationFrame` and timers
+  run at full rate, `document.visibilityState` / `document.hasFocus()` report
+  foreground, and screenshots show live content. Both surfaces spawn the same
+  detached holder process (`tab foreground-hold`, hidden) whose PID and expiry
+  live in the registry, so `browser_tab_list` / `tab list` show the flag and
+  either surface can turn it off. Default timeout 1 hour (`timeout` /
+  `--timeout`); `enabled: false, all: true` or `tab foreground <browser> off`
+  stops every holder on a browser.
 
 ### Changed
 

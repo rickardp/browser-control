@@ -52,6 +52,35 @@ pub enum TabCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Make a tab behave as the focused, visible foreground tab even while
+    /// the window is minimized or the display is locked (games, canvas apps,
+    /// anything that pauses in the background). A small holder process keeps
+    /// it on until `off`, the timeout elapses, the tab closes, or the browser
+    /// exits. Chromium only.
+    ///
+    ///   browser-control tab foreground brave/game on --timeout 2h
+    ///   browser-control tab foreground brave/game off
+    ///   browser-control tab foreground brave off        # every tab
+    Foreground {
+        /// `<browser>/<name>`, or a bare `<browser>` with `off` to stop all.
+        browser: String,
+        /// `on` (default) or `off`.
+        #[arg(default_value = "on")]
+        state: String,
+        /// How long to hold it (`30m`, `2h`, `90s`). Default 1h.
+        #[arg(long, default_value = "1h")]
+        timeout: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal: the holder process spawned by `tab foreground`.
+    #[command(hide = true)]
+    ForegroundHold {
+        browser_name: String,
+        target_id: String,
+        #[arg(long, default_value_t = 3600)]
+        timeout_s: u64,
+    },
     /// Adopt an existing live tab by target ID, binding it to a name.
     ///
     /// Use `tab list --all` to discover unnamed tabs and their target IDs,
@@ -88,7 +117,135 @@ pub async fn run(cmd: TabCmd) -> Result<()> {
             let result = adopt(&browser, &target_id, json, &mut trace).await;
             trace.finish(result)
         }
+        TabCmd::Foreground {
+            browser,
+            state,
+            timeout,
+            json,
+        } => {
+            let mut trace = CommandTrace::new("tab-foreground");
+            let result = foreground(&browser, &state, &timeout, json, &mut trace).await;
+            trace.finish(result)
+        }
+        TabCmd::ForegroundHold {
+            browser_name,
+            target_id,
+            timeout_s,
+        } => {
+            crate::session::foreground::hold(
+                &browser_name,
+                &target_id,
+                std::time::Duration::from_secs(timeout_s),
+            )
+            .await
+        }
     }
+}
+
+async fn foreground(
+    positional: &str,
+    state: &str,
+    timeout: &str,
+    json: bool,
+    trace: &mut CommandTrace,
+) -> Result<()> {
+    use crate::session::foreground as fg;
+    let enabled = match state.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => return Err(anyhow!("state must be `on` or `off`, got `{other}`")),
+    };
+    let timeout = crate::session::freshness::parse_max_age(timeout)
+        .with_context(|| format!("parsing --timeout `{timeout}`"))?;
+    let target = env_resolver::parse_target(positional)
+        .with_context(|| format!("parsing `{positional}` as <browser>[/<tab>]"))?;
+    let registry = Registry::open()?;
+    let resolved = resolve_browser(Some(reassemble_browser_only(positional)?)).await?;
+    let browser_name = match &resolved.source {
+        crate::cli::env_resolver::Source::Registered { name } => name.clone(),
+        _ => {
+            return Err(anyhow!(
+                "foreground emulation requires a registered browser; `{positional}` resolved to an external endpoint"
+            ));
+        }
+    };
+    trace.browser(&browser_name).engine(resolved.engine);
+    trace.route("tab-foreground");
+    if resolved.engine != crate::detect::Engine::Cdp {
+        return Err(anyhow!(
+            "foreground emulation is Chromium-only: Firefox has no WebDriver BiDi equivalent"
+        ));
+    }
+    let Some(name) = target.tab.as_deref() else {
+        if enabled {
+            return Err(anyhow!(
+                "`tab foreground <browser> on` needs a tab: use `<browser>/<tab>`; a bare browser is only valid with `off` (stop all)"
+            ));
+        }
+        let n = fg::stop_all(&registry, &browser_name)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"browser": browser_name, "foreground": false, "stopped": n})
+                )?
+            );
+        } else {
+            println!("foreground off for {n} tab(s) on {browser_name}");
+        }
+        return Ok(());
+    };
+    trace.tab_name(name);
+    let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
+    let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+    let row = crate::session::resolve_tab(&backend, &registry, &browser_name, name).await;
+    backend.shutdown().await;
+    let row = row?.ok_or_else(|| crate::errors::SessionError::TabNotFound {
+        browser: browser_name.clone(),
+        name: name.to_string(),
+    })?;
+    trace.target_id(&row.target_id);
+    let (pid, changed) = if enabled {
+        let (pid, created) = fg::spawn_holder(&registry, &browser_name, &row.target_id, timeout)?;
+        (Some(pid), created)
+    } else {
+        (
+            None,
+            fg::stop_holder(&registry, &browser_name, &row.target_id)?,
+        )
+    };
+    // The holder that is actually running may predate this call with its
+    // own expiry; report that rather than the requested timeout.
+    let expires_in = fg::status(&registry, &browser_name, &row.target_id)?
+        .map(|r| (r.expires_at_epoch_s - crate::registry::now_epoch_s()).max(0) as u64)
+        .map(std::time::Duration::from_secs);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "browser": browser_name,
+                "name": name,
+                "target_id": row.target_id,
+                "foreground": enabled,
+                "changed": changed,
+                "holder_pid": pid,
+                "expires_in_s": expires_in.map(|d| d.as_secs()),
+            }))?
+        );
+    } else if enabled {
+        println!(
+            "foreground {} for {browser_name}/{name} (holder pid {}, expires in {})",
+            if changed { "on" } else { "already on" },
+            pid.unwrap_or(0),
+            crate::session::freshness::format_duration(expires_in.unwrap_or(timeout))
+        );
+    } else {
+        println!(
+            "foreground {} for {browser_name}/{name}",
+            if changed { "off" } else { "already off" }
+        );
+    }
+    Ok(())
 }
 
 async fn open(positional: &str, url: &str, json: bool, trace: &mut CommandTrace) -> Result<()> {
@@ -151,6 +308,7 @@ async fn list(positional: &str, all: bool, json: bool, trace: &mut CommandTrace)
     trace.route(if all { "tab-list-all" } else { "tab-list" });
     let _bidi_lock = acquire_bidi_lock_if_needed(&registry, &resolved)?;
     let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
+    let foreground = crate::session::foreground::active_targets(&registry, &browser_name)?;
     let merged = async {
         let rows = session_tabs::tab_list(&backend, &registry, &browser_name).await?;
         // With `--all`, fold in every live tab the browser knows about with
@@ -175,7 +333,10 @@ async fn list(positional: &str, all: bool, json: bool, trace: &mut CommandTrace)
     }
     .await;
     backend.shutdown().await;
-    let merged = merged?;
+    let mut merged = merged?;
+    for r in &mut merged {
+        r.foreground = foreground.contains(&r.target_id);
+    }
 
     if json {
         let arr: Vec<serde_json::Value> = merged.iter().map(DisplayRow::to_json).collect();
@@ -183,14 +344,21 @@ async fn list(positional: &str, all: bool, json: bool, trace: &mut CommandTrace)
     } else if merged.is_empty() {
         println!("(no tabs)");
     } else {
-        println!("NAME\tOWNER\tIDLE_S\tURL");
+        println!("NAME\tOWNER\tIDLE_S\tFOREGROUND\tURL");
         let now = crate::registry::now_epoch_s();
         for r in &merged {
             let idle = r
                 .last_used_at_epoch_s
                 .map(|t| (now - t).max(0).to_string())
                 .unwrap_or_else(|| "-".to_string());
-            println!("{}\t{}\t{}\t{}", r.name, r.owner, idle, r.url);
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                r.name,
+                r.owner,
+                idle,
+                if r.foreground { "on" } else { "-" },
+                r.url
+            );
         }
     }
     Ok(())
@@ -273,6 +441,7 @@ struct DisplayRow {
     last_used_at_epoch_s: Option<i64>,
     target_id: String,
     daemon_created: bool,
+    foreground: bool,
 }
 
 impl DisplayRow {
@@ -284,6 +453,7 @@ impl DisplayRow {
             last_used_at_epoch_s: Some(r.last_used_at_epoch_s),
             target_id: r.target_id.clone(),
             daemon_created: r.daemon_created,
+            foreground: false,
         }
     }
     fn from_live(t: &crate::session::backend::LiveTarget) -> Self {
@@ -294,6 +464,7 @@ impl DisplayRow {
             last_used_at_epoch_s: None,
             target_id: t.id.clone(),
             daemon_created: false,
+            foreground: false,
         }
     }
     fn to_json(&self) -> serde_json::Value {
@@ -304,6 +475,7 @@ impl DisplayRow {
             "url": self.url,
             "last_used_at_epoch_s": self.last_used_at_epoch_s,
             "daemon_created": self.daemon_created,
+            "foreground": self.foreground,
         })
     }
 }

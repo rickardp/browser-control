@@ -45,6 +45,19 @@ fn is_reloadable_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+/// Human form of a duration using the same units `parse_max_age` accepts
+/// (`2h`, `30m`, `90s`; mixed values fall back to seconds).
+pub fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs > 0 && secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs > 0 && secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 pub fn parse_max_age(raw: &str) -> Result<Duration> {
     let raw = raw.trim();
     if raw.is_empty() {

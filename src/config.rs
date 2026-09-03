@@ -16,38 +16,12 @@ const HEADER: &str =
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    /// `"always"` to emulate a focused, visible foreground on every tab the
-    /// MCP server touches (see `browser_tab_foreground`); `"off"` or absent
-    /// for per-tab opt-in only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub foreground: Option<String>,
 }
 
 impl Config {
     pub fn is_empty(&self) -> bool {
-        self.default.is_none() && self.foreground.is_none()
+        self.default.is_none()
     }
-
-    /// Whether the persisted `foreground` key asks for always-on emulation.
-    pub fn foreground_always(&self) -> bool {
-        matches!(self.foreground.as_deref(), Some("always"))
-    }
-}
-
-/// Resolve the server-wide foreground default: `BROWSER_CONTROL_FOREGROUND`
-/// (`1` / `always` / `true` on, `0` / `off` / `false` off) wins over the
-/// persisted config key; both absent means off.
-pub fn foreground_default() -> bool {
-    if let Ok(v) = std::env::var("BROWSER_CONTROL_FOREGROUND") {
-        let v = v.trim().to_ascii_lowercase();
-        if matches!(v.as_str(), "1" | "always" | "true" | "on") {
-            return true;
-        }
-        if matches!(v.as_str(), "0" | "off" | "false" | "never") {
-            return false;
-        }
-    }
-    load().map(|c| c.foreground_always()).unwrap_or(false)
 }
 
 /// Load the config from disk. A missing file yields `Config::default()`.
@@ -116,10 +90,8 @@ mod tests {
         let (_td, p) = tmp_cfg();
         let cfg = Config {
             default: Some("firefox".into()),
-            foreground: Some("always".into()),
         };
         save_to(&p, &cfg).unwrap();
-        assert!(cfg.foreground_always());
         let read = load_from(&p).unwrap();
         assert_eq!(read, cfg);
 
@@ -135,7 +107,6 @@ mod tests {
             &p,
             &Config {
                 default: Some("chrome".into()),
-                foreground: None,
             },
         )
         .unwrap();

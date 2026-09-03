@@ -24,7 +24,7 @@ on Firefox.
 | `browser_take_screenshot` | yes | yes | differs: `max_width` is ignored on Firefox; see *Screenshots* |
 | `browser_console_messages`, `browser_network_requests` | yes | yes (network needs Firefox 124+) | differs: see *Console and network capture* |
 | `browser_network_body` | yes | no | Chromium-only: BiDi exposes bodies only through browser-side data collectors, which are deliberately not enabled |
-| `browser_tab_foreground`, `foreground` on `browser_tab_new` / `browser_tab_select`, `set foreground always` | yes | no | Chromium-only: `Emulation.setFocusEmulationEnabled` has no BiDi equivalent; on Firefox a background tab stays hidden to the page (ADR-004) |
+| `browser_tab_foreground`, `browser-control tab foreground` | yes | no | Chromium-only: `Emulation.setFocusEmulationEnabled` has no BiDi equivalent; on Firefox a background tab stays hidden to the page (ADR-004) |
 
 ## Session and lifecycle
 
@@ -35,7 +35,7 @@ on Firefox.
 | Renderer crash detection | `Inspector.targetCrashed` short-circuits an in-flight op as `TabCrashed` | No crash event; a wedged context surfaces as `TabHung` after the per-op timeout |
 | Tab titles (`browser_tab_list`, `list_targets`) | Real titles | Empty: `browsingContext.getTree` carries no title. `browser_snapshot` prints `document.title` from the walker instead |
 | Readiness after `browser-control start --headless` | Endpoint probe succeeds | Known wart: the readiness probe can report a 30 s timeout although the browser is up and usable |
-| Background tabs (minimized window, locked display) | Hidden to the page unless `browser_tab_foreground` emulates foreground on the hub session | Hidden to the page; no emulation available |
+| Background tabs (minimized window, locked display) | Hidden to the page unless a `tab foreground-hold` process emulates foreground (`browser_tab_foreground` / `tab foreground`) | Hidden to the page; no emulation available |
 
 ## Evaluation (`browser_eval`, CLI `eval`, freshness probe)
 

@@ -31,7 +31,11 @@ ref-based interaction), and ADR-004 (foreground emulation).
   `Runtime`/`Log`/`Network`/`Page` enabled on tabs the server has touched and
   buffers browser-pushed events in memory (on Firefox it holds one BiDi
   `session.subscribe` instead); it never polls, never wakes on a timer, and
-  is torn down with the backend.
+  is torn down with the backend. The one process that outlives an
+  invocation is the foreground holder (ADR-004, `tab foreground-hold`): it
+  exists only while a user or agent asked for foreground emulation on one
+  tab, blocks on CDP events and a termination signal, and has a hard expiry
+  (default 1 h).
 - **Always proceed.** Agent-facing tab/session ops must not surface
   `TabHung` / `TabCrashed` / `Closed` to the caller. Detect, recreate, retry
   once, and only then escalate with a typed error. The recover-once wrappers

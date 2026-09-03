@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS bidi_locks (
   holder_pid           INTEGER NOT NULL,
   acquired_at_epoch_s  INTEGER NOT NULL
 );
+
+-- Foreground emulation holders (ADR-004): one detached
+-- `browser-control tab foreground-hold` process per emulated tab. `pid` is
+-- the holder; rows whose pid is dead are evicted on read.
+CREATE TABLE IF NOT EXISTS foreground_holders (
+  browser_name         TEXT NOT NULL,
+  target_id            TEXT NOT NULL,
+  pid                  INTEGER NOT NULL,
+  started_at_epoch_s   INTEGER NOT NULL,
+  expires_at_epoch_s   INTEGER NOT NULL,
+  PRIMARY KEY (browser_name, target_id)
+);
 "#;
 
 /// Apply the schema migration. Idempotent.
