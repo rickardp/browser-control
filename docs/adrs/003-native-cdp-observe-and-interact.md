@@ -144,6 +144,8 @@ dependency on the path agents use most (clicking what they just read).
 
 - ADR-001 (Rust CLI rewrite), ADR-002 (CLI lifecycle, no idle work).
 - `docs/specs/boundaries.md` records the passive-listener rule.
+- `docs/engine-parity.md` lists every Chromium/Firefox divergence of the
+  native tools in one place.
 
 ### Follow-ups
 

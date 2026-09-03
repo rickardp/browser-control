@@ -98,7 +98,8 @@ browser-control list-installed --json
 ```
 
 Supported kinds: `chrome`, `edge`, `chromium`, `brave` (CDP), and `firefox`
-(BiDi).
+(BiDi). The two engines share one tool surface; every behavioural difference
+is listed in [docs/engine-parity.md](docs/engine-parity.md).
 
 ### `list-running`
 
@@ -197,6 +198,10 @@ The server exposes three groups of tools:
 - **Chromium-only extras**: `browser_network_body` (Firefox exposes no
   captured bodies; use `browser_fetch` there) and screenshot `max_width`
   (BiDi has no scale).
+
+Where the engines differ in detail (accessible-name approximation on Firefox,
+typing semantics, which console entries exist, iframe capture, session
+lifecycle), see [docs/engine-parity.md](docs/engine-parity.md).
 - **Playwright sidecar** (Chromium family, needs `bun` or `node`): CSS
   `selector` interaction on `browser_click` / `browser_type` /
   `browser_hover` / `browser_drag`, plus `browser_press_key`,

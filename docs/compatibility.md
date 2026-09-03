@@ -240,8 +240,8 @@ Playwright's `--browser webkit` launches a custom WebKit build, not real Safari.
 
 For Safari testing, the community `lxman/safari-mcp-server` uses SafariDriver but is early-stage (macOS only, single session).
 
-### Future: WebDriver BiDi
+### WebDriver BiDi
 
 [WebDriver BiDi](https://w3c.github.io/webdriver-bidi/) is a W3C standard aiming to be the cross-browser successor to CDP. Chrome, Firefox, and Safari are all implementing it.
 
-The coordinator already uses BiDi for Firefox support (navigate, evaluate JS, screenshot — the operations needed for `coordinator_*` tools). As BiDi matures across browsers, more operations could be unified under a single protocol. Playwright's BiDi support is still incomplete, but it's the direction the ecosystem is heading.
+`browser-control` uses BiDi for Firefox across the whole native tool surface: navigation, evaluation, screenshots, accessibility snapshots with refs, ref-based input, and console/network capture. The Playwright sidecar (CSS-selector interaction, `browser_press_key`, `browser_wait_for`, `browser_pdf_save`) and `browser_network_body` remain Chromium-only. Every behavioural difference between the two engines is listed in [engine-parity.md](engine-parity.md).

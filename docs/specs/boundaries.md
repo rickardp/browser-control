@@ -58,6 +58,9 @@ ref-based interaction).
 - **Supported (CDP):** Chrome, Edge, Chromium, Brave.
 - **Supported (BiDi):** Firefox.
 - **Not supported:** Safari/WebKit.
+- Every observable difference between the CDP and BiDi paths is recorded in
+  `docs/engine-parity.md`. A change that adds or removes a difference must
+  update that page in the same PR.
 
 ## MCP Integration
 

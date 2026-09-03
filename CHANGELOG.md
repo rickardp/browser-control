@@ -40,6 +40,8 @@
   Firefox via a document-origin clip. Console and network listing work on
   Firefox through one BiDi `session.subscribe` (network needs Firefox 124+).
   Still Chromium-only: `browser_network_body` and screenshot `max_width`.
+  Every remaining Chromium/Firefox difference is listed in
+  `docs/engine-parity.md`.
 
 ### Changed
 

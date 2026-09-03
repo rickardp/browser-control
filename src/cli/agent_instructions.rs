@@ -48,6 +48,7 @@ MCP server setup
 - Set `BROWSER_CONTROL` in the MCP host env to scope that server to one browser, or rely on `browser-control set default`.
 - `browser_snapshot`, `browser_find`, ref-based interaction, and console/network listing are native (no Node) on Chromium and Firefox; on Firefox the accessibility tree is approximate. CSS-selector interaction, `browser_press_key`, `browser_wait_for`, and `browser_pdf_save` route through a Playwright sidecar that needs `bun` or `node` and a Chromium browser; on Firefox use refs instead of selectors.
 - Set `BROWSER_CONTROL_CAPTURE=0` in the MCP host env to disable console/network capture (it enables CDP `Runtime`, which some anti-bot scripts detect).
+- Firefox differences to plan around: `browser_eval` always awaits promises; tab titles are empty in `browser_tab_list`; closed shadow roots and iframe contents are not in snapshots; `press_sequentially` sends real key events (on Chromium it inserts text per character); Firefox does not log failed resource loads to the console. The full list is in docs/engine-parity.md.
 
 Recovery
 - If a tab is gone or hung, list tabs, select another tab, or create a fresh named tab and retry.

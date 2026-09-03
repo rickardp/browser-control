@@ -251,7 +251,7 @@ fn make_eval() -> RegisteredTool {
                 "await_promise": {
                     "type": "boolean",
                     "default": true,
-                    "description": "Treat the expression as a Promise and await it."
+                    "description": "Treat the expression as a Promise and await it. Ignored on Firefox, which always awaits."
                 },
                 "timeout_ms": {
                     "type": "number",
@@ -1022,7 +1022,7 @@ fn make_tab_list() -> RegisteredTool {
     RegisteredTool {
         name: "browser_tab_list".into(),
         description: "List open tabs in the active browser, Playwright-shaped \
-                      (`[{target_id, url, title, active}]`)."
+                      (`[{target_id, url, title, active}]`). Titles are empty on Firefox."
             .into(),
         input_schema: json!({"type": "object", "properties": {}}),
         handler: handler(|state, _args| {
@@ -2526,7 +2526,7 @@ fn make_type() -> RegisteredTool {
             },
             SidecarParam {
                 name: "press_sequentially",
-                schema: json!({"type": "boolean"}),
+                schema: json!({"type": "boolean", "description": "Send the text one character at a time. On Firefox this dispatches real key events; on Chromium it inserts one character per event without keydown/keyup."}),
                 required: false,
             },
             SidecarParam {
