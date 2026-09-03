@@ -359,7 +359,10 @@ pub fn pid_alive(pid: u32) -> bool {
     // Refresh only this PID, not the entire process table — this is hit
     // per-row by stale-row eviction across scratches/tabs/bidi_locks.
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    sys.process(pid).is_some()
+    // A zombie (exited, not yet reaped by its parent) still has a /proc
+    // entry on Linux but is not a live process for our purposes.
+    sys.process(pid)
+        .is_some_and(|p| !matches!(p.status(), sysinfo::ProcessStatus::Zombie))
 }
 
 /// Current Unix epoch seconds.

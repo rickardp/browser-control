@@ -136,6 +136,15 @@ pub fn spawn_holder(
     loop {
         if let Some(row) = registry.foreground_get(browser_name, target_id)? {
             if row.pid == pid {
+                // Reap the child whenever it exits so it never lingers as a
+                // zombie (which `pid_alive` would otherwise keep reporting
+                // as a live holder in a long-lived MCP server).
+                std::thread::Builder::new()
+                    .name("foreground-holder-reaper".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    })
+                    .ok();
                 return Ok((pid, true));
             }
         }

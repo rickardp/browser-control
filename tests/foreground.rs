@@ -176,6 +176,10 @@ async fn holder_attaches_emulates_and_stops() {
         .foreground_get("brave-test", "T1")
         .unwrap()
         .is_none());
+    // On Unix `stop_holder` sends SIGTERM and the holder reverts the
+    // emulation and detaches before exiting; on Windows it is terminated
+    // outright and the session drop reverts the emulation browser-side.
+    #[cfg(unix)]
     assert!(wait_until(
         || {
             let s = seen.lock().unwrap();
