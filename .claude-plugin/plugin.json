@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "browser-control",
   "displayName": "Browser Control",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Expose browser-control's MCP server for controlling local browsers through CDP and WebDriver BiDi.",
   "author": {
     "name": "rickardp",

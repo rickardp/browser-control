@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1 — 2026-09-03
+
+### Fixed
+
+- Foreground holders are reaped when they exit, and a zombie process no
+  longer counts as a live holder, so a long-lived MCP server on Linux does
+  not keep reporting an expired holder as on.
+- Running-browser detection compares canonical executable paths, so a
+  symlinked install (`/bin -> /usr/bin` on merged-usr Linux) is recognised as
+  running.
+
 ## 1.2.0 — 2026-09-03
 
 ### Added
