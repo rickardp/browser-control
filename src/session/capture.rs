@@ -21,10 +21,18 @@
 //! `TabCrashed`: attach failures are swallowed and retried on the next touch,
 //! so the recover-once flows elsewhere are unaffected.
 //!
+//! Firefox (WebDriver BiDi) uses the same hub with a different ingress: one
+//! global `session.subscribe` per backend for `log.entryAdded`,
+//! `network.beforeRequestSent` / `responseCompleted` / `fetchError`, and
+//! `browsingContext.navigationStarted` / `contextDestroyed`, routed by the
+//! browsing-context id, which *is* the target id. Response bodies are not
+//! available on BiDi (no `getResponseBody` equivalent without browser-side
+//! retention), so `browser_network_body` stays Chromium-only.
+//!
 //! Opt-out: `BROWSER_CONTROL_CAPTURE=0` (or `false`) disables attachment
-//! entirely. `Runtime.enable` is observable by some anti-bot scripts, and a
-//! user logging into such a site through `browser_show` may prefer the
-//! server not to touch their tabs.
+//! entirely on both engines. `Runtime.enable` is observable by some anti-bot
+//! scripts, and a user logging into such a site through `browser_show` may
+//! prefer the server not to touch their tabs.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -35,10 +43,14 @@ use base64::Engine as _;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, OnceCell};
 
+use crate::bidi::{BidiClient, BidiEvent};
 use crate::cdp::{CdpClient, CdpEvent};
 use crate::session::backend::TabBackend;
+
+/// Agent-facing explanation for `browser_network_body` on Firefox.
+pub const BIDI_NO_BODIES_HINT: &str = "response bodies are not captured on Firefox; use browser_fetch to re-issue the request, or switch to a Chromium browser via browser_select";
 
 /// Console entries kept per tab.
 pub const CONSOLE_CAP: usize = 1000;
@@ -199,12 +211,23 @@ impl TabCapture {
     }
 }
 
+/// What the one-time BiDi `session.subscribe` managed to arm.
+#[derive(Debug, Clone, Copy)]
+struct BidiCapabilities {
+    /// `network.*` events were accepted (Firefox 124+).
+    network: bool,
+}
+
 #[derive(Default)]
 struct HubInner {
     tabs: HashMap<String, TabCapture>,
-    /// Hub session id → target id.
+    /// CDP only: hub session id → target id. BiDi routes by context id.
     sessions: HashMap<String, String>,
+    /// Either engine's router (only one backend is live at a time).
     router: Option<tokio::task::JoinHandle<()>>,
+    /// BiDi only: the global subscription, performed once per backend by
+    /// the first attach task and shared by later ones; replaced on `reset`.
+    bidi: Option<Arc<OnceCell<BidiCapabilities>>>,
     lost_events: u64,
     disabled: bool,
 }
@@ -345,6 +368,362 @@ impl HubInner {
             }
             _ => {}
         }
+    }
+}
+
+impl HubInner {
+    /// Route one WebDriver BiDi event. The browsing-context id is the
+    /// target id, so no session map is involved; events for untouched
+    /// contexts (including child frames) cost one hash miss.
+    fn route_bidi(&mut self, ev: BidiEvent) {
+        let p = &ev.params;
+        let ctx = match ev.method.as_str() {
+            "log.entryAdded" => p["source"]["context"].as_str(),
+            _ => p["context"].as_str(),
+        };
+        let Some(ctx) = ctx else {
+            return;
+        };
+        if ev.method == "browsingContext.contextDestroyed" {
+            self.tabs.remove(ctx);
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(ctx) else {
+            return;
+        };
+        match ev.method.as_str() {
+            "log.entryAdded" => {
+                if let Some(e) = console_entry_from_bidi(p) {
+                    tab.push_console(e);
+                }
+            }
+            "network.beforeRequestSent" => {
+                let req = &p["request"];
+                let rid = req["request"].as_str().unwrap_or_default().to_string();
+                let start = bidi_secs(p);
+                if p["redirectCount"].as_u64().unwrap_or(0) > 0 {
+                    if let Some(prev) = tab.network_mut(&rid) {
+                        if prev.state != NetState::Redirected {
+                            prev.state = NetState::Redirected;
+                            if prev.duration_ms.is_none() {
+                                prev.duration_ms = duration_ms(prev.monotonic_start, start);
+                            }
+                        }
+                    }
+                }
+                let is_navigation = p["navigation"].as_str().is_some();
+                tab.push_network(NetworkEntry {
+                    seq: 0,
+                    request_id: rid,
+                    ts_ms: p["timestamp"].as_f64().unwrap_or(0.0),
+                    monotonic_start: start.unwrap_or(0.0),
+                    method: req["method"].as_str().unwrap_or("GET").to_string(),
+                    url: truncate(req["url"].as_str().unwrap_or_default(), URL_CAP),
+                    resource_type: bidi_resource_type(
+                        req,
+                        is_navigation,
+                        p["initiator"]["type"].as_str(),
+                        None,
+                    ),
+                    status: None,
+                    status_text: None,
+                    mime_type: None,
+                    from_cache: false,
+                    encoded_bytes: None,
+                    duration_ms: None,
+                    failed: None,
+                    state: NetState::Pending,
+                    page_url: String::new(),
+                    has_post_data: req["bodySize"].as_u64().unwrap_or(0) > 0,
+                });
+            }
+            "network.responseCompleted" => {
+                let rid = p["request"]["request"].as_str().unwrap_or_default();
+                let end = bidi_secs(p);
+                if let Some(e) = tab.network_mut(rid) {
+                    apply_bidi_response(e, &p["response"]);
+                    e.duration_ms = duration_ms(e.monotonic_start, end);
+                    if e.resource_type.is_none() {
+                        e.resource_type =
+                            bidi_resource_type(&p["request"], false, None, e.mime_type.as_deref());
+                    }
+                    if e.state == NetState::Pending {
+                        e.state = NetState::Finished;
+                    }
+                }
+            }
+            "network.fetchError" => {
+                let rid = p["request"]["request"].as_str().unwrap_or_default();
+                let end = bidi_secs(p);
+                if let Some(e) = tab.network_mut(rid) {
+                    e.failed = Some(p["errorText"].as_str().unwrap_or("failed").to_string());
+                    e.state = NetState::Failed;
+                    e.duration_ms = duration_ms(e.monotonic_start, end);
+                }
+            }
+            "browsingContext.navigationStarted" => {
+                if let Some(u) = p["url"].as_str() {
+                    tab.page_url = truncate(u, URL_CAP);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// BiDi timestamps are epoch milliseconds; the shared `duration_ms` works
+/// in seconds.
+fn bidi_secs(p: &Value) -> Option<f64> {
+    p["timestamp"].as_f64().map(|t| t / 1000.0)
+}
+
+fn apply_bidi_response(e: &mut NetworkEntry, r: &Value) {
+    e.status = r["status"].as_u64().map(|s| s as u16);
+    e.status_text = r["statusText"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    e.mime_type = r["mimeType"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    e.from_cache = r["fromCache"].as_bool().unwrap_or(false);
+    e.encoded_bytes = r["bytesReceived"].as_f64().map(|b| b as u64);
+}
+
+/// Derive a CDP-style resource label for a BiDi request so
+/// `resource_type` filters behave the same on both engines. Firefox
+/// hard-codes `initiator.type = "other"`, so it is only consulted for
+/// preflights; `request.initiatorType` / `destination` (Firefox 129+) and,
+/// at response time, the MIME type do the real work.
+fn bidi_resource_type(
+    req: &Value,
+    is_navigation: bool,
+    initiator_type: Option<&str>,
+    mime: Option<&str>,
+) -> Option<String> {
+    if is_navigation {
+        return Some("Document".into());
+    }
+    if initiator_type == Some("preflight") {
+        return Some("Preflight".into());
+    }
+    let destination = req["destination"].as_str().unwrap_or("");
+    let by_initiator = match req["initiatorType"].as_str().unwrap_or("") {
+        "xmlhttprequest" => Some("XHR"),
+        "fetch" => Some("Fetch"),
+        "script" => Some("Script"),
+        "css" => Some("Stylesheet"),
+        "img" | "image" | "input" => Some("Image"),
+        "font" => Some("Font"),
+        "iframe" | "frame" => Some("Document"),
+        "beacon" => Some("Ping"),
+        "audio" | "video" | "track" => Some("Media"),
+        "link" if destination == "style" => Some("Stylesheet"),
+        _ => None,
+    };
+    if let Some(t) = by_initiator {
+        return Some(t.into());
+    }
+    let by_destination = match destination {
+        "document" | "iframe" | "frame" => Some("Document"),
+        "script" | "worker" | "sharedworker" | "serviceworker" => Some("Script"),
+        "style" => Some("Stylesheet"),
+        "image" => Some("Image"),
+        "font" => Some("Font"),
+        "manifest" => Some("Manifest"),
+        "audio" | "video" => Some("Media"),
+        _ => None,
+    };
+    if let Some(t) = by_destination {
+        return Some(t.into());
+    }
+    let m = mime?.to_ascii_lowercase();
+    let by_mime = if m.starts_with("text/css") {
+        "Stylesheet"
+    } else if m.contains("javascript") || m.contains("ecmascript") {
+        "Script"
+    } else if m.starts_with("image/") {
+        "Image"
+    } else if m.starts_with("font/") || m.starts_with("application/font") {
+        "Font"
+    } else if m.starts_with("application/json") {
+        "Fetch"
+    } else {
+        return None;
+    };
+    Some(by_mime.into())
+}
+
+/// `log.entryAdded` → console entry. Console entries take their level
+/// from the console method (BiDi reports `console.log` as `info`);
+/// JavaScript errors become `exception` entries with a rendered stack.
+fn console_entry_from_bidi(p: &Value) -> Option<ConsoleEntry> {
+    let fallback_level = match p["level"].as_str() {
+        Some("error") => Level::Error,
+        Some("warn") => Level::Warn,
+        Some("debug") => Level::Debug,
+        _ => Level::Info,
+    };
+    let (level, source, text, stack) = if p["type"].as_str() == Some("javascript") {
+        let full = p["text"].as_str().unwrap_or("Uncaught exception");
+        let first = full.lines().next().unwrap_or(full).to_string();
+        (
+            Level::Error,
+            "exception".to_string(),
+            first,
+            Some(bidi_stack_string(full, &p["stackTrace"])),
+        )
+    } else {
+        let method = p["method"].as_str().unwrap_or("log");
+        let level = match method {
+            "error" | "assert" => Level::Error,
+            "warn" => Level::Warn,
+            "info" => Level::Info,
+            "debug" | "trace" => Level::Debug,
+            "clear" | "group" | "groupCollapsed" | "groupEnd" | "profile" | "profileEnd" => {
+                return None
+            }
+            "log" | "dir" | "dirxml" | "table" | "count" | "countReset" | "timeEnd" | "timeLog" => {
+                Level::Log
+            }
+            _ => fallback_level,
+        };
+        // `warn` → `console.warning` so a `pattern` matches on both engines.
+        let source = format!(
+            "console.{}",
+            if method == "warn" { "warning" } else { method }
+        );
+        let text = match p["text"].as_str() {
+            Some(t) => t.to_string(),
+            None => p["args"]
+                .as_array()
+                .map(|args| {
+                    args.iter()
+                        .map(|a| render_bidi_value(a, false))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default(),
+        };
+        (level, source, text, None)
+    };
+    let (url, line, column) = location(&p["stackTrace"]["callFrames"][0]);
+    Some(ConsoleEntry {
+        seq: 0,
+        ts_ms: p["timestamp"].as_f64().unwrap_or(0.0),
+        level,
+        source,
+        text: truncate(&text, CONSOLE_TEXT_CAP),
+        url,
+        line,
+        column,
+        page_url: String::new(),
+        stack,
+        network_request_id: None,
+    })
+}
+
+/// `text` plus one `    at fn (url:line:col)` line per BiDi stack frame
+/// (1-based), mirroring CDP's `exception.description`.
+fn bidi_stack_string(text: &str, stack: &Value) -> String {
+    let mut out = text.to_string();
+    if let Some(frames) = stack["callFrames"].as_array() {
+        for f in frames {
+            let (url, line, col) = location(f);
+            out.push_str(&format!(
+                "\n    at {} ({}:{}:{})",
+                f["functionName"].as_str().unwrap_or("<anonymous>"),
+                url.unwrap_or_default(),
+                line.unwrap_or(0),
+                col.unwrap_or(0)
+            ));
+        }
+    }
+    out
+}
+
+/// Render a BiDi `script.RemoteValue` for console output.
+pub fn render_bidi_remote_value(v: &Value) -> String {
+    render_bidi_value(v, false)
+}
+
+fn render_bidi_value(v: &Value, nested: bool) -> String {
+    let join = |items: &[Value]| {
+        items
+            .iter()
+            .map(|i| render_bidi_value(i, true))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let pairs = |items: &[Value], sep: &str| {
+        items
+            .iter()
+            .map(|pair| {
+                let k = match pair.get(0) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => render_bidi_value(other, true),
+                    None => String::new(),
+                };
+                let val = pair
+                    .get(1)
+                    .map(|x| render_bidi_value(x, true))
+                    .unwrap_or_default();
+                format!("{k}{sep}{val}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match v["type"].as_str().unwrap_or("undefined") {
+        "string" => {
+            let s = v["value"].as_str().unwrap_or("");
+            if nested {
+                json!(s).to_string()
+            } else {
+                s.to_string()
+            }
+        }
+        "number" => match &v["value"] {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            _ => "NaN".into(),
+        },
+        "boolean" => v["value"]
+            .as_bool()
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
+        "null" => "null".into(),
+        "undefined" => "undefined".into(),
+        "bigint" => format!("{}n", v["value"].as_str().unwrap_or("0")),
+        "array" => match v["value"].as_array() {
+            Some(items) => format!("[{}]", join(items)),
+            None => "Array".into(),
+        },
+        "object" => match v["value"].as_array() {
+            Some(items) => format!("{{{}}}", pairs(items, ": ")),
+            None => "Object".into(),
+        },
+        "map" => match v["value"].as_array() {
+            Some(items) => format!("Map {{{}}}", pairs(items, " => ")),
+            None => "Map".into(),
+        },
+        "set" => match v["value"].as_array() {
+            Some(items) => format!("Set {{{}}}", join(items)),
+            None => "Set".into(),
+        },
+        "regexp" => format!(
+            "/{}/{}",
+            v["value"]["pattern"].as_str().unwrap_or(""),
+            v["value"]["flags"].as_str().unwrap_or("")
+        ),
+        "date" => v["value"].as_str().unwrap_or("Date").to_string(),
+        "error" => "Error".into(),
+        "node" => v["value"]["localName"]
+            .as_str()
+            .map(|n| format!("<{n}>"))
+            .unwrap_or_else(|| "Node".into()),
+        "function" => "function".into(),
+        other => other.to_string(),
     }
 }
 
@@ -853,7 +1232,7 @@ impl Drop for CaptureHub {
 
 fn no_capture_error(target_id: &str) -> anyhow::Error {
     anyhow!(
-        "no capture for tab {target_id}: the MCP server attaches to a tab when a tool first touches it (browser_navigate, browser_tab_select, …); navigate or select the tab, act, then read again. Capture is Chromium-only and can be disabled with BROWSER_CONTROL_CAPTURE=0"
+        "no capture for tab {target_id}: the MCP server attaches to a tab when a tool first touches it (browser_navigate, browser_tab_select, …); navigate or select the tab, act, then read again. Capture runs on Chromium (CDP) and Firefox (BiDi) and can be disabled with BROWSER_CONTROL_CAPTURE=0"
     )
 }
 
@@ -883,27 +1262,46 @@ impl CaptureHub {
     }
 
     /// Start capturing `target_id` if not already. Synchronous and
-    /// non-blocking: the attach runs on a background task. No-op on BiDi.
+    /// non-blocking: the attach (CDP) or subscribe + seed (BiDi) runs on a
+    /// background task.
     pub fn touch(&self, backend: &TabBackend, target_id: &str) {
-        let TabBackend::Cdp(client) = backend else {
+        let weak = Arc::downgrade(&self.inner);
+        let mut g = self.lock();
+        if g.disabled || g.tabs.contains_key(target_id) {
             return;
-        };
-        {
-            let mut g = self.lock();
-            if g.disabled || g.tabs.contains_key(target_id) {
-                return;
+        }
+        g.tabs.insert(target_id.to_string(), TabCapture::new());
+        match backend {
+            TabBackend::Cdp(client) => {
+                if g.router.is_none() {
+                    let rx = client.subscribe();
+                    g.router = Some(tokio::spawn(run_router(rx, weak.clone(), HubInner::route)));
+                }
+                drop(g);
+                tokio::spawn(attach_task(client.clone(), target_id.to_string(), weak));
             }
-            g.tabs.insert(target_id.to_string(), TabCapture::new());
-            if g.router.is_none() {
-                let rx = client.subscribe();
-                g.router = Some(tokio::spawn(run_router(rx, Arc::downgrade(&self.inner))));
+            TabBackend::Bidi(client) => {
+                if g.router.is_none() {
+                    let rx = client.subscribe();
+                    g.router = Some(tokio::spawn(run_router(
+                        rx,
+                        weak.clone(),
+                        HubInner::route_bidi,
+                    )));
+                }
+                let cell = g
+                    .bidi
+                    .get_or_insert_with(|| Arc::new(OnceCell::new()))
+                    .clone();
+                drop(g);
+                tokio::spawn(bidi_attach_task(
+                    client.clone(),
+                    target_id.to_string(),
+                    cell,
+                    weak,
+                ));
             }
         }
-        tokio::spawn(attach_task(
-            client.clone(),
-            target_id.to_string(),
-            Arc::downgrade(&self.inner),
-        ));
     }
 
     /// `touch`, then wait (bounded by [`TOUCH_WAIT`]) until the tab's
@@ -963,7 +1361,8 @@ impl CaptureHub {
     }
 
     /// Forget everything (browser switch). No RPCs: dropping the backend
-    /// closes the socket, and the browser discards its sessions.
+    /// closes the socket, and the browser discards its sessions and
+    /// subscriptions.
     pub fn reset(&self) {
         let mut g = self.lock();
         if let Some(h) = g.router.take() {
@@ -971,6 +1370,7 @@ impl CaptureHub {
         }
         g.tabs.clear();
         g.sessions.clear();
+        g.bidi = None;
         g.lost_events = 0;
     }
 
@@ -1022,10 +1422,21 @@ impl CaptureHub {
         self.wait_ready(target_id).await;
         let mut g = self.lock();
         let lost = g.lost_events;
+        let network_armed = g
+            .bidi
+            .as_ref()
+            .and_then(|c| c.get())
+            .map(|c| c.network)
+            .unwrap_or(true);
         let tab = g
             .tabs
             .get_mut(target_id)
             .ok_or_else(|| no_capture_error(target_id))?;
+        if !network_armed {
+            return Err(anyhow!(
+                "network capture is unavailable on this Firefox: session.subscribe for network.* was rejected (needs Firefox 124 or newer); console capture still works"
+            ));
+        }
         let buffered = tab.network.len();
         let method = q.method.as_ref().map(|m| m.to_ascii_uppercase());
         let rtype = q.resource_type.as_ref().map(|t| t.to_ascii_lowercase());
@@ -1078,7 +1489,7 @@ impl CaptureHub {
         timeout: Duration,
     ) -> Result<BodyResult> {
         let TabBackend::Cdp(client) = backend else {
-            return Err(no_capture_error(target_id));
+            return Err(anyhow!("{BIDI_NO_BODIES_HINT}"));
         };
         self.wait_ready(target_id).await;
         let (sid, url, status, mime_type) = {
@@ -1235,37 +1646,127 @@ async fn attach_task(client: Arc<CdpClient>, target_id: String, weak: Weak<Mutex
         Ok::<_, anyhow::Error>(())
     };
     let outcome = tokio::time::timeout(ATTACH_TIMEOUT, attempt).await;
+    finish_attach(&weak, &target_id, outcome);
+}
+
+/// Shared tail of the attach tasks: mark the tab ready, or drop it so the
+/// next touch retries. Waiters are notified either way.
+fn finish_attach(
+    weak: &Weak<Mutex<HubInner>>,
+    target_id: &str,
+    outcome: Result<Result<()>, tokio::time::error::Elapsed>,
+) {
     let Some(inner) = weak.upgrade() else {
         return;
     };
     let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
     match outcome {
         Ok(Ok(())) => {
-            if let Some(tab) = g.tabs.get_mut(&target_id) {
+            if let Some(tab) = g.tabs.get_mut(target_id) {
                 tab.ready = true;
                 tab.notify.notify_waiters();
             }
+            return;
         }
         Ok(Err(e)) => {
             tracing::debug!(target = %target_id, error = %e, "capture attach failed");
-            if let Some(tab) = g.tabs.remove(&target_id) {
-                tab.notify.notify_waiters();
-            }
-            g.sessions.retain(|_, t| t != &target_id);
         }
         Err(_) => {
             tracing::debug!(target = %target_id, "capture attach timed out");
-            if let Some(tab) = g.tabs.remove(&target_id) {
-                tab.notify.notify_waiters();
-            }
-            g.sessions.retain(|_, t| t != &target_id);
         }
     }
+    if let Some(tab) = g.tabs.remove(target_id) {
+        tab.notify.notify_waiters();
+    }
+    g.sessions.retain(|_, t| t != target_id);
 }
 
-/// Drain the broadcast channel into the hub. Exits when the socket closes
-/// or the hub is dropped.
-async fn run_router(mut rx: broadcast::Receiver<CdpEvent>, weak: Weak<Mutex<HubInner>>) {
+/// One global `session.subscribe` per BiDi backend. The console call is
+/// required; the network call is optional so a Firefox older than 124
+/// degrades to console-only capture.
+async fn bidi_subscribe(client: Arc<BidiClient>) -> Result<BidiCapabilities> {
+    client
+        .send(
+            "session.subscribe",
+            json!({ "events": [
+                "log.entryAdded",
+                "browsingContext.navigationStarted",
+                "browsingContext.contextDestroyed",
+            ] }),
+        )
+        .await?;
+    let network = match client
+        .send(
+            "session.subscribe",
+            json!({ "events": [
+                "network.beforeRequestSent",
+                "network.responseCompleted",
+                "network.fetchError",
+            ] }),
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!(error = %e, "BiDi network capture unavailable");
+            false
+        }
+    };
+    Ok(BidiCapabilities { network })
+}
+
+/// BiDi counterpart of `attach_task`: arm the global subscription (first
+/// caller only) and seed the tab's document URL from `getTree`.
+async fn bidi_attach_task(
+    client: Arc<BidiClient>,
+    target_id: String,
+    sub: Arc<OnceCell<BidiCapabilities>>,
+    weak: Weak<Mutex<HubInner>>,
+) {
+    let attempt = async {
+        // Seed the document URL before arming the subscription so replayed
+        // or immediate events are stamped with the right page. When the
+        // subscription already exists (second tab), events may land in the
+        // brief window before the seed; those are backfilled below.
+        let v = client
+            .send(
+                "browsingContext.getTree",
+                json!({ "root": target_id, "maxDepth": 0 }),
+            )
+            .await?;
+        let page_url = truncate(
+            v["contexts"][0]["url"].as_str().unwrap_or_default(),
+            URL_CAP,
+        );
+        if let Some(inner) = weak.upgrade() {
+            let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(tab) = g.tabs.get_mut(&target_id) {
+                if tab.page_url.is_empty() {
+                    tab.page_url = page_url.clone();
+                }
+                for e in tab.console.iter_mut().filter(|e| e.page_url.is_empty()) {
+                    e.page_url = page_url.clone();
+                }
+                for e in tab.network.iter_mut().filter(|e| e.page_url.is_empty()) {
+                    e.page_url = page_url.clone();
+                }
+            }
+        }
+        sub.get_or_try_init(|| bidi_subscribe(client.clone()))
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let outcome = tokio::time::timeout(ATTACH_TIMEOUT, attempt).await;
+    finish_attach(&weak, &target_id, outcome);
+}
+
+/// Drain a broadcast channel into the hub through `route`. Exits when the
+/// socket closes or the hub is dropped.
+async fn run_router<E: Clone + Send + 'static>(
+    mut rx: broadcast::Receiver<E>,
+    weak: Weak<Mutex<HubInner>>,
+    route: fn(&mut HubInner, E),
+) {
     loop {
         match rx.recv().await {
             Ok(ev) => {
@@ -1273,7 +1774,7 @@ async fn run_router(mut rx: broadcast::Receiver<CdpEvent>, weak: Weak<Mutex<HubI
                     return;
                 };
                 let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
-                g.route(ev);
+                route(&mut g, ev);
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 if let Some(inner) = weak.upgrade() {
@@ -1286,6 +1787,7 @@ async fn run_router(mut rx: broadcast::Receiver<CdpEvent>, weak: Weak<Mutex<HubI
                     let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
                     g.tabs.clear();
                     g.sessions.clear();
+                    g.bidi = None;
                     g.router = None;
                 }
                 return;
@@ -1857,5 +2359,509 @@ mod tests {
         hub.touch_and_wait(&backend, "T1").await;
         assert!(hub.captured_tabs().is_empty());
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    // -- WebDriver BiDi ingress ----------------------------------------------
+
+    fn bev(method: &str, params: Value) -> BidiEvent {
+        BidiEvent {
+            method: method.into(),
+            params,
+        }
+    }
+
+    fn bidi_hub_with_tab() -> HubInner {
+        let mut h = HubInner::default();
+        let mut tab = TabCapture::new();
+        tab.ready = true;
+        tab.page_url = "https://app.test/x".into();
+        h.tabs.insert("C1".into(), tab);
+        h
+    }
+
+    #[test]
+    fn bidi_console_uses_text_and_location() {
+        let mut h = bidi_hub_with_tab();
+        h.route_bidi(bev(
+            "log.entryAdded",
+            json!({
+                "type": "console", "level": "warn", "method": "warn",
+                "text": "Deprecated 3", "args": [],
+                "timestamp": 1756816496120.0,
+                "source": {"realm": "R1", "context": "C1"},
+                "stackTrace": {"callFrames": [{"url": "https://app.test/a.js", "lineNumber": 11, "columnNumber": 4, "functionName": "f"}]}
+            }),
+        ));
+        let e = &h.tabs["C1"].console[0];
+        assert_eq!(e.level, Level::Warn);
+        assert_eq!(e.source, "console.warning");
+        assert_eq!((e.line, e.column), (Some(12), Some(5)));
+        assert_eq!(e.page_url, "https://app.test/x");
+        assert_eq!(
+            format_console_line(e),
+            "[warn] 2025-09-02T12:34:56.120Z https://app.test/a.js:12:5  Deprecated 3"
+        );
+    }
+
+    #[test]
+    fn bidi_console_null_text_renders_args() {
+        let mut h = bidi_hub_with_tab();
+        h.route_bidi(bev(
+            "log.entryAdded",
+            json!({
+                "type": "console", "level": "info", "method": "log", "text": null, "timestamp": 1.0,
+                "source": {"context": "C1"},
+                "args": [
+                    {"type": "string", "value": "Deprecated"},
+                    {"type": "number", "value": 3},
+                    {"type": "number", "value": "NaN"},
+                    {"type": "boolean", "value": true},
+                    {"type": "null"},
+                    {"type": "undefined"},
+                    {"type": "object", "value": [["a", {"type": "number", "value": 1}], ["b", {"type": "string", "value": "x"}]]},
+                    {"type": "array", "value": [{"type": "number", "value": 1}]},
+                    {"type": "node", "value": {"localName": "div"}},
+                    {"type": "function"},
+                    {"type": "map", "value": [[{"type": "string", "value": "k"}, {"type": "number", "value": 2}]]},
+                    {"type": "object"}
+                ]
+            }),
+        ));
+        let e = &h.tabs["C1"].console[0];
+        assert_eq!(e.level, Level::Log);
+        assert_eq!(e.source, "console.log");
+        assert_eq!(
+            e.text,
+            "Deprecated 3 NaN true null undefined {a: 1, b: \"x\"} [1] <div> function Map {\"k\" => 2} Object"
+        );
+        assert!(e.url.is_none());
+    }
+
+    #[test]
+    fn bidi_console_group_methods_skipped() {
+        let mut h = bidi_hub_with_tab();
+        for m in ["group", "groupEnd", "clear"] {
+            h.route_bidi(bev(
+                "log.entryAdded",
+                json!({"type": "console", "level": "info", "method": m, "text": "x", "timestamp": 1.0, "source": {"context": "C1"}}),
+            ));
+        }
+        assert!(h.tabs["C1"].console.is_empty());
+    }
+
+    #[test]
+    fn bidi_javascript_error_is_exception_with_stack() {
+        let mut h = bidi_hub_with_tab();
+        h.route_bidi(bev(
+            "log.entryAdded",
+            json!({
+                "type": "javascript", "level": "error",
+                "text": "TypeError: x is not a function", "timestamp": 2.0,
+                "source": {"context": "C1"},
+                "stackTrace": {"callFrames": [{"url": "https://app.test/a.js", "lineNumber": 11, "columnNumber": 4, "functionName": "f"}]}
+            }),
+        ));
+        let e = &h.tabs["C1"].console[0];
+        assert_eq!(e.level, Level::Error);
+        assert_eq!(e.source, "exception");
+        assert_eq!(e.text, "TypeError: x is not a function");
+        assert!(e
+            .stack
+            .as_deref()
+            .unwrap()
+            .contains("at f (https://app.test/a.js:12:5)"));
+        assert_eq!((e.line, e.column), (Some(12), Some(5)));
+    }
+
+    fn bidi_net_triplet(h: &mut HubInner, rid: &str, url: &str, status: u64) {
+        h.route_bidi(bev(
+            "network.beforeRequestSent",
+            json!({"context": "C1", "navigation": null, "redirectCount": 0, "timestamp": 1756816496000.0,
+                   "initiator": {"type": "other"},
+                   "request": {"request": rid, "url": url, "method": "get", "bodySize": 0, "initiatorType": "xmlhttprequest"}}),
+        ));
+        h.route_bidi(bev(
+            "network.responseCompleted",
+            json!({"context": "C1", "timestamp": 1756816496084.0, "redirectCount": 0,
+                   "request": {"request": rid, "url": url, "method": "get"},
+                   "response": {"status": status, "statusText": "OK", "mimeType": "application/json", "fromCache": false, "bytesReceived": 312}}),
+        ));
+    }
+
+    #[test]
+    fn bidi_network_triplet_failed_and_redirect() {
+        let mut h = bidi_hub_with_tab();
+        bidi_net_triplet(&mut h, "1", "https://app.test/api/me", 401);
+        h.route_bidi(bev(
+            "network.beforeRequestSent",
+            json!({"context": "C1", "navigation": null, "redirectCount": 0, "timestamp": 200000.0,
+                   "initiator": {"type": "other"},
+                   "request": {"request": "2", "url": "https://cdn.test/app.js", "method": "GET", "bodySize": 0, "destination": "script"}}),
+        ));
+        h.route_bidi(bev(
+            "network.fetchError",
+            json!({"context": "C1", "timestamp": 200500.0, "errorText": "NS_ERROR_ABORT",
+                   "request": {"request": "2"}}),
+        ));
+        h.route_bidi(bev(
+            "network.beforeRequestSent",
+            json!({"context": "C1", "navigation": "N1", "redirectCount": 0, "timestamp": 300000.0,
+                   "initiator": {"type": "other"},
+                   "request": {"request": "3", "url": "https://app.test/old", "method": "GET", "bodySize": 12}}),
+        ));
+        h.route_bidi(bev(
+            "network.responseCompleted",
+            json!({"context": "C1", "timestamp": 300100.0, "redirectCount": 0,
+                   "request": {"request": "3"},
+                   "response": {"status": 302, "mimeType": "text/html", "bytesReceived": 0}}),
+        ));
+        h.route_bidi(bev(
+            "network.beforeRequestSent",
+            json!({"context": "C1", "navigation": "N1", "redirectCount": 1, "timestamp": 300100.0,
+                   "initiator": {"type": "other"},
+                   "request": {"request": "3", "url": "https://app.test/new", "method": "GET", "bodySize": 0}}),
+        ));
+        let tab = &h.tabs["C1"];
+        assert_eq!(tab.network.len(), 4);
+        assert_eq!(
+            format_network_line(&tab.network[0]),
+            "1  get    https://app.test/api/me  → 401 application/json 312B 84ms [XHR]"
+        );
+        assert_eq!(
+            format_network_line(&tab.network[1]),
+            "2  GET    https://cdn.test/app.js  → failed NS_ERROR_ABORT [Script]"
+        );
+        let c = &tab.network[2];
+        assert_eq!(c.state, NetState::Redirected);
+        assert_eq!(c.status, Some(302));
+        assert!(c.has_post_data);
+        assert!(
+            format_network_line(c).ends_with("→ 302 text/html 0B 100ms [redirect] [Document]"),
+            "{}",
+            format_network_line(c)
+        );
+        assert_eq!(tab.network[3].state, NetState::Pending);
+        assert_eq!(tab.network[3].resource_type.as_deref(), Some("Document"));
+    }
+
+    #[test]
+    fn bidi_resource_type_tiers() {
+        let t = |req: Value, nav: bool, init: Option<&str>, mime: Option<&str>| {
+            bidi_resource_type(&req, nav, init, mime)
+        };
+        assert_eq!(t(json!({}), true, None, None).as_deref(), Some("Document"));
+        assert_eq!(
+            t(json!({}), false, Some("preflight"), None).as_deref(),
+            Some("Preflight")
+        );
+        assert_eq!(
+            t(json!({"initiatorType": "fetch"}), false, None, None).as_deref(),
+            Some("Fetch")
+        );
+        assert_eq!(
+            t(
+                json!({"initiatorType": "link", "destination": "style"}),
+                false,
+                None,
+                None
+            )
+            .as_deref(),
+            Some("Stylesheet")
+        );
+        assert_eq!(
+            t(json!({"destination": "image"}), false, None, None).as_deref(),
+            Some("Image")
+        );
+        assert_eq!(
+            t(json!({}), false, None, Some("text/css")).as_deref(),
+            Some("Stylesheet")
+        );
+        assert_eq!(
+            t(
+                json!({}),
+                false,
+                None,
+                Some("application/json; charset=utf-8")
+            )
+            .as_deref(),
+            Some("Fetch")
+        );
+        assert_eq!(t(json!({}), false, Some("other"), Some("text/plain")), None);
+    }
+
+    #[test]
+    fn bidi_navigation_started_updates_top_level_page_url_only() {
+        let mut h = bidi_hub_with_tab();
+        h.route_bidi(bev(
+            "browsingContext.navigationStarted",
+            json!({"context": "C-child", "navigation": "N2", "url": "https://iframe.test/"}),
+        ));
+        assert_eq!(h.tabs["C1"].page_url, "https://app.test/x");
+        h.route_bidi(bev(
+            "browsingContext.navigationStarted",
+            json!({"context": "C1", "navigation": "N3", "url": "https://app.test/login"}),
+        ));
+        assert_eq!(h.tabs["C1"].page_url, "https://app.test/login");
+        h.route_bidi(bev(
+            "log.entryAdded",
+            json!({"type": "console", "level": "info", "method": "log", "text": "after", "timestamp": 5.0, "source": {"context": "C1"}}),
+        ));
+        assert_eq!(h.tabs["C1"].console[0].page_url, "https://app.test/login");
+    }
+
+    #[test]
+    fn bidi_untouched_context_ignored_and_context_destroyed_drops() {
+        let mut h = bidi_hub_with_tab();
+        h.route_bidi(bev(
+            "log.entryAdded",
+            json!({"type": "console", "level": "info", "method": "log", "text": "x", "timestamp": 1.0, "source": {"context": "C-other"}}),
+        ));
+        h.route_bidi(bev(
+            "network.beforeRequestSent",
+            json!({"context": null, "request": {"request": "9", "url": "u"}, "timestamp": 1.0}),
+        ));
+        assert!(h.tabs["C1"].console.is_empty());
+        assert!(h.tabs["C1"].network.is_empty());
+        h.route_bidi(bev(
+            "browsingContext.contextDestroyed",
+            json!({"context": "C1", "url": "https://app.test/x", "children": []}),
+        ));
+        assert!(h.tabs.is_empty());
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Reject {
+        None,
+        Network,
+        Console,
+    }
+
+    /// BiDi-framed mock: records requests, answers `session.subscribe`
+    /// (optionally rejecting one of the two calls), `getTree {root}`, and
+    /// pushes console/network/foreign-context events right after the last
+    /// accepted subscribe.
+    async fn spawn_bidi_event_mock(reject: Reject) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&t).unwrap();
+                    seen.lock().unwrap().push(req.clone());
+                    let id = req["id"].as_u64().unwrap();
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    let first_event = req["params"]["events"][0]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let is_network_sub =
+                        method == "session.subscribe" && first_event.starts_with("network.");
+                    let is_console_sub =
+                        method == "session.subscribe" && first_event.starts_with("log.");
+                    let rejected = (is_network_sub && reject == Reject::Network)
+                        || (is_console_sub && reject == Reject::Console);
+                    let resp = if rejected {
+                        json!({"type": "error", "id": id, "error": "invalid argument", "message": "unknown event"})
+                    } else {
+                        let result = match method.as_str() {
+                            "session.subscribe" => json!({"subscription": "SUB1"}),
+                            "browsingContext.getTree" => json!({"contexts": [
+                                {"context": "C1", "url": "https://app.test/x", "children": []}
+                            ]}),
+                            _ => json!({}),
+                        };
+                        json!({"type": "success", "id": id, "result": result})
+                    };
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    let push_now = (is_network_sub && reject != Reject::Network)
+                        || (is_console_sub && reject == Reject::Network);
+                    if push_now {
+                        for ev in [
+                            json!({"type": "event", "method": "log.entryAdded", "params": {
+                                "type": "console", "level": "error", "method": "error", "text": "boom",
+                                "timestamp": 1.0, "source": {"context": "C1"}}}),
+                            json!({"type": "event", "method": "log.entryAdded", "params": {
+                                "type": "console", "level": "info", "method": "log", "text": "foreign",
+                                "timestamp": 1.0, "source": {"context": "C-other"}}}),
+                            json!({"type": "event", "method": "network.beforeRequestSent", "params": {
+                                "context": "C1", "navigation": null, "redirectCount": 0, "timestamp": 1000.0,
+                                "initiator": {"type": "other"},
+                                "request": {"request": "7.1", "url": "https://app.test/api", "method": "GET", "bodySize": 0, "initiatorType": "fetch"}}}),
+                            json!({"type": "event", "method": "network.responseCompleted", "params": {
+                                "context": "C1", "timestamp": 1050.0, "redirectCount": 0,
+                                "request": {"request": "7.1"},
+                                "response": {"status": 200, "mimeType": "application/json", "bytesReceived": 11}}}),
+                        ] {
+                            ws.send(Message::Text(ev.to_string())).await.unwrap();
+                        }
+                    }
+                }
+            }
+        });
+        (format!("ws://{addr}"), seen)
+    }
+
+    async fn bidi_backend(url: &str) -> TabBackend {
+        TabBackend::Bidi(Arc::new(BidiClient::connect(url).await.unwrap()))
+    }
+
+    async fn poll_network(hub: &CaptureHub, target: &str) -> usize {
+        for _ in 0..100 {
+            if let Ok(r) = hub
+                .read_network(
+                    target,
+                    &NetworkQuery {
+                        limit: 10,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                if r.matched > 0 {
+                    return r.matched;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        0
+    }
+
+    #[tokio::test]
+    async fn bidi_touch_subscribes_seeds_page_url_and_routes_events() {
+        let (url, seen) = spawn_bidi_event_mock(Reject::None).await;
+        let backend = bidi_backend(&url).await;
+        let hub = CaptureHub::new();
+        hub.touch_and_wait(&backend, "C1").await;
+        assert_eq!(poll_network(&hub, "C1").await, 1);
+        {
+            let reqs = seen.lock().unwrap();
+            let subs: Vec<&Value> = reqs
+                .iter()
+                .filter(|r| r["method"] == "session.subscribe")
+                .collect();
+            assert_eq!(subs.len(), 2);
+            assert_eq!(
+                subs[0]["params"]["events"],
+                json!([
+                    "log.entryAdded",
+                    "browsingContext.navigationStarted",
+                    "browsingContext.contextDestroyed"
+                ])
+            );
+            assert_eq!(
+                subs[1]["params"]["events"],
+                json!([
+                    "network.beforeRequestSent",
+                    "network.responseCompleted",
+                    "network.fetchError"
+                ])
+            );
+            let tree = reqs
+                .iter()
+                .find(|r| r["method"] == "browsingContext.getTree")
+                .expect("getTree");
+            assert_eq!(tree["params"]["root"], "C1");
+            assert_eq!(tree["params"]["maxDepth"], 0);
+        }
+        let c = hub
+            .read_console(
+                "C1",
+                &ConsoleQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].text, "boom");
+        assert_eq!(c.entries[0].page_url, "https://app.test/x");
+        let n = hub
+            .read_network(
+                "C1",
+                &NetworkQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(n.entries[0].state, NetState::Finished);
+        assert_eq!(n.entries[0].resource_type.as_deref(), Some("Fetch"));
+
+        let err = hub
+            .response_body(&backend, "C1", "7.1", 100, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("browser_fetch"));
+
+        // A second tab reuses the subscription.
+        hub.touch_and_wait(&backend, "C2").await;
+        let before = seen.lock().unwrap().len();
+        hub.forget(&backend, "C2");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reqs = seen.lock().unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r["method"] == "session.subscribe")
+                .count(),
+            2
+        );
+        assert_eq!(reqs.len(), before, "forget must not send RPCs on BiDi");
+    }
+
+    #[tokio::test]
+    async fn bidi_network_subscribe_rejected_degrades_to_console_only() {
+        let (url, _seen) = spawn_bidi_event_mock(Reject::Network).await;
+        let backend = bidi_backend(&url).await;
+        let hub = CaptureHub::new();
+        hub.touch_and_wait(&backend, "C1").await;
+        let mut text = String::new();
+        for _ in 0..100 {
+            let c = hub
+                .read_console(
+                    "C1",
+                    &ConsoleQuery {
+                        limit: 10,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            if let Some(e) = c.entries.first() {
+                text = e.text.clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(text, "boom");
+        let err = hub
+            .read_network("C1", &NetworkQuery::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Firefox 124"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bidi_console_subscribe_failure_leaves_no_state_and_retries() {
+        let (url, seen) = spawn_bidi_event_mock(Reject::Console).await;
+        let backend = bidi_backend(&url).await;
+        let hub = CaptureHub::new();
+        hub.touch_and_wait(&backend, "C1").await;
+        assert!(hub.captured_tabs().is_empty());
+        hub.touch_and_wait(&backend, "C1").await;
+        assert!(hub.captured_tabs().is_empty());
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "session.subscribe")
+                .count(),
+            2
+        );
     }
 }

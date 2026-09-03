@@ -126,14 +126,12 @@ impl ServerState {
         }
     }
 
-    /// Engine gate for the capture tools (`browser_console_messages`,
-    /// `browser_network_requests`, `browser_network_body`).
-    pub async fn ensure_capture_supported(&self, tool_name: &str) -> Result<()> {
-        self.ensure_cdp_engine(
-            tool_name,
-            "console/network capture is native CDP; on Firefox use browser_eval (install a window.onerror hook, or read performance.getEntriesByType('resource')) or switch to a Chromium browser via browser_select",
-        )
-        .await
+    /// Engine gate for `browser_network_body`. The console/network listing
+    /// tools work on both engines (CDP domains or a BiDi subscription) and
+    /// need no gate; bodies require CDP `Network.getResponseBody`.
+    pub async fn ensure_body_capture_supported(&self, tool_name: &str) -> Result<()> {
+        self.ensure_cdp_engine(tool_name, crate::session::capture::BIDI_NO_BODIES_HINT)
+            .await
     }
 
     /// Validate that the active browser speaks CDP, without touching the

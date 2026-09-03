@@ -76,7 +76,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_storage_get());
     registry.register(make_storage_set());
     registry.register(make_wait_for_cookie());
-    // Passive console/network capture (native CDP, Chromium-only).
+    // Passive console/network capture (native CDP or BiDi events; bodies Chromium-only).
     registry.register(make_console_messages());
     registry.register(make_network_requests());
     registry.register(make_network_body());
@@ -1728,7 +1728,8 @@ fn make_console_messages() -> RegisteredTool {
              failed resource loads and CSP violations) captured for a tab. Capture starts when \
              the MCP server first touches a tab (browser_navigate, browser_tab_select, …) and \
              keeps the last {CONSOLE_CAP} entries across navigations until `clear`. Pass \
-             `pattern` or `only_errors` to keep output small. Native CDP, Chromium-only."
+             `pattern` or `only_errors` to keep output small. Native protocol events on \
+             Chromium (CDP) and Firefox (BiDi); no Node."
         ),
         input_schema: json!({
             "type": "object",
@@ -1743,9 +1744,6 @@ fn make_console_messages() -> RegisteredTool {
                     clear: bool_arg(&args, "clear", false)?,
                 };
                 let json_out = wants_json(&args)?;
-                state
-                    .ensure_capture_supported("browser_console_messages")
-                    .await?;
                 let (_backend, target_id) = state.resolve_target_for_args(&args).await?;
                 let report = state.capture.read_console(&target_id, &q).await?;
                 if json_out {
@@ -1775,7 +1773,7 @@ fn make_network_requests() -> RegisteredTool {
     });
     props["resource_type"] = json!({
         "type": "string",
-        "description": "CDP resource type: Document, XHR, Fetch, Script, Stylesheet, Image, Font, WebSocket, …"
+        "description": "Resource type: Document, XHR, Fetch, Script, Stylesheet, Image, Font, WebSocket, … On Firefox the type is derived from the request destination or MIME type and may be absent."
     });
     RegisteredTool {
         name: "browser_network_requests".into(),
@@ -1783,7 +1781,8 @@ fn make_network_requests() -> RegisteredTool {
             "List network requests captured for a tab: method, URL, status, MIME type, size, \
              duration, failure reason, and the request id to pass to browser_network_body. \
              Capture starts when the MCP server first touches a tab and keeps the last \
-             {NETWORK_CAP} requests across navigations until `clear`. Native CDP, Chromium-only."
+             {NETWORK_CAP} requests across navigations until `clear`. Native protocol events \
+             on Chromium (CDP) and Firefox (BiDi); no Node."
         ),
         input_schema: json!({
             "type": "object",
@@ -1802,9 +1801,6 @@ fn make_network_requests() -> RegisteredTool {
                     clear: bool_arg(&args, "clear", false)?,
                 };
                 let json_out = wants_json(&args)?;
-                state
-                    .ensure_capture_supported("browser_network_requests")
-                    .await?;
                 let (_backend, target_id) = state.resolve_target_for_args(&args).await?;
                 let report = state.capture.read_network(&target_id, &q).await?;
                 if json_out {
@@ -1825,7 +1821,8 @@ fn make_network_body() -> RegisteredTool {
                       browser_network_requests. Text bodies come back as text, binary as an \
                       embedded base64 resource, followed by a JSON metadata block. Default cap \
                       256 KiB, hard max 8 MiB. Bodies are evicted by the browser after \
-                      navigation, so fetch promptly. Native CDP, Chromium-only."
+                      navigation, so fetch promptly. Chromium-only: Firefox does not expose \
+                      captured bodies; use browser_fetch there."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -1849,7 +1846,7 @@ fn make_network_body() -> RegisteredTool {
                     .ok_or_else(|| anyhow!("missing 'request_id'"))?;
                 let max_bytes = count_arg(&args, "max_bytes", BODY_DEFAULT_MAX, 1, BODY_HARD_MAX)?;
                 state
-                    .ensure_capture_supported("browser_network_body")
+                    .ensure_body_capture_supported("browser_network_body")
                     .await?;
                 let (backend, target_id) = state.resolve_target_for_args(&args).await?;
                 let body = state
@@ -3578,27 +3575,149 @@ mod tests {
             .expect_err("must error");
         assert!(err.to_string().contains("missing 'request_id'"), "{err:#}");
 
+        // Only bodies are gated on the engine; the listing tools reach the
+        // backend on Firefox (and fail here only because nothing listens).
         let state = ServerState::new(ResolvedBrowser {
             engine: Engine::Bidi,
             endpoint: "ws://127.0.0.1:0".into(),
             source: Source::External,
         });
-        for (tool, args) in [
-            ("browser_console_messages", json!({})),
-            ("browser_network_requests", json!({})),
-            ("browser_network_body", json!({"request_id": "1"})),
-        ] {
-            let err = handler_for(tool)(state.clone(), args)
-                .await
-                .expect_err("BiDi must error");
-            match err.downcast_ref::<SessionError>() {
-                Some(SessionError::EngineUnsupported { tool: t, hint, .. }) => {
-                    assert_eq!(t, tool);
-                    assert!(hint.contains("browser_eval") && hint.contains("browser_select"));
-                }
-                other => panic!("{tool}: expected EngineUnsupported, got {other:?}"),
+        let err = handler_for("browser_network_body")(state.clone(), json!({"request_id": "1"}))
+            .await
+            .expect_err("BiDi must error");
+        match err.downcast_ref::<SessionError>() {
+            Some(SessionError::EngineUnsupported { tool, hint, .. }) => {
+                assert_eq!(tool, "browser_network_body");
+                assert!(hint.contains("browser_fetch") && hint.contains("browser_select"));
             }
+            other => panic!("expected EngineUnsupported, got {other:?}"),
         }
+        for tool in ["browser_console_messages", "browser_network_requests"] {
+            let err = handler_for(tool)(state.clone(), json!({}))
+                .await
+                .expect_err("unreachable endpoint must error");
+            assert!(
+                !matches!(
+                    err.downcast_ref::<SessionError>(),
+                    Some(SessionError::EngineUnsupported { .. })
+                ),
+                "{tool} must not be engine-gated on BiDi: {err:#}"
+            );
+        }
+    }
+
+    /// BiDi-framed CDP-free mock for the capture tools on Firefox: answers
+    /// the session handshake, tree, navigate and subscribe, then pushes one
+    /// console error and one finished request on context `C1`.
+    async fn spawn_bidi_capture_mock() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let req: Value = serde_json::from_str(&t).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                let result = match method.as_str() {
+                    "session.new" => json!({"sessionId": "S1", "capabilities": {}}),
+                    "browsingContext.getTree" => json!({"contexts": [
+                        {"context": "C1", "url": "https://app.test/", "children": []}
+                    ]}),
+                    "browsingContext.navigate" => {
+                        json!({"navigation": "N1", "url": "https://app.test/x"})
+                    }
+                    "script.evaluate" => {
+                        json!({"type": "success", "result": {"type": "number", "value": 1}})
+                    }
+                    _ => json!({}),
+                };
+                ws.send(Message::Text(
+                    json!({"type": "success", "id": id, "result": result}).to_string(),
+                ))
+                .await
+                .unwrap();
+                let first_event = req["params"]["events"][0].as_str().unwrap_or("");
+                if method == "session.subscribe" && first_event.starts_with("network.") {
+                    for ev in [
+                        json!({"type": "event", "method": "log.entryAdded", "params": {
+                            "type": "console", "level": "error", "method": "error", "text": "boom",
+                            "timestamp": 1756816496120.0, "source": {"context": "C1"},
+                            "stackTrace": {"callFrames": [{"url": "https://app.test/a.js", "lineNumber": 3, "columnNumber": 0}]}}}),
+                        json!({"type": "event", "method": "network.beforeRequestSent", "params": {
+                            "context": "C1", "navigation": null, "redirectCount": 0, "timestamp": 1756816496000.0,
+                            "initiator": {"type": "other"},
+                            "request": {"request": "9.1", "url": "https://app.test/api/me", "method": "GET", "bodySize": 0, "initiatorType": "xmlhttprequest"}}}),
+                        json!({"type": "event", "method": "network.responseCompleted", "params": {
+                            "context": "C1", "timestamp": 1756816496084.0, "redirectCount": 0,
+                            "request": {"request": "9.1"},
+                            "response": {"status": 401, "mimeType": "application/json", "bytesReceived": 11}}}),
+                    ] {
+                        ws.send(Message::Text(ev.to_string())).await.unwrap();
+                    }
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn capture_tools_work_on_bidi_and_body_is_cdp_only() {
+        let endpoint = spawn_bidi_capture_mock().await;
+        let state = ServerState::new(ResolvedBrowser {
+            engine: Engine::Bidi,
+            endpoint,
+            source: Source::External,
+        });
+        let route = json!({"target": "app\\.test"});
+        let mut nav = route.clone();
+        nav["url"] = json!("https://app.test/x");
+        handler_for("browser_navigate")(state.clone(), nav)
+            .await
+            .unwrap();
+        let mut text = String::new();
+        for _ in 0..100 {
+            let out = handler_for("browser_console_messages")(state.clone(), route.clone())
+                .await
+                .unwrap();
+            text = out["content"][0]["text"].as_str().unwrap().to_string();
+            if text.contains("boom") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            text.starts_with("console tab=C1 page=https://app.test/  showing 1 of 1 matched (1 buffered, 0 evicted, 0 events lost)\n-- page: https://app.test/ --\n[error] 2025-09-02T12:34:56.120Z https://app.test/a.js:4:1  boom"),
+            "{text}"
+        );
+        let mut q = route.clone();
+        q["status"] = json!("4xx");
+        let out = handler_for("browser_network_requests")(state.clone(), q)
+            .await
+            .unwrap();
+        let net = out["content"][0]["text"].as_str().unwrap();
+        assert!(
+            net.contains(
+                "9.1  GET    https://app.test/api/me  → 401 application/json 11B 84ms [XHR]"
+            ),
+            "{net}"
+        );
+        let mut q = route.clone();
+        q["request_id"] = json!("9.1");
+        let err = handler_for("browser_network_body")(state.clone(), q)
+            .await
+            .unwrap_err();
+        match err.downcast_ref::<SessionError>() {
+            Some(SessionError::EngineUnsupported { hint, .. }) => {
+                assert!(hint.contains("browser_fetch"))
+            }
+            other => panic!("expected EngineUnsupported, got {other:?}"),
+        }
+        assert_eq!(state.capture.captured_tabs(), vec!["C1".to_string()]);
+        handler_for("browser_tab_close")(state.clone(), json!({"target_id": "C1"}))
+            .await
+            .unwrap();
+        assert!(state.capture.captured_tabs().is_empty());
     }
 
     #[tokio::test]
