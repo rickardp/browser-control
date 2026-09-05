@@ -1,6 +1,6 @@
 use anyhow::Result;
 use browser_control::cli::{
-    agent_instructions, cookies, curl, eval, fetch, list, set, show, storage,
+    agent_instructions, cookies, curl, eval, fetch, key, list, set, show, storage,
     targets as cli_targets, wait, wait_for_cookie,
 };
 use clap::{Parser, Subcommand};
@@ -139,6 +139,17 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: storage::StorageCmd,
+    },
+    /// Press a key on the focused element, e.g. `Enter`, `Tab`, `Control+A`.
+    #[command(alias = "press-key")]
+    Key {
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
+        browser: Option<String>,
+        /// Key or chord: `Enter`, `ArrowDown`, `Control+A`, `Shift+Tab`.
+        key: String,
+        /// Select a page target by URL regex (default: first page).
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Evaluate a JavaScript expression in the active page.
     Eval {
@@ -297,6 +308,11 @@ async fn main() -> Result<()> {
         }
         Command::Curl { browser, args } => curl::run(browser, args).await,
         Command::Storage { action } => storage::run(action).await,
+        Command::Key {
+            browser,
+            key,
+            target,
+        } => key::run(browser, key, target).await,
         Command::Eval {
             browser,
             expression,

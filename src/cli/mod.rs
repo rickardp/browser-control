@@ -4,6 +4,7 @@ pub mod curl;
 pub mod env_resolver;
 pub mod eval;
 pub mod fetch;
+pub mod key;
 pub mod list;
 pub mod mcp;
 pub mod output;

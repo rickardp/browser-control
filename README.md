@@ -56,7 +56,7 @@ $script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/sc
 Requires Rust 1.80 or newer when building from source. A Node runtime
 (`bun` preferred, `node`+`npm` accepted) is required only if you invoke the
 Playwright-sidecar MCP tools (CSS-selector `browser_click`/`browser_type`,
-`browser_press_key`, `browser_wait_for`, `browser_pdf_save`); the sidecar is
+`browser_wait_for`, `browser_pdf_save`); the sidecar is
 spawned lazily on first use. Snapshots, refs, and console/network capture
 are native and need no Node.
 
@@ -204,8 +204,8 @@ typing semantics, which console entries exist, iframe capture, session
 lifecycle), see [docs/engine-parity.md](docs/engine-parity.md).
 - **Playwright sidecar** (Chromium family, needs `bun` or `node`): CSS
   `selector` interaction on `browser_click` / `browser_type` /
-  `browser_hover` / `browser_drag`, plus `browser_press_key`,
-  `browser_wait_for`, `browser_pdf_save`. On the first call the sidecar is
+  `browser_hover` / `browser_drag`, plus `browser_wait_for` and
+  `browser_pdf_save`. On the first call the sidecar is
   spawned (prefers `bun`, falls back to `node`+`npm`) against the active
   browser's CDP endpoint. The `--playwright-version` flag overrides the pinned
   `playwright-core` version.

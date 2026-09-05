@@ -15,6 +15,7 @@ pub mod foreground;
 pub mod freshness;
 pub mod input;
 pub mod input_bidi;
+pub mod keys;
 pub mod scratch;
 pub mod tabs;
 pub mod targets;

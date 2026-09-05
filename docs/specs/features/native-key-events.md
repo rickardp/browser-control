@@ -165,13 +165,31 @@ The integration pair runs on both engines, since they share no dispatch code.
 
 ## Risks
 
-**The motivating case may not be solved by this.** The immediate driver was
-navigating Chromium's saved-password autofill dropdown with `ArrowDown`+`Enter`.
-That popup is browser UI, not page content, and CDP `Input` events are
-delivered to the renderer — they may never reach it. **Spike this first**, in an
-afternoon, before building the rest: if the dropdown does not respond, the
-feature is still worth having for page-level keyboard control, but it will not
-unblock credential autofill, and we should stop describing it as though it will.
+**The motivating case is not solved by this — spiked and confirmed.**
+
+Measured against `gamesglobal.okta.com`, which has a saved credential in the
+browser-control profile:
+
+| | |
+|---|---|
+| Username field | **autofilled by Chromium on its own**, before any input |
+| Password field | stayed empty |
+| `ArrowDown` ×2 on the focused password field | no dropdown, no fill |
+| Submitting afterwards | "we found some errors" — the field really was empty |
+
+So Chromium's on-load autofill reaches a username but not a password (it
+requires a user gesture the renderer never sees), and the popup does not
+respond to CDP-dispatched keys — it is browser-process UI, while `Input.*`
+events are delivered to the renderer.
+
+**This does not diminish the feature**, which was verified working in the same
+session: `Control+A` selected `[0,11]` in a real input, `Delete` cleared it,
+printable keys inserted, `Tab` moved focus, and every event arrived with
+`isTrusted: true` — which is precisely what synthetic JS events cannot do and
+why frameworks ignored the old fallback.
+
+It does mean **keyboard automation is not a route to credential autofill**, and
+the docs should not imply it is.
 
 **Key tables rot.** Scope is deliberately US-layout ASCII plus named keys.
 Anything beyond that should go through `type` and `Input.insertText`, which is

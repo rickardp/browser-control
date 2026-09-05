@@ -2318,6 +2318,7 @@ enum NativeAction {
     Type,
     Hover,
     Drag,
+    PressKey,
 }
 
 /// How an interaction tool call is routed.
@@ -2330,9 +2331,16 @@ enum Route {
 /// Decide the route from the (selector, ref) argument pairs. Validation
 /// only — fires before any backend access. Every pair must carry exactly
 /// one side, and all pairs must agree.
-fn route_mode(args: &Value, ref_pairs: &[(&str, &str)]) -> Result<Route> {
+fn route_mode(args: &Value, ref_pairs: &[(&str, &str)], has_native: bool) -> Result<Route> {
     if ref_pairs.is_empty() {
-        return Ok(Route::Sidecar);
+        // No element to address. Such a tool is native when it has a native
+        // path at all (`press_key` targets whatever has focus), and sidecar
+        // otherwise (`wait_for`, `pdf_save`).
+        return Ok(if has_native {
+            Route::Native
+        } else {
+            Route::Sidecar
+        });
     }
     let mut native = 0;
     let mut sidecar = 0;
@@ -2381,6 +2389,17 @@ async fn run_native(
             .ok_or_else(|| anyhow!("missing '{key}'"))
     };
     match action {
+        NativeAction::PressKey => {
+            let spec = args
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing 'key'"))?;
+            let chord = crate::session::keys::parse_chord(spec)?;
+            backend
+                .press_key_on_tab(&target_id, &chord, timeout)
+                .await?;
+            Ok(text_content(format!("pressed {spec}")))
+        }
         NativeAction::Click => {
             let r = ref_arg("ref")?;
             let entry = resolve_ref(state, &backend, &target_id, &r).await?;
@@ -2553,7 +2572,7 @@ impl SidecarTool {
             handler: handler(move |state, args| {
                 let param_names = param_names.clone();
                 Box::pin(async move {
-                    match (route_mode(&args, ref_pairs)?, native) {
+                    match (route_mode(&args, ref_pairs, native.is_some())?, native) {
                         (Route::Native, Some(action)) => {
                             run_native(&state, name, action, &args).await
                         }
@@ -2722,8 +2741,10 @@ fn make_drag() -> RegisteredTool {
 fn make_press_key() -> RegisteredTool {
     SidecarTool {
         name: "browser_press_key",
-        description: "Press a keyboard key (Playwright key name, e.g. 'Enter', 'Control+A'). \
-                      Chromium-only.",
+        description: "Press a keyboard key on the focused element, e.g. 'Enter', 'Tab', \
+                      'Escape', 'ArrowDown', 'Control+A'. Modifiers are Control/Ctrl, Shift, \
+                      Alt/Option and Meta/Cmd, joined with '+'. Native on Chromium and Firefox, \
+                      no Node needed.",
         method: "press_key",
         params: vec![SidecarParam {
             name: "key",
@@ -2731,7 +2752,7 @@ fn make_press_key() -> RegisteredTool {
             required: true,
         }],
         success: "pressed",
-        native: None,
+        native: Some(NativeAction::PressKey),
         ref_pairs: &[],
     }
     .build()
@@ -3208,16 +3229,16 @@ mod tests {
     fn route_mode_validates_selector_ref_pairs() {
         let pairs = &[("selector", "ref")];
         assert_eq!(
-            route_mode(&json!({"ref": "e1"}), pairs).unwrap(),
+            route_mode(&json!({"ref": "e1"}), pairs, true).unwrap(),
             Route::Native
         );
         assert_eq!(
-            route_mode(&json!({"selector": "#x"}), pairs).unwrap(),
+            route_mode(&json!({"selector": "#x"}), pairs, true).unwrap(),
             Route::Sidecar
         );
-        let err = route_mode(&json!({}), pairs).unwrap_err().to_string();
+        let err = route_mode(&json!({}), pairs, true).unwrap_err().to_string();
         assert!(err.contains("exactly one of `selector`"), "{err}");
-        let err = route_mode(&json!({"selector": "#x", "ref": "e1"}), pairs)
+        let err = route_mode(&json!({"selector": "#x", "ref": "e1"}), pairs, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
@@ -3226,16 +3247,23 @@ mod tests {
             ("source_selector", "source_ref"),
             ("target_selector", "target_ref"),
         ];
-        let err = route_mode(&json!({"source_ref": "e1", "target_selector": "#y"}), drag)
-            .unwrap_err()
-            .to_string();
+        let err = route_mode(
+            &json!({"source_ref": "e1", "target_selector": "#y"}),
+            drag,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not a mix"), "{err}");
         assert_eq!(
-            route_mode(&json!({"source_ref": "e1", "target_ref": "e2"}), drag).unwrap(),
+            route_mode(&json!({"source_ref": "e1", "target_ref": "e2"}), drag, true).unwrap(),
             Route::Native
         );
         // Sidecar-only tools never route natively.
-        assert_eq!(route_mode(&json!({}), &[]).unwrap(), Route::Sidecar);
+        // No ref pairs and no native path (wait_for, pdf_save) -> sidecar.
+        assert_eq!(route_mode(&json!({}), &[], false).unwrap(), Route::Sidecar);
+        // No ref pairs but a native path (press_key) -> native.
+        assert_eq!(route_mode(&json!({}), &[], true).unwrap(), Route::Native);
     }
 
     #[tokio::test]

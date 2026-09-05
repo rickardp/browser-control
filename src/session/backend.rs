@@ -753,6 +753,38 @@ impl TabBackend {
         }
     }
 
+    /// Press a key, with any modifiers held around it.
+    ///
+    /// Keyboard input goes to whatever currently has focus, so unlike the
+    /// other native actions this addresses no node.
+    pub async fn press_key_on_tab(
+        &self,
+        target_id: &str,
+        chord: &crate::session::keys::Chord,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let chord = chord.clone();
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move { crate::session::input::press_key(c, &sid, &chord).await },
+                )
+                .await
+            }
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::press_key(c, target_id, chord),
+                )
+                .await
+            }
+        }
+    }
+
     /// Hover the element with `backend_node_id`.
     pub async fn hover_node(
         &self,
