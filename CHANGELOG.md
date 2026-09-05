@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.3.0 — 2026-09-05
+
+### Added
+
+- `browser_press_key` is native on both engines — CDP `Input.dispatchKeyEvent`
+  and BiDi `input.performActions` — so keyboard input no longer needs the
+  Playwright sidecar, `bun`, or `node`. **Firefox gains `press_key` for the
+  first time**, as the sidecar was Chromium-only. Chords take the form
+  `Enter`, `ArrowDown`, `Control+A`, `Shift+Tab`, with modifier aliases
+  (`Ctrl`, `Cmd`/`Meta`, `Option`), and an unknown key names the closest
+  match rather than being silently dropped.
+- `browser-control key <chord>` presses a key on the focused element from the
+  CLI.
+- `browser-control type` types into the focused element, with `--text` or
+  `--stdin`. `--stdin` exists so a secret can reach a login form without
+  passing through the agent driving it:
+
+      op read op://vault/item/password | browser-control type --stdin --submit
+
+  The value crosses an OS pipe between two processes the caller spawned; the
+  command reports only a character count and never logs, traces, or returns
+  it. Any vault works, because anything that prints a secret on stdout is a
+  resolver — `op`, `bw`, `vault`, `security`, a `.env` file, an environment
+  variable. browser-control stores no credentials and resolves no references.
+  It targets the focused element rather than a ref, because refs live in the
+  MCP server's state and a separate process cannot see them.
+
+### Fixed
+
+- **Named tabs now work on Firefox.** They never had: `tab open` reported
+  success with a target id and the next command reported the tab
+  unregistered. Firefox mints fresh browsing-context ids for every BiDi
+  session, so an id persisted by one process was always dead to the next.
+  A named tab whose id has been regenerated is now re-found by its last URL
+  and the row repaired — only on engines whose ids are session-scoped, since
+  relocating on CDP would silently retarget a different tab.
+- `--target` no longer opens a second connection to resolve a tab, which BiDi
+  rejected with "Maximum number of active sessions", and the BiDi session is
+  released when a command finishes instead of leaking into the next one.
+- The CLI runs on a thread with a 16 MiB stack. Windows gives the main thread
+  1 MiB, and clap's command tree overflowed it in a debug build before any
+  command ran — `--help` included.
+- A flaky capture test polled for a network entry's existence rather than its
+  terminal state, so it could observe `Pending` where it asserted `Finished`.
+
+### Changed
+
+- CI actions moved off the deprecated Node 20 runtime (`actions/checkout` v4
+  to v5, `softprops/action-gh-release` v2 to v3).
+
 ## 1.2.1 — 2026-09-03
 
 ### Fixed
