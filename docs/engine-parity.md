@@ -20,7 +20,10 @@ on Firefox.
 | `browser_snapshot`, `browser_find` | yes | yes | differs: see *Accessibility snapshot* |
 | `browser_click` / `browser_type` / `browser_hover` / `browser_drag` with `ref` | yes | yes | differs: see *Input* |
 | `browser_click` / `browser_type` / `browser_hover` / `browser_drag` with CSS `selector` | yes (Playwright sidecar, needs `bun`/`node`) | no | Chromium-only; use `ref` on Firefox |
-| `browser_press_key`, `browser_wait_for`, `browser_pdf_save` | yes (sidecar) | no | Chromium-only |
+| Named tabs (`<browser>/<tab>`) | yes | yes | Firefox regenerates browsing-context ids per BiDi session, so a stored id is dead to the next process; the registry re-finds the tab by its last URL and repairs the row |
+| `browser_press_key` | yes (native) | yes (native) | CDP `Input.dispatchKeyEvent` / BiDi `input.performActions` |
+| CLI `type` (focused element) | yes (native) | yes (native) | CDP `Input.insertText`; BiDi sends key actions, so it cannot select-all first — clear the field before piping if replacement is wanted |
+| `browser_wait_for`, `browser_pdf_save` | yes (sidecar) | no | Chromium-only |
 | `browser_take_screenshot` | yes | yes | differs: `max_width` is ignored on Firefox; see *Screenshots* |
 | `browser_console_messages`, `browser_network_requests` | yes | yes (network needs Firefox 124+) | differs: see *Console and network capture* |
 | `browser_network_body` | yes | no | Chromium-only: BiDi exposes bodies only through browser-side data collectors, which are deliberately not enabled |
@@ -116,8 +119,9 @@ on Firefox.
 
 The sidecar (`playwright-core` over `connectOverCDP`) is Chromium-only by
 construction: Playwright cannot attach to a user-launched Firefox. On Firefox,
-use refs instead of CSS selectors; `browser_press_key`, `browser_wait_for`,
-and `browser_pdf_save` have no Firefox equivalent yet.
+use refs instead of CSS selectors; `browser_wait_for` and `browser_pdf_save`
+have no Firefox equivalent yet. `browser_press_key` does: it dispatches
+`input.performActions` on Firefox and `Input.dispatchKeyEvent` on Chromium.
 
 ## Keeping this page honest
 

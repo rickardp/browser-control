@@ -1,0 +1,172 @@
+# Credential injection
+
+`browser-control type --stdin` reads a value from a pipe and puts it in the
+focused element. That is the whole feature.
+
+**Status: implemented.** Verified end to end against the macOS Keychain.
+
+## The principle
+
+A secret has to reach a login form without passing through the agent driving
+the login. The Unix answer is a pipe, and the Unix division of labour is that
+**browser-control has no opinion about where the secret comes from**:
+
+```sh
+op read op://Automation/site/password | browser-control type --stdin --submit
+bw get password site                  | browser-control type --stdin --submit
+vault kv get -field=password kv/site  | browser-control type --stdin --submit
+security find-internet-password -s site -w | browser-control type --stdin --submit
+printf '%s' "$SITE_PW"                | browser-control type --stdin --submit
+```
+
+Everything to the left of the pipe is the operator's business. A managed
+vault, the OS keychain, a `.env` file, an environment variable, `echo` in a
+throwaway shell — all equally valid, all outside this tool. Anything that
+prints a secret on stdout is a resolver, and browser-control never learns
+which one was used.
+
+**The security boundary sits at the pipe, not inside browser-control.** That
+is deliberate. A tool that stored credentials, or resolved references, or
+knew about vault vendors, would be taking responsibility for a decision the
+operator is better placed to make — and would acquire, in a public
+automation tool, a capability indistinguishable from credential-stealing
+software. It does none of those things. It reads stdin.
+
+## What browser-control guarantees
+
+Only what a program at the end of a pipe can:
+
+- The value goes to the focused element and nowhere else.
+- It is never printed, logged, traced, or returned. The command reports a
+  character count.
+- Errors never include stdin.
+- Nothing is written to disk, cached, or kept after the process exits.
+
+## What it does not guarantee, and cannot
+
+On a single-user workstation the agent and the resolver run as the same user.
+Whatever the resolver can read, an agent that wants to can read too. A pipe
+does not change that, and neither would any design inside this tool — a
+resolver built into browser-control would need the same credentials, readable
+by the same user.
+
+A real guarantee needs a boundary that does not exist here: a separate
+principal (a daemon holding credentials the agent's user cannot read), or a
+human approving each release. Both belong outside browser-control. If one
+appears — 1Password's agentic autofill is the closest, though it currently
+approves via desktop biometrics and supports only Browserbase — it plugs in
+on the left of the pipe with no change here.
+
+So the bar met is the one CI systems meet: the value is not in the agent's
+context, its use is auditable at the vault, and a scoped token bounds the
+blast radius.
+
+## Interface
+
+```
+browser-control type [--text <s> | --stdin] [--submit] [--press-sequentially]
+                     [-b <browser>[/<tab>]] [--target <regex>]
+```
+
+Targets the **focused** element, not a ref. Refs live in the MCP server's
+state; a separate CLI process cannot see them. Focus the field first with a
+ref-based `browser_click` over MCP, or by tabbing to it.
+
+### Refusals
+
+Each is a real vault-CLI failure mode that would otherwise be typed verbatim
+into a password field. All fire before any browser I/O.
+
+| Input | Why it is refused |
+|---|---|
+| `--text` with `--stdin` | ambiguous |
+| neither | nothing to type |
+| empty stdin | the resolver produced nothing — usually a mis-scoped token |
+| multi-line stdin | a resolver should print one secret; extra lines mean a banner or warning on stdout |
+
+One trailing newline is stripped, since every CLI emits one. Spaces and
+symbols inside the value are preserved.
+
+## Implementation
+
+| File | What it does |
+|---|---|
+| `src/session/input.rs` | `type_focused` — select existing content via `document.activeElement`, then `Input.insertText`, then optional Enter |
+| `src/session/input_bidi.rs` | `type_focused` — key actions, which is what typing into focus means on BiDi. No select-all: without a node handle there is nothing to select, so clear the field first if replacement is wanted |
+| `src/session/backend.rs` | `type_into_focused` — engine dispatch, no node id |
+| `src/cli/type_cmd.rs` | the command, stdin handling, refusals |
+| `src/main.rs`, `src/cli/mod.rs` | wiring |
+| `src/cli/agent_instructions.rs` | agents must never ask for or handle a password; pipe it. One-time codes are different — single-use, safe to relay |
+
+## Explicitly out of scope
+
+- **Vault integrations.** The shell does resolution.
+- **Reference schemes** (`op://…` parsing, resolver config). The shell does that too.
+- **Reading the browser's own password store.** Considered and dropped: it
+  would add a decryption capability to a public automation tool, and every
+  external vault already works through the pipe.
+- **MFA.** A second factor is a different human step in a different place —
+  the operator's phone — and an agentic concern: recognise the prompt, ask,
+  relay. See `remote-auth.md` in the games-bronze repo.
+- **Site knowledge.** The agent finds the field; browser-control fills it.
+
+## Verification
+
+Performed against a live browser, 2026-09-05.
+
+| Check | Result |
+|---|---|
+| `--text` + `--stdin`, neither, empty, multi-line | all refused before browser I/O |
+| Piped value reaches a focused password field | 14 chars in, `value.length == 14` |
+| `input` event fires | yes — trusted-event semantics frameworks require |
+| End to end from a real vault (`security … -w \| type --stdin`) | exact secret landed; asserted as a boolean so the value was never printed |
+| `--submit` | form submitted carrying all 11 characters |
+| Value absent from stdout | command reports only "typed N characters" |
+| **Leak test under maximum logging** | `BROWSER_CONTROL_LOG=trace`: 104 KB of trace output, secret absent from stdout, stderr and `browser.log`, while the field confirmed receipt. Outgoing CDP frames are never logged; only undecodable inbound ones are |
+| Unicode | `pä§§wörd-日本語-🔑` round-trips byte-identical; the reported count is scalar chars (14), not UTF-16 units (15) |
+| Leading/trailing spaces, quotes, backslashes, HTML | preserved exactly |
+| `--press-sequentially` | same result via the per-character path |
+| Refusals precede browser resolution | a bogus `-b` never surfaces; the refusal wins |
+| Firefox / BiDi end to end | `matches: true`; `--submit` carried all 11 characters |
+| Repeat BiDi runs | no session leak after `release()` |
+
+### Defects found by this verification, and fixed
+
+Both were mine, both only reachable on Firefox, and neither had a test:
+
+1. **Double connection on `--target`.** The path attached a throwaway
+   `PageSession` purely to resolve a target id, then opened a second backend.
+   CDP tolerates concurrent clients; BiDi allows one session per browser and
+   failed with "Maximum number of active sessions". Replaced with
+   `target_matching`, which resolves through the backend already being used.
+2. **Leaked BiDi session.** `open_backend` was never released, so the *next*
+   command against that browser failed even though the current one succeeded
+   — the failure appeared one step removed from its cause. Added
+   `TabBackend::release()`, a no-op on CDP.
+
+`--text` places the value in `argv`, where `ps` can see it. That is inherent
+to passing a secret as an argument and is why `--stdin` exists; the help text
+should keep steering callers to it.
+
+### A third defect, pre-existing, now fixed
+
+The Firefox **named-tab** path was broken for every command, not just these:
+`tab open` reported success with a target id, and the next command said the
+tab was unregistered.
+
+Root cause, measured over the raw BiDi protocol: **Firefox mints fresh
+browsing-context ids for every session.** Two consecutive `session.new`
+connections report entirely different ids for the same four tabs. Since each
+CLI invocation is its own process and therefore its own session, a stored id
+was always dead on arrival — so named tabs could never work on Firefox. CDP is
+unaffected: a `targetId` lives as long as the tab.
+
+The tab is still there; only the handle changed. `resolve_tab` now re-finds it
+by its last known URL and repairs the row, and only on engines whose ids are
+session-scoped — relocating on CDP would silently retarget a different tab
+when one had genuinely closed. Verified: a named Firefox tab is now usable
+from a separate process, and both a genuinely-closed tab and a stale CDP row
+are still swept rather than resurrected.
+
+Tests assert by submission or by length, never by reading the value back —
+otherwise the test itself becomes a way to print the secret.

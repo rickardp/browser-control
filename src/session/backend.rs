@@ -753,6 +753,106 @@ impl TabBackend {
         }
     }
 
+    /// Whether this engine's target ids are scoped to the connection.
+    ///
+    /// Firefox mints fresh browsing-context ids for every BiDi session, so an
+    /// id stored by one process means nothing to the next. CDP target ids
+    /// live as long as the tab.
+    pub fn ids_are_session_scoped(&self) -> bool {
+        matches!(self, TabBackend::Bidi(_))
+    }
+
+    /// End the BiDi session, if this is one.
+    ///
+    /// BiDi permits **one session per browser**, so a backend opened and left
+    /// without ending its session makes the browser refuse every later
+    /// connection with "Maximum number of active sessions" — which is exactly
+    /// what a short-lived CLI command does unless it calls this. The socket
+    /// itself needs no attention: the process exits.
+    ///
+    /// A no-op on CDP, which is happy with many concurrent clients.
+    pub async fn release(&self) {
+        if let TabBackend::Bidi(c) = self {
+            let _ = c.session_end().await;
+        }
+    }
+
+    /// Type into whatever currently has focus.
+    ///
+    /// Addresses no node, so it works from a separate process that has no
+    /// access to the MCP server's ref table — which is what lets a shell
+    /// pipeline deliver a secret straight into a field.
+    pub async fn type_into_focused(
+        &self,
+        target_id: &str,
+        text: &str,
+        press_sequentially: bool,
+        submit: bool,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let text = text.to_string();
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move {
+                        crate::session::input::type_focused(
+                            c,
+                            &sid,
+                            &text,
+                            press_sequentially,
+                            submit,
+                        )
+                        .await
+                    },
+                )
+                .await
+            }
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::type_focused(c, target_id, text, submit),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Press a key, with any modifiers held around it.
+    ///
+    /// Keyboard input goes to whatever currently has focus, so unlike the
+    /// other native actions this addresses no node.
+    pub async fn press_key_on_tab(
+        &self,
+        target_id: &str,
+        chord: &crate::session::keys::Chord,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let chord = chord.clone();
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move { crate::session::input::press_key(c, &sid, &chord).await },
+                )
+                .await
+            }
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::press_key(c, target_id, chord),
+                )
+                .await
+            }
+        }
+    }
+
     /// Hover the element with `backend_node_id`.
     pub async fn hover_node(
         &self,

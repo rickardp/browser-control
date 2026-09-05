@@ -157,11 +157,61 @@ pub async fn resolve_tab(
     };
     if target_alive(backend, &row.target_id).await? {
         registry.tab_touch(browser_name, name)?;
-        Ok(Some(row))
-    } else {
-        registry.tab_delete(browser_name, name)?;
-        Ok(None)
+        return Ok(Some(row));
     }
+    // The handle may be stale rather than the tab gone — see relocate_by_url.
+    if let Some(repaired) = relocate_by_url(backend, registry, browser_name, name, &row).await? {
+        return Ok(Some(repaired));
+    }
+    registry.tab_delete(browser_name, name)?;
+    Ok(None)
+}
+
+/// Re-find a named tab whose stored `target_id` no longer exists, and repair
+/// the row.
+///
+/// Firefox regenerates browsing-context ids for **every BiDi session**.
+/// Measured: the same four tabs report entirely different ids in two
+/// consecutive `session.new` connections. Because each CLI invocation is its
+/// own process and therefore its own session, a `target_id` persisted by one
+/// command is always dead to the next — so on Firefox a named tab was
+/// unusable the moment it was created. CDP has no such problem: a `targetId`
+/// is stable for the life of the tab.
+///
+/// The tab itself is still there; only its handle changed. The last URL we
+/// navigated it to is the identity that survives, so match on that and write
+/// the fresh id back.
+///
+/// Limits, both preferable to the row being deleted: if two tabs share a URL
+/// the first is taken, and if the page navigated itself since we last looked
+/// the URL is stale and no match is found — which lands on exactly the
+/// "tab not found" behaviour that existed before.
+async fn relocate_by_url(
+    backend: &TabBackend,
+    registry: &Registry,
+    browser_name: &str,
+    name: &str,
+    row: &TabRow,
+) -> Result<Option<TabRow>> {
+    if !backend.ids_are_session_scoped() || row.last_url.is_empty() {
+        return Ok(None);
+    }
+    let Some(hit) = backend
+        .live_targets()
+        .await?
+        .into_iter()
+        .find(|t| t.url == row.last_url)
+    else {
+        return Ok(None);
+    };
+    registry.tab_upsert(
+        browser_name,
+        name,
+        &hit.id,
+        &row.last_url,
+        row.daemon_created,
+    )?;
+    registry.tab_get(browser_name, name)
 }
 
 async fn target_alive(backend: &TabBackend, target_id: &str) -> Result<bool> {
@@ -407,7 +457,10 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut next_ctx = 0u32;
-            let mut live = std::collections::HashSet::<String>::new();
+            // context -> url. The real Firefox reports a URL per context in
+            // getTree, and the tab registry now relies on it to re-find a tab
+            // whose id was regenerated, so the mock has to track it too.
+            let mut live = std::collections::BTreeMap::<String, String>::new();
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
@@ -425,7 +478,7 @@ mod tests {
                                 "browsingContext.create" => {
                                     next_ctx += 1;
                                     let c = format!("C{next_ctx}");
-                                    live.insert(c.clone());
+                                    live.insert(c.clone(), String::from("about:blank"));
                                     json!({"context": c})
                                 }
                                 "browsingContext.close" => {
@@ -437,11 +490,21 @@ mod tests {
                                     }
                                     json!({})
                                 }
-                                "browsingContext.navigate" => json!({"navigation": "N1"}),
+                                "browsingContext.navigate" => {
+                                    if let (Some(c), Some(u)) = (
+                                        req.pointer("/params/context").and_then(|v| v.as_str()),
+                                        req.pointer("/params/url").and_then(|v| v.as_str()),
+                                    ) {
+                                        live.insert(c.to_string(), u.to_string());
+                                    }
+                                    json!({"navigation": "N1"})
+                                }
                                 "browsingContext.getTree" => {
                                     let contexts: Vec<Value> = live
                                         .iter()
-                                        .map(|c| json!({"context": c, "url": "", "children": []}))
+                                        .map(|(c, u)| {
+                                            json!({"context": c, "url": u, "children": []})
+                                        })
                                         .collect();
                                     json!({"contexts": contexts})
                                 }
@@ -957,5 +1020,68 @@ mod tests {
             err.downcast_ref::<SessionError>(),
             Some(SessionError::TabHung { .. })
         ));
+    }
+    // ---- session-scoped ids (Firefox) ------------------------------------
+
+    #[tokio::test]
+    async fn cdp_ids_are_not_session_scoped_but_bidi_ids_are() {
+        let (cdp, _a) = cdp_backend().await;
+        let (bidi, _b) = bidi_backend().await;
+        assert!(!cdp.ids_are_session_scoped());
+        assert!(bidi.ids_are_session_scoped());
+    }
+
+    #[tokio::test]
+    async fn a_regenerated_bidi_id_relocates_by_url_instead_of_dropping_the_row() {
+        // Firefox mints new browsing-context ids for every BiDi session, so a
+        // stored id is always dead to the next process. The tab is still
+        // there; only the handle changed.
+        let (backend, _stop) = bidi_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        let row = tab_open(&backend, &reg, "ff", Some("nt"), Some("https://x"))
+            .await
+            .unwrap();
+
+        // Simulate the next CLI process: same tab, different id.
+        reg.tab_upsert(
+            "ff",
+            "nt",
+            "stale-id-from-a-dead-session",
+            &row.last_url,
+            true,
+        )
+        .unwrap();
+
+        let resolved = resolve_tab(&backend, &reg, "ff", "nt").await.unwrap();
+        let resolved = resolved.expect("named tab must survive an id regeneration");
+        assert_eq!(resolved.target_id, row.target_id, "row should be repaired");
+        assert_eq!(resolved.last_url, "https://x");
+    }
+
+    #[tokio::test]
+    async fn relocation_does_not_resurrect_a_tab_that_is_really_gone() {
+        let (backend, _stop) = bidi_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        // A row whose URL matches no live context: the tab was genuinely closed.
+        reg.tab_upsert("ff", "gone", "stale", "https://nowhere", true)
+            .unwrap();
+        let resolved = resolve_tab(&backend, &reg, "ff", "gone").await.unwrap();
+        assert!(resolved.is_none(), "must not invent a tab");
+        assert!(reg.tab_get("ff", "gone").unwrap().is_none(), "row swept");
+    }
+
+    #[tokio::test]
+    async fn a_stale_cdp_row_is_still_dropped_not_relocated() {
+        // CDP ids are stable, so a missing id means the tab really is gone.
+        // Relocating there would silently retarget a different tab.
+        let (backend, _stop) = cdp_backend().await;
+        let reg = Registry::open_in_memory().unwrap();
+        let row = tab_open(&backend, &reg, "brave", Some("nt"), Some("https://x"))
+            .await
+            .unwrap();
+        reg.tab_upsert("brave", "nt", "T-does-not-exist", &row.last_url, true)
+            .unwrap();
+        let resolved = resolve_tab(&backend, &reg, "brave", "nt").await.unwrap();
+        assert!(resolved.is_none());
     }
 }

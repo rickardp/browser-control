@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use crate::cdp::CdpClient;
 use crate::dom::scripts::SELECT_ALL_JS;
 use crate::errors::{is_cdp_node_gone, SessionError};
+use crate::session::keys::{self, Chord};
 
 /// A point in viewport CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -237,6 +238,77 @@ pub async fn type_text(
     Ok(())
 }
 
+/// Type into whatever currently has focus, with no node id.
+///
+/// This is the sink for piped input (`browser-control type --stdin`): the
+/// caller focuses the field by other means — a ref-based click, or `Tab` —
+/// and the value arrives over a pipe without ever passing through the
+/// caller's own memory.
+///
+/// Existing content is selected first so the insert replaces rather than
+/// appends, matching `type_text`. If nothing has focus, the selection step is
+/// skipped and the text still goes to the page's default target.
+pub async fn type_focused(
+    c: &CdpClient,
+    sid: &str,
+    text: &str,
+    press_sequentially: bool,
+    submit: bool,
+) -> Result<()> {
+    // Background tabs do not deliver focus events unless emulated.
+    let _ = c
+        .send_with_session(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+            Some(sid),
+        )
+        .await;
+    let resolved = c
+        .send_with_session(
+            "Runtime.evaluate",
+            json!({ "expression": "document.activeElement", "returnByValue": false }),
+            Some(sid),
+        )
+        .await
+        .context("resolving document.activeElement")?;
+    if let Some(object_id) = resolved["result"]["objectId"].as_str() {
+        let object_id = object_id.to_string();
+        let select = c
+            .send_with_session(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": SELECT_ALL_JS,
+                    "arguments": [{ "value": text.is_empty() }],
+                    "returnByValue": true,
+                }),
+                Some(sid),
+            )
+            .await;
+        let _ = c
+            .send_with_session(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(sid),
+            )
+            .await;
+        select.context("selecting existing content")?;
+    }
+    if !text.is_empty() {
+        if press_sequentially {
+            for ch in text.chars() {
+                insert_text(c, sid, &ch.to_string()).await?;
+            }
+        } else {
+            insert_text(c, sid, text).await?;
+        }
+    }
+    if submit {
+        press_enter(c, sid).await?;
+    }
+    Ok(())
+}
+
 async fn insert_text(c: &CdpClient, sid: &str, text: &str) -> Result<()> {
     c.send_with_session("Input.insertText", json!({ "text": text }), Some(sid))
         .await
@@ -248,35 +320,104 @@ async fn insert_text(c: &CdpClient, sid: &str, text: &str) -> Result<()> {
 /// keyDown is what makes Chromium synthesise the `keypress` and submit
 /// forms, matching Puppeteer.
 pub async fn press_enter(c: &CdpClient, sid: &str) -> Result<()> {
-    c.send_with_session(
-        "Input.dispatchKeyEvent",
-        json!({
-            "type": "keyDown",
-            "key": "Enter",
-            "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-            "nativeVirtualKeyCode": 13,
-            "text": "\r",
-            "unmodifiedText": "\r",
-        }),
-        Some(sid),
-    )
-    .await
-    .context("Input.dispatchKeyEvent keyDown")?;
-    c.send_with_session(
-        "Input.dispatchKeyEvent",
-        json!({
-            "type": "keyUp",
-            "key": "Enter",
-            "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-            "nativeVirtualKeyCode": 13,
-        }),
-        Some(sid),
-    )
-    .await
-    .context("Input.dispatchKeyEvent keyUp")?;
-    Ok(())
+    press_key(c, sid, &Chord::plain(keys::ENTER)).await
+}
+
+/// Press and release a key, with any modifiers held around it.
+///
+/// Order is modifiers down, key down, key up, modifiers up **in reverse**.
+/// Releasing in reverse matters: a Shift left down leaks into whatever the
+/// page does next. The modifier release runs even when the key dispatch
+/// fails, so an error cannot strand the browser with Control held.
+///
+/// Keyboard input goes to whatever has focus, so unlike the other native
+/// actions this takes no node id.
+pub async fn press_key(c: &CdpClient, sid: &str, chord: &Chord) -> Result<()> {
+    let events = key_events(chord);
+    // Everything after the target key's keyUp is modifier release; those must
+    // still be sent if the key itself fails, or the browser is left with a
+    // modifier held down.
+    let release_from = events.len() - chord.modifiers.len();
+
+    let mut first_error = None;
+    for (i, ev) in events.iter().enumerate() {
+        if first_error.is_some() && i < release_from {
+            continue; // abandon the press, keep the release
+        }
+        if let Err(e) = c
+            .send_with_session("Input.dispatchKeyEvent", ev.clone(), Some(sid))
+            .await
+        {
+            let described = e.context(format!(
+                "Input.dispatchKeyEvent {} {}",
+                ev["type"].as_str().unwrap_or("?"),
+                ev["key"].as_str().unwrap_or("?")
+            ));
+            if first_error.is_none() {
+                first_error = Some(described);
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The full ordered event sequence for a chord.
+///
+/// Modifiers down in declaration order, the key down and up, then modifiers
+/// up **in reverse**. Reverse release matters: a Shift left down leaks into
+/// whatever the page does next.
+///
+/// Each event carries the modifier bitmask in force at that moment, the
+/// target key's included — omitting it there is the usual reason `Control+A`
+/// selects nothing.
+pub fn key_events(chord: &Chord) -> Vec<Value> {
+    let mut events = Vec::with_capacity(chord.modifiers.len() * 2 + 2);
+    let mut mask = 0u32;
+
+    for m in &chord.modifiers {
+        mask |= *m as u32;
+        events.push(event("rawKeyDown", &m.def(), mask));
+    }
+    // `keyDown` when the key inserts text, so Chromium synthesises the
+    // `keypress`; `rawKeyDown` when it does not.
+    let kind = if chord.key.text.is_some() {
+        "keyDown"
+    } else {
+        "rawKeyDown"
+    };
+    events.push(event(kind, &chord.key, mask));
+    events.push(event("keyUp", &chord.key, mask));
+
+    for m in chord.modifiers.iter().rev() {
+        mask &= !(*m as u32);
+        events.push(event("keyUp", &m.def(), mask));
+    }
+    events
+}
+
+fn event(kind: &str, key: &keys::KeyDef, modifiers: u32) -> Value {
+    let mut params = json!({
+        "type": kind,
+        "key": key.key,
+        "code": key.code,
+        "windowsVirtualKeyCode": key.vk,
+        "nativeVirtualKeyCode": key.vk,
+    });
+    if modifiers != 0 {
+        params["modifiers"] = json!(modifiers);
+    }
+    // Only a key that inserts text carries `text`, and only on the way down.
+    // Sending it for e.g. ArrowDown types a glyph instead of moving the caret.
+    if kind != "keyUp" {
+        if let Some(text) = key.text {
+            params["text"] = json!(text);
+            params["unmodifiedText"] = json!(text);
+        }
+    }
+    params
 }
 
 /// Pointer-event drag from one node's centre to another's. HTML5 native
@@ -546,5 +687,108 @@ mod tests {
             rect,
             json!({"x": 10.0, "y": 430.0, "width": 100.0, "height": 20.0})
         );
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use crate::session::keys::parse_chord;
+
+    fn kinds(events: &[Value]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap().to_string(),
+                    e["key"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plain_named_key_is_two_events() {
+        let events = key_events(&parse_chord("ArrowDown").unwrap());
+        assert_eq!(
+            kinds(&events),
+            vec![
+                ("rawKeyDown".into(), "ArrowDown".into()),
+                ("keyUp".into(), "ArrowDown".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_inserting_key_carries_no_text() {
+        // With `text` set, Chromium types a private-use glyph instead of
+        // moving the caret.
+        for ev in key_events(&parse_chord("ArrowDown").unwrap()) {
+            assert!(ev.get("text").is_none(), "{ev}");
+        }
+    }
+
+    #[test]
+    fn enter_still_carries_the_carriage_return_that_submits_forms() {
+        let events = key_events(&parse_chord("Enter").unwrap());
+        assert_eq!(events[0]["type"], "keyDown");
+        assert_eq!(events[0]["text"], "\r");
+        assert_eq!(events[0]["unmodifiedText"], "\r");
+        assert_eq!(events[0]["windowsVirtualKeyCode"], 13);
+        // The release never inserts.
+        assert!(events[1].get("text").is_none());
+    }
+
+    #[test]
+    fn press_enter_payload_is_unchanged() {
+        // press_enter now goes through press_key; its wire format must not move.
+        let events = key_events(&Chord::plain(keys::ENTER));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["key"], "Enter");
+        assert_eq!(events[0]["code"], "Enter");
+        assert_eq!(events[0]["nativeVirtualKeyCode"], 13);
+        assert_eq!(events[1]["type"], "keyUp");
+    }
+
+    #[test]
+    fn control_a_holds_the_modifier_across_the_key() {
+        let events = key_events(&parse_chord("Control+A").unwrap());
+        assert_eq!(
+            kinds(&events),
+            vec![
+                ("rawKeyDown".into(), "Control".into()),
+                ("keyDown".into(), "A".into()),
+                ("keyUp".into(), "A".into()),
+                ("keyUp".into(), "Control".into()),
+            ]
+        );
+        // The mask must be on the *key's* events too, not just the modifier's.
+        assert_eq!(events[1]["modifiers"], 2);
+        assert_eq!(events[2]["modifiers"], 2);
+        // ... and gone once the modifier is released.
+        assert!(events[3].get("modifiers").is_none());
+    }
+
+    #[test]
+    fn modifiers_release_in_reverse_order() {
+        // A modifier left down leaks into whatever the page does next.
+        let events = key_events(&parse_chord("Control+Shift+K").unwrap());
+        let seq = kinds(&events);
+        assert_eq!(seq[0].1, "Control");
+        assert_eq!(seq[1].1, "Shift");
+        assert_eq!(seq[4].1, "Shift");
+        assert_eq!(seq[5].1, "Control");
+        // Mask accumulates then unwinds.
+        assert_eq!(events[1]["modifiers"], 2 | 8);
+        assert_eq!(events[2]["modifiers"], 2 | 8);
+        assert_eq!(events[4]["modifiers"], 2); // Shift released, Control held
+    }
+
+    #[test]
+    fn printable_keys_insert_themselves() {
+        let events = key_events(&parse_chord("a").unwrap());
+        assert_eq!(events[0]["type"], "keyDown");
+        assert_eq!(events[0]["text"], "a");
+        assert_eq!(events[0]["code"], "KeyA");
     }
 }

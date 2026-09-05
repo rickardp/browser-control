@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use browser_control::cli::{
-    agent_instructions, cookies, curl, eval, fetch, list, set, show, storage,
-    targets as cli_targets, wait, wait_for_cookie,
+    agent_instructions, cookies, curl, eval, fetch, key, list, set, show, storage,
+    targets as cli_targets, type_cmd, wait, wait_for_cookie,
 };
 use clap::{Parser, Subcommand};
 
@@ -140,6 +140,38 @@ enum Command {
         #[command(subcommand)]
         action: storage::StorageCmd,
     },
+    /// Type into the focused element. With `--stdin`, reads the text from a
+    /// pipe, so a secret can reach a form without passing through the caller.
+    Type {
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
+        browser: Option<String>,
+        /// Literal text. Mutually exclusive with `--stdin`.
+        #[arg(long)]
+        text: Option<String>,
+        /// Read the text from standard input, e.g. `op read … | browser-control type --stdin`.
+        #[arg(long)]
+        stdin: bool,
+        /// Press Enter afterwards.
+        #[arg(long)]
+        submit: bool,
+        /// Send one character at a time.
+        #[arg(long)]
+        press_sequentially: bool,
+        /// Select a page target by URL regex (default: first page).
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Press a key on the focused element, e.g. `Enter`, `Tab`, `Control+A`.
+    #[command(alias = "press-key")]
+    Key {
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
+        browser: Option<String>,
+        /// Key or chord: `Enter`, `ArrowDown`, `Control+A`, `Shift+Tab`.
+        key: String,
+        /// Select a page target by URL regex (default: first page).
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Evaluate a JavaScript expression in the active page.
     Eval {
         #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
@@ -237,8 +269,34 @@ fn init_tracing() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack for the thread that does all the work.
+///
+/// Windows gives the main thread 1 MiB, against 8 MiB on macOS and Linux.
+/// clap builds its command tree recursively, and with this many subcommands a
+/// debug build overflows that budget inside `Cli::parse()` — before any
+/// command runs, so even `--help` dies with STATUS_STACK_OVERFLOW. Release
+/// builds have smaller frames and survive, which is why only the debug-built
+/// CI job saw it.
+///
+/// Rather than budget clap's growth forever, run on a thread we size.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the tokio runtime")?
+                .block_on(run())
+        })
+        .context("spawning the worker thread")?
+        .join()
+        .map_err(|_| anyhow!("worker thread panicked"))?
+}
+
+async fn run() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     if cli.agent_instructions {
@@ -297,6 +355,19 @@ async fn main() -> Result<()> {
         }
         Command::Curl { browser, args } => curl::run(browser, args).await,
         Command::Storage { action } => storage::run(action).await,
+        Command::Key {
+            browser,
+            key,
+            target,
+        } => key::run(browser, key, target).await,
+        Command::Type {
+            browser,
+            text,
+            stdin,
+            submit,
+            press_sequentially,
+            target,
+        } => type_cmd::run(browser, text, stdin, submit, press_sequentially, target).await,
         Command::Eval {
             browser,
             expression,

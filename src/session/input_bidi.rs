@@ -21,6 +21,7 @@ use crate::dom::scripts::{
 };
 use crate::errors::SessionError;
 use crate::session::input::Point;
+use crate::session::keys::Chord;
 
 /// Node budget handed to the walker.
 const SNAPSHOT_MAX_NODES: u64 = 20_000;
@@ -191,6 +192,59 @@ pub async fn type_text(
             };
             keys.extend(key_press(&v));
         }
+        c.input_perform_actions(ctx, json!([key_source(keys)]))
+            .await?;
+    }
+    if submit {
+        c.input_perform_actions(ctx, json!([key_source(key_press(ENTER).to_vec())]))
+            .await?;
+    }
+    let _ = c.input_release_actions(ctx).await;
+    Ok(())
+}
+
+/// Press and release a key, with any modifiers held around it.
+///
+/// BiDi tracks modifier state from the keyDown/keyUp pairs itself, so unlike
+/// CDP there is no bitmask — the nesting order *is* the state. Modifiers are
+/// released in reverse for the same reason as CDP: a key left down leaks into
+/// whatever the page does next.
+///
+/// `input.releaseActions` runs afterwards regardless, so a failed action
+/// sequence cannot strand the browser with a modifier held.
+pub async fn press_key(c: &BidiClient, ctx: &str, chord: &Chord) -> Result<()> {
+    let mut actions = Vec::new();
+    for m in &chord.modifiers {
+        actions.push(json!({ "type": "keyDown", "value": m.def().bidi }));
+    }
+    actions.extend(key_press(chord.key.bidi));
+    for m in chord.modifiers.iter().rev() {
+        actions.push(json!({ "type": "keyUp", "value": m.def().bidi }));
+    }
+    let result = c
+        .input_perform_actions(ctx, json!([key_source(actions)]))
+        .await;
+    let _ = c.input_release_actions(ctx).await;
+    result
+}
+
+/// Type into whatever currently has focus, with no node id.
+///
+/// BiDi has no "insert text at the caret" primitive, so this sends the value
+/// as key actions — which is what typing into focus means on this engine.
+/// Unlike the CDP path there is no select-all first: without a node handle
+/// there is nothing to select, so the caller should clear the field before
+/// piping into it if replacement is wanted.
+pub async fn type_focused(c: &BidiClient, ctx: &str, text: &str, submit: bool) -> Result<()> {
+    let mut keys = Vec::new();
+    for ch in text.chars() {
+        let v = match ch {
+            '\n' | '\r' => ENTER.to_string(),
+            other => other.to_string(),
+        };
+        keys.extend(key_press(&v));
+    }
+    if !keys.is_empty() {
         c.input_perform_actions(ctx, json!([key_source(keys)]))
             .await?;
     }

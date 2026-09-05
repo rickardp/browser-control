@@ -39,6 +39,12 @@ Console and network
 - Always pass `pattern` / `url_pattern` or `only_errors` on busy pages, and `clear: true` before an action to isolate its effects. Buffers persist across navigations; each entry shows the page it came from.
 - `browser_tab_new` with a URL cannot capture that very first load; use `browser_tab_new` then `browser_navigate` when the initial traffic matters. Works on Chromium and Firefox; `browser_network_body` is Chromium-only (on Firefox re-issue the request with `browser_fetch`), and Firefox does not log failed resource loads to the console (check `browser_network_requests` with `status: "4xx"` instead).
 
+Credentials
+- Never ask the operator for a password, and never put one in a tool call. Pipe it from a vault straight into the field: `op read op://vault/item/password | browser-control type -b <browser>/<tab> --stdin --submit`.
+- Any resolver that prints a secret on stdout works: `op read`, `bw get password`, `vault kv get -field=password`, `security find-internet-password -s <host> -w`. Focus the field first (a ref-based `browser_click`), then run the pipe; `type` targets whatever has focus.
+- `browser-control type --stdin` reports only a character count. The value never reaches the transcript, a tool result, or a log.
+- A second factor is different: relay it. Read the prompt, ask the operator for the one-time code, and type it. One-time codes are single-use and safe to handle; passwords are not.
+
 Cookies and login
 - Wait for login with `browser_wait_for_cookie` or `browser-control wait-for-cookie --domain <regex> --name <regex>`.
 - Add `--validate-url <url>` when the cookie alone is not enough and an authenticated endpoint must return 2xx.
@@ -47,7 +53,7 @@ Cookies and login
 MCP server setup
 - Configure the host with command `browser-control` and args `["mcp"]`.
 - Set `BROWSER_CONTROL` in the MCP host env to scope that server to one browser, or rely on `browser-control set default`.
-- `browser_snapshot`, `browser_find`, ref-based interaction, and console/network listing are native (no Node) on Chromium and Firefox; on Firefox the accessibility tree is approximate. CSS-selector interaction, `browser_press_key`, `browser_wait_for`, and `browser_pdf_save` route through a Playwright sidecar that needs `bun` or `node` and a Chromium browser; on Firefox use refs instead of selectors.
+- `browser_snapshot`, `browser_find`, ref-based interaction, and console/network listing are native (no Node) on Chromium and Firefox; on Firefox the accessibility tree is approximate. CSS-selector interaction, `browser_wait_for` and `browser_pdf_save` route through a Playwright sidecar that needs `bun` or `node` and a Chromium browser; on Firefox use refs instead of selectors. `browser_press_key` is native on both engines: it presses on whatever has focus, and takes chords like `Enter`, `ArrowDown`, `Control+A`, `Shift+Tab`.
 - Set `BROWSER_CONTROL_CAPTURE=0` in the MCP host env to disable console/network capture (it enables CDP `Runtime`, which some anti-bot scripts detect).
 - Firefox differences to plan around: `browser_eval` always awaits promises; tab titles are empty in `browser_tab_list`; closed shadow roots and iframe contents are not in snapshots; `press_sequentially` sends real key events (on Chromium it inserts text per character); Firefox does not log failed resource loads to the console. The full list is in docs/engine-parity.md.
 
