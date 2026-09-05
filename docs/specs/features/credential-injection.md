@@ -62,6 +62,13 @@ resolver:
 None of these need code in browser-control. The one exception is the last
 row, because only browser-control knows its own profile and launch flags.
 
+> **What is installed here matters for sequencing.** On this workstation only
+> `security` (macOS/iCloud Keychain) is present — `op`, `bw`, `vault` and
+> `infisical` are not. So the resolvers usable *today*, with no install, are
+> the Keychain, the environment, and (once built) the Chromium profile. That
+> is an argument for shipping the profile resolver: it needs no external tool
+> and the credential is already there.
+
 **iCloud Keychain caveat.** Apple's Passwords app has no CLI; `security` reads
 the login keychain, into which iCloud Keychain items sync. Each item prompts
 for access the first time unless its ACL trusts the calling binary, so the
@@ -247,5 +254,6 @@ Chromium resolver and can follow at their own pace.
 | No CLI `type` command exists today | verified | `browser-control --help`; only `browser_type` via MCP |
 | `use-mock-keychain`, `mock_password`, `saltysalt` present in the Brave binary | verified | `strings` on the framework |
 | Existing profile logins use the `v10` scheme under the real key | verified | `Login Data` inspected; nine entries |
-| Mock-keychain decryption round-trip | **not yet performed** | required before the resolver is called done |
+| Mock key does NOT open real-key entries | verified (small sample) | one profile `v10` entry decrypts to 38% printable garbage under `mock_password`; no Keychain access in the path |
+| Mock-keychain positive round-trip (mock key opens mock-key entry) | **not yet performed** | needs a credential saved through the UI in a `--use-mock-keychain` profile |
 | Same-user agent can read any resolver credential | reasoning, not measured | shared principal; no filesystem or env boundary exists between them |
