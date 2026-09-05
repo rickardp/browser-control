@@ -243,6 +243,71 @@ way to print the secret. Assert server-side.
 Steps 1–2 are independently useful and ship first. Steps 3–5 are the
 Chromium resolver and can follow at their own pace.
 
+## Concrete changes to browser-control
+
+Grounded in the current code, smallest first. Two tracks: the pipe (makes
+every external vault work) and the Chromium-profile resolver (the one vault
+browser-control must implement itself).
+
+### Track 1 — the pipe. New CLI `type` with `--stdin`.
+
+There is no CLI `type` today; only the MCP tool `browser_type`. That is the
+gap. But a CLI process **cannot use refs** — refs (`e7`) live in the MCP
+server's `state.refs`, populated by `browser_snapshot`, and a separate
+`browser-control type` process has no access to them. So the CLI addresses an
+element differently.
+
+Decision: **CLI `type` targets the focused element by default, or a
+`--selector`.** The `key` command already types-to-focus successfully, so the
+zero-argument form reuses a proven path; `--selector` is for when the caller
+wants one self-contained command.
+
+| File | Change |
+|---|---|
+| `src/session/backend.rs` | `type_into_focused(&self, target_id, text, submit, timeout)` — `Input.insertText` on the active element, no node id. A near-clone of `type_into_node` minus the `DOM.focus`; the node path already focuses first, so factor the insert/submit tail out and share it. |
+| `src/session/backend.rs` | (only if `--selector`) `node_for_selector(target_id, css)` — CDP `DOM.getDocument` → `DOM.querySelector`, returns a `backend_node_id`. This is the piece that lets a selector work **without the sidecar**; it is also reusable to give the MCP `type`/`click` a native selector path later. |
+| `src/cli/type_cmd.rs` (new) | `run(browser, selector: Option, text: Option, stdin: bool, submit, press_sequentially)`. Mirrors `key.rs`: `route::preamble`, the three tab-routing paths, `trace`. Reads stdin when `--stdin`; trims one trailing newline; refuses empty, embedded-newline, and `--text`+`--stdin`. Errors never include the value. |
+| `src/main.rs` | `Type { browser, selector, text, stdin, submit, press_sequentially }` in the `Command` enum; dispatch to `type_cmd::run`; add `type_cmd` to the `use crate::cli::{…}` line. |
+| `src/cli/mod.rs` | `pub mod type_cmd;` |
+
+That is the whole external-vault story: `op read … | browser-control type
+--stdin --submit`, and the same for `bw`, `vault`, `security`, `env`.
+
+The value reaches the field over an OS pipe between two processes the agent
+spawned; it never enters a tool result or the model context. The reference
+(`op://…`) appears in the shell command the agent wrote, which is fine.
+
+### Track 2 — the Chromium profile as a vault.
+
+The one resolver browser-control must own, because only it knows the profile
+path and the launch flags. Independent of Track 1 and can follow later.
+
+| File | Change |
+|---|---|
+| `src/config.rs` | `Config` gains `chromium: ChromiumConfig` with `password_store: Option<String>` (`"mock"` \| `"os"`). Serde already derives here. |
+| `src/launch/chromium.rs` | when the profile's store is `"mock"`, add `--use-mock-keychain` (macOS/generic) / `--password-store=basic` (Linux) to the arg list at lines 33–41. **Opt-in for existing profiles** — it changes the key and hides credentials saved under the OS key. Default it on only for profiles created after this ships. |
+| `src/vault/chromium.rs` (new) | copy `Login Data` to a temp file (it is locked while the browser runs), query `logins` by `signon_realm`, decrypt `password_value`: strip `v10`, `PBKDF2-HMAC-SHA1(key, "saltysalt", 1003, 16)`, AES-128-CBC, IV = 16×`0x20`. Pure Rust — `rusqlite`, `pbkdf2`, `sha1`, `aes`, `cbc`. No Keychain call anywhere. The `mock` key is the constant `"mock_password"`; the `os` key would need the Keychain and is out of scope. |
+| `src/cli/vault.rs` (new) | `browser-control vault list` (origins + usernames, never values) and `vault read <origin> [--username]` (password to stdout, exit 1 naming the origin if absent/undecryptable). |
+| `src/main.rs`, `src/cli/mod.rs` | wire the `Vault` subcommand. |
+| `Cargo.toml` | `rusqlite` (bundled), `pbkdf2`, `sha1`, `aes`, `cbc`. |
+
+Then the profile is just another resolver:
+`browser-control vault read pineheights.casino | browser-control type --stdin --submit`.
+
+### Docs, both tracks
+
+`src/cli/agent_instructions.rs` and README: agents pipe from a resolver into
+`type --stdin` and **must never ask the operator for, or handle, a password**.
+
+### What does NOT change
+
+- No resolver config, no `--secret` scheme parsing, no vault vendor code on
+  the pipe path. The shell does resolution; browser-control reads stdin.
+- No MCP surface change is required for Track 1. (A `browser_type` `secret:`
+  param is a *possible* convenience, but it would make the MCP server run
+  resolvers — the thing we are avoiding — so it is deliberately omitted.)
+- `press_key`, snapshots, refs, the sidecar: untouched.
+
 ## Verification log
 
 | Claim | Status | Evidence |
