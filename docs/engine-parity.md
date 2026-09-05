@@ -21,6 +21,7 @@ on Firefox.
 | `browser_click` / `browser_type` / `browser_hover` / `browser_drag` with `ref` | yes | yes | differs: see *Input* |
 | `browser_click` / `browser_type` / `browser_hover` / `browser_drag` with CSS `selector` | yes (Playwright sidecar, needs `bun`/`node`) | no | Chromium-only; use `ref` on Firefox |
 | `browser_press_key` | yes (native) | yes (native) | CDP `Input.dispatchKeyEvent` / BiDi `input.performActions` |
+| CLI `type` (focused element) | yes (native) | yes (native) | CDP `Input.insertText`; BiDi sends key actions, so it cannot select-all first — clear the field before piping if replacement is wanted |
 | `browser_wait_for`, `browser_pdf_save` | yes (sidecar) | no | Chromium-only |
 | `browser_take_screenshot` | yes | yes | differs: `max_width` is ignored on Firefox; see *Screenshots* |
 | `browser_console_messages`, `browser_network_requests` | yes | yes (network needs Firefox 124+) | differs: see *Console and network capture* |

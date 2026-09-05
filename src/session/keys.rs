@@ -374,8 +374,8 @@ pub fn parse_chord(spec: &str) -> Result<Chord> {
     // `+` is both the separator and a pressable key, so a trailing `+` is
     // peeled off before splitting rather than handled afterwards — splitting
     // first leaves empty segments that look like unnamed modifiers.
-    let (mod_spec, key_name) = if spec.ends_with('+') {
-        (spec[..spec.len() - 1].trim_end_matches('+'), "+")
+    let (mod_spec, key_name) = if let Some(head) = spec.strip_suffix('+') {
+        (head.trim_end_matches('+'), "+")
     } else {
         match spec.rsplit_once('+') {
             Some((head, key)) => (head, key),

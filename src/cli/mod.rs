@@ -17,5 +17,6 @@ pub mod storage;
 pub mod tab;
 pub mod targets;
 pub mod trace;
+pub mod type_cmd;
 pub mod wait;
 pub mod wait_for_cookie;

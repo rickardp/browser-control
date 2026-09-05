@@ -1,7 +1,7 @@
 use anyhow::Result;
 use browser_control::cli::{
     agent_instructions, cookies, curl, eval, fetch, key, list, set, show, storage,
-    targets as cli_targets, wait, wait_for_cookie,
+    targets as cli_targets, type_cmd, wait, wait_for_cookie,
 };
 use clap::{Parser, Subcommand};
 
@@ -139,6 +139,27 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: storage::StorageCmd,
+    },
+    /// Type into the focused element. With `--stdin`, reads the text from a
+    /// pipe, so a secret can reach a form without passing through the caller.
+    Type {
+        #[arg(long, short = 'b', env = "BROWSER_CONTROL")]
+        browser: Option<String>,
+        /// Literal text. Mutually exclusive with `--stdin`.
+        #[arg(long)]
+        text: Option<String>,
+        /// Read the text from standard input, e.g. `op read … | browser-control type --stdin`.
+        #[arg(long)]
+        stdin: bool,
+        /// Press Enter afterwards.
+        #[arg(long)]
+        submit: bool,
+        /// Send one character at a time.
+        #[arg(long)]
+        press_sequentially: bool,
+        /// Select a page target by URL regex (default: first page).
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Press a key on the focused element, e.g. `Enter`, `Tab`, `Control+A`.
     #[command(alias = "press-key")]
@@ -313,6 +334,14 @@ async fn main() -> Result<()> {
             key,
             target,
         } => key::run(browser, key, target).await,
+        Command::Type {
+            browser,
+            text,
+            stdin,
+            submit,
+            press_sequentially,
+            target,
+        } => type_cmd::run(browser, text, stdin, submit, press_sequentially, target).await,
         Command::Eval {
             browser,
             expression,

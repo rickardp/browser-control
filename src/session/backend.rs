@@ -753,6 +753,50 @@ impl TabBackend {
         }
     }
 
+    /// Type into whatever currently has focus.
+    ///
+    /// Addresses no node, so it works from a separate process that has no
+    /// access to the MCP server's ref table — which is what lets a shell
+    /// pipeline deliver a secret straight into a field.
+    pub async fn type_into_focused(
+        &self,
+        target_id: &str,
+        text: &str,
+        press_sequentially: bool,
+        submit: bool,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            TabBackend::Cdp(c) => {
+                let text = text.to_string();
+                crate::session::cdp_session::with_page_session(
+                    c,
+                    target_id,
+                    timeout,
+                    |sid| async move {
+                        crate::session::input::type_focused(
+                            c,
+                            &sid,
+                            &text,
+                            press_sequentially,
+                            submit,
+                        )
+                        .await
+                    },
+                )
+                .await
+            }
+            TabBackend::Bidi(c) => {
+                bidi_bounded(
+                    target_id,
+                    timeout,
+                    input_bidi::type_focused(c, target_id, text, submit),
+                )
+                .await
+            }
+        }
+    }
+
     /// Press a key, with any modifiers held around it.
     ///
     /// Keyboard input goes to whatever currently has focus, so unlike the

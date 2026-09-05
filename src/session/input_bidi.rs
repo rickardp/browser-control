@@ -228,6 +228,34 @@ pub async fn press_key(c: &BidiClient, ctx: &str, chord: &Chord) -> Result<()> {
     result
 }
 
+/// Type into whatever currently has focus, with no node id.
+///
+/// BiDi has no "insert text at the caret" primitive, so this sends the value
+/// as key actions — which is what typing into focus means on this engine.
+/// Unlike the CDP path there is no select-all first: without a node handle
+/// there is nothing to select, so the caller should clear the field before
+/// piping into it if replacement is wanted.
+pub async fn type_focused(c: &BidiClient, ctx: &str, text: &str, submit: bool) -> Result<()> {
+    let mut keys = Vec::new();
+    for ch in text.chars() {
+        let v = match ch {
+            '\n' | '\r' => ENTER.to_string(),
+            other => other.to_string(),
+        };
+        keys.extend(key_press(&v));
+    }
+    if !keys.is_empty() {
+        c.input_perform_actions(ctx, json!([key_source(keys)]))
+            .await?;
+    }
+    if submit {
+        c.input_perform_actions(ctx, json!([key_source(key_press(ENTER).to_vec())]))
+            .await?;
+    }
+    let _ = c.input_release_actions(ctx).await;
+    Ok(())
+}
+
 /// Pointer drag from one node's centre to another's.
 pub async fn drag(c: &BidiClient, ctx: &str, from: u64, to: u64) -> Result<()> {
     let a = node_center(c, ctx, from).await?;

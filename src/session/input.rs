@@ -238,6 +238,77 @@ pub async fn type_text(
     Ok(())
 }
 
+/// Type into whatever currently has focus, with no node id.
+///
+/// This is the sink for piped input (`browser-control type --stdin`): the
+/// caller focuses the field by other means — a ref-based click, or `Tab` —
+/// and the value arrives over a pipe without ever passing through the
+/// caller's own memory.
+///
+/// Existing content is selected first so the insert replaces rather than
+/// appends, matching `type_text`. If nothing has focus, the selection step is
+/// skipped and the text still goes to the page's default target.
+pub async fn type_focused(
+    c: &CdpClient,
+    sid: &str,
+    text: &str,
+    press_sequentially: bool,
+    submit: bool,
+) -> Result<()> {
+    // Background tabs do not deliver focus events unless emulated.
+    let _ = c
+        .send_with_session(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+            Some(sid),
+        )
+        .await;
+    let resolved = c
+        .send_with_session(
+            "Runtime.evaluate",
+            json!({ "expression": "document.activeElement", "returnByValue": false }),
+            Some(sid),
+        )
+        .await
+        .context("resolving document.activeElement")?;
+    if let Some(object_id) = resolved["result"]["objectId"].as_str() {
+        let object_id = object_id.to_string();
+        let select = c
+            .send_with_session(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": SELECT_ALL_JS,
+                    "arguments": [{ "value": text.is_empty() }],
+                    "returnByValue": true,
+                }),
+                Some(sid),
+            )
+            .await;
+        let _ = c
+            .send_with_session(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(sid),
+            )
+            .await;
+        select.context("selecting existing content")?;
+    }
+    if !text.is_empty() {
+        if press_sequentially {
+            for ch in text.chars() {
+                insert_text(c, sid, &ch.to_string()).await?;
+            }
+        } else {
+            insert_text(c, sid, text).await?;
+        }
+    }
+    if submit {
+        press_enter(c, sid).await?;
+    }
+    Ok(())
+}
+
 async fn insert_text(c: &CdpClient, sid: &str, text: &str) -> Result<()> {
     c.send_with_session("Input.insertText", json!({ "text": text }), Some(sid))
         .await
