@@ -148,13 +148,25 @@ Both were mine, both only reachable on Firefox, and neither had a test:
 to passing a secret as an argument and is why `--stdin` exists; the help text
 should keep steering callers to it.
 
-### Not verified
+### A third defect, pre-existing, now fixed
 
-The Firefox **named-tab** path (`-b <browser>/<tab>`) could not be exercised:
-`tab open` reports success with a target id, and the next command reports the
-tab unregistered. That reproduces with `eval`, so it is pre-existing and
-unrelated to this work — but it means BiDi was verified only through
-`--target`.
+The Firefox **named-tab** path was broken for every command, not just these:
+`tab open` reported success with a target id, and the next command said the
+tab was unregistered.
+
+Root cause, measured over the raw BiDi protocol: **Firefox mints fresh
+browsing-context ids for every session.** Two consecutive `session.new`
+connections report entirely different ids for the same four tabs. Since each
+CLI invocation is its own process and therefore its own session, a stored id
+was always dead on arrival — so named tabs could never work on Firefox. CDP is
+unaffected: a `targetId` lives as long as the tab.
+
+The tab is still there; only the handle changed. `resolve_tab` now re-finds it
+by its last known URL and repairs the row, and only on engines whose ids are
+session-scoped — relocating on CDP would silently retarget a different tab
+when one had genuinely closed. Verified: a named Firefox tab is now usable
+from a separate process, and both a genuinely-closed tab and a stale CDP row
+are still swept rather than resurrected.
 
 Tests assert by submission or by length, never by reading the value back —
 otherwise the test itself becomes a way to print the secret.

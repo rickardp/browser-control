@@ -20,6 +20,7 @@ on Firefox.
 | `browser_snapshot`, `browser_find` | yes | yes | differs: see *Accessibility snapshot* |
 | `browser_click` / `browser_type` / `browser_hover` / `browser_drag` with `ref` | yes | yes | differs: see *Input* |
 | `browser_click` / `browser_type` / `browser_hover` / `browser_drag` with CSS `selector` | yes (Playwright sidecar, needs `bun`/`node`) | no | Chromium-only; use `ref` on Firefox |
+| Named tabs (`<browser>/<tab>`) | yes | yes | Firefox regenerates browsing-context ids per BiDi session, so a stored id is dead to the next process; the registry re-finds the tab by its last URL and repairs the row |
 | `browser_press_key` | yes (native) | yes (native) | CDP `Input.dispatchKeyEvent` / BiDi `input.performActions` |
 | CLI `type` (focused element) | yes (native) | yes (native) | CDP `Input.insertText`; BiDi sends key actions, so it cannot select-all first — clear the field before piping if replacement is wanted |
 | `browser_wait_for`, `browser_pdf_save` | yes (sidecar) | no | Chromium-only |

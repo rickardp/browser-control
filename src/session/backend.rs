@@ -753,6 +753,15 @@ impl TabBackend {
         }
     }
 
+    /// Whether this engine's target ids are scoped to the connection.
+    ///
+    /// Firefox mints fresh browsing-context ids for every BiDi session, so an
+    /// id stored by one process means nothing to the next. CDP target ids
+    /// live as long as the tab.
+    pub fn ids_are_session_scoped(&self) -> bool {
+        matches!(self, TabBackend::Bidi(_))
+    }
+
     /// End the BiDi session, if this is one.
     ///
     /// BiDi permits **one session per browser**, so a backend opened and left
