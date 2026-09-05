@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use browser_control::cli::{
     agent_instructions, cookies, curl, eval, fetch, key, list, set, show, storage,
     targets as cli_targets, type_cmd, wait, wait_for_cookie,
@@ -269,8 +269,34 @@ fn init_tracing() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack for the thread that does all the work.
+///
+/// Windows gives the main thread 1 MiB, against 8 MiB on macOS and Linux.
+/// clap builds its command tree recursively, and with this many subcommands a
+/// debug build overflows that budget inside `Cli::parse()` — before any
+/// command runs, so even `--help` dies with STATUS_STACK_OVERFLOW. Release
+/// builds have smaller frames and survive, which is why only the debug-built
+/// CI job saw it.
+///
+/// Rather than budget clap's growth forever, run on a thread we size.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the tokio runtime")?
+                .block_on(run())
+        })
+        .context("spawning the worker thread")?
+        .join()
+        .map_err(|_| anyhow!("worker thread panicked"))?
+}
+
+async fn run() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     if cli.agent_instructions {
