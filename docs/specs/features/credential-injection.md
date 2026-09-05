@@ -122,6 +122,39 @@ Performed against a live browser, 2026-09-05.
 | End to end from a real vault (`security … -w \| type --stdin`) | exact secret landed; asserted as a boolean so the value was never printed |
 | `--submit` | form submitted carrying all 11 characters |
 | Value absent from stdout | command reports only "typed N characters" |
+| **Leak test under maximum logging** | `BROWSER_CONTROL_LOG=trace`: 104 KB of trace output, secret absent from stdout, stderr and `browser.log`, while the field confirmed receipt. Outgoing CDP frames are never logged; only undecodable inbound ones are |
+| Unicode | `pä§§wörd-日本語-🔑` round-trips byte-identical; the reported count is scalar chars (14), not UTF-16 units (15) |
+| Leading/trailing spaces, quotes, backslashes, HTML | preserved exactly |
+| `--press-sequentially` | same result via the per-character path |
+| Refusals precede browser resolution | a bogus `-b` never surfaces; the refusal wins |
+| Firefox / BiDi end to end | `matches: true`; `--submit` carried all 11 characters |
+| Repeat BiDi runs | no session leak after `release()` |
+
+### Defects found by this verification, and fixed
+
+Both were mine, both only reachable on Firefox, and neither had a test:
+
+1. **Double connection on `--target`.** The path attached a throwaway
+   `PageSession` purely to resolve a target id, then opened a second backend.
+   CDP tolerates concurrent clients; BiDi allows one session per browser and
+   failed with "Maximum number of active sessions". Replaced with
+   `target_matching`, which resolves through the backend already being used.
+2. **Leaked BiDi session.** `open_backend` was never released, so the *next*
+   command against that browser failed even though the current one succeeded
+   — the failure appeared one step removed from its cause. Added
+   `TabBackend::release()`, a no-op on CDP.
+
+`--text` places the value in `argv`, where `ps` can see it. That is inherent
+to passing a secret as an argument and is why `--stdin` exists; the help text
+should keep steering callers to it.
+
+### Not verified
+
+The Firefox **named-tab** path (`-b <browser>/<tab>`) could not be exercised:
+`tab open` reports success with a target id, and the next command reports the
+tab unregistered. That reproduces with `eval`, so it is pre-existing and
+unrelated to this work — but it means BiDi was verified only through
+`--target`.
 
 Tests assert by submission or by length, never by reading the value back —
 otherwise the test itself becomes a way to print the secret.

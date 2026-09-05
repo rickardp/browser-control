@@ -14,9 +14,10 @@ use anyhow::Result;
 use crate::cli::env_resolver::Source;
 use crate::cli::route;
 use crate::cli::trace::CommandTrace;
+use crate::cli::type_cmd::target_matching;
 use crate::session::backend::open_backend;
 use crate::session::keys::{parse_chord, Chord};
-use crate::session::{with_scratch_recovery, PageSession};
+use crate::session::with_scratch_recovery;
 
 const KEY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -77,19 +78,19 @@ async fn run_inner(
             })
             .await
         }
-        // Path 3: bare browser, --target regex. PageSession does the regex
-        // match; we only need the target id it settled on.
+        // Path 3: bare browser, --target regex. Resolved through the backend
+        // we then use, not a throwaway PageSession: BiDi permits only one
+        // session per browser, so attaching twice fails with "Maximum number
+        // of active sessions".
         (None, Some(regex)) => {
             trace.route("target-regex");
-            let session =
-                PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
-            let target_id = session.target_id();
-            session.close().await;
-            let target_id = target_id.ok_or_else(|| anyhow::anyhow!("no tab matched `{regex}`"))?;
             let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-            backend
+            let target_id = target_matching(&backend, &regex).await?;
+            let out = backend
                 .press_key_on_tab(&target_id, &chord, KEY_TIMEOUT)
-                .await
+                .await;
+            backend.release().await;
+            out
         }
         _ => unreachable!("mutual exclusion checked in preamble"),
     }

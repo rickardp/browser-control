@@ -30,7 +30,7 @@ use crate::cli::env_resolver::Source;
 use crate::cli::route;
 use crate::cli::trace::CommandTrace;
 use crate::session::backend::open_backend;
-use crate::session::{with_scratch_recovery, PageSession};
+use crate::session::with_scratch_recovery;
 
 const TYPE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -157,21 +157,39 @@ async fn run_inner(
             })
             .await
         }
-        // Path 3: bare browser, --target regex.
+        // Path 3: bare browser, --target regex. Resolved through the backend
+        // we then use, not a throwaway PageSession: BiDi permits only one
+        // session per browser, so attaching twice fails with "Maximum number
+        // of active sessions".
         (None, Some(regex)) => {
             trace.route("target-regex");
-            let session =
-                PageSession::attach(&resolved.endpoint, resolved.engine, Some(&regex)).await?;
-            let target_id = session.target_id();
-            session.close().await;
-            let target_id = target_id.ok_or_else(|| anyhow::anyhow!("no tab matched `{regex}`"))?;
             let backend = open_backend(&resolved.endpoint, resolved.engine).await?;
-            backend
+            let target_id = target_matching(&backend, &regex).await?;
+            let out = backend
                 .type_into_focused(&target_id, value, press_sequentially, submit, TYPE_TIMEOUT)
-                .await
+                .await;
+            backend.release().await;
+            out
         }
         _ => unreachable!("mutual exclusion checked in preamble"),
     }
+}
+
+/// First live target whose URL matches `regex`, using an existing backend.
+///
+/// Deliberately not `PageSession::attach`: that opens a second connection,
+/// and BiDi permits only one session per browser.
+pub(crate) async fn target_matching(
+    backend: &crate::session::backend::TabBackend,
+    regex: &str,
+) -> Result<String> {
+    let re = regex::Regex::new(regex).map_err(|e| anyhow::anyhow!("bad --target regex: {e}"))?;
+    let targets = backend.live_targets().await?;
+    targets
+        .into_iter()
+        .find(|t| re.is_match(&t.url))
+        .map(|t| t.id)
+        .ok_or_else(|| anyhow::anyhow!("no tab matched `{regex}`"))
 }
 
 #[cfg(test)]

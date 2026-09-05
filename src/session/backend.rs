@@ -753,6 +753,21 @@ impl TabBackend {
         }
     }
 
+    /// End the BiDi session, if this is one.
+    ///
+    /// BiDi permits **one session per browser**, so a backend opened and left
+    /// without ending its session makes the browser refuse every later
+    /// connection with "Maximum number of active sessions" — which is exactly
+    /// what a short-lived CLI command does unless it calls this. The socket
+    /// itself needs no attention: the process exits.
+    ///
+    /// A no-op on CDP, which is happy with many concurrent clients.
+    pub async fn release(&self) {
+        if let TabBackend::Bidi(c) = self {
+            let _ = c.session_end().await;
+        }
+    }
+
     /// Type into whatever currently has focus.
     ///
     /// Addresses no node, so it works from a separate process that has no
