@@ -2721,6 +2721,16 @@ mod tests {
         TabBackend::Bidi(Arc::new(BidiClient::connect(url).await.unwrap()))
     }
 
+    /// Wait until the request has reached its **terminal** state, not merely
+    /// until an entry exists.
+    ///
+    /// `network.beforeRequestSent` creates the entry in `Pending`;
+    /// `network.responseCompleted` is a second event that moves it to
+    /// `Finished`. Returning as soon as `matched > 0` therefore let the test
+    /// proceed between the two, and the later `assert_eq!(state, Finished)`
+    /// failed as `Pending` — intermittently, and only when the machine was
+    /// loaded enough to interleave them. Poll for the state the assertions
+    /// actually depend on.
     async fn poll_network(hub: &CaptureHub, target: &str) -> usize {
         for _ in 0..100 {
             if let Ok(r) = hub
@@ -2733,7 +2743,7 @@ mod tests {
                 )
                 .await
             {
-                if r.matched > 0 {
+                if r.entries.iter().any(|e| e.state == NetState::Finished) {
                     return r.matched;
                 }
             }
