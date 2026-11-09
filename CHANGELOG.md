@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.4.0 — 2026-11-09
+
+### Added
+
+- Silent downloads (ADR-005). In a browser started by browser-control,
+  downloads no longer open a Save dialog: they land in a staging folder
+  (`<data dir>/downloads/<kind>/`) under the page's file name, never
+  overwriting (`name (1).ext`). Action results say "download started", and
+  the new `browser_downloads` tool lists downloads, waits for one, and moves it
+  into a folder (`save_to`, or the server default `--download-dir` /
+  `BROWSER_CONTROL_DOWNLOAD_DIR`; a leading `~` is expanded). Several agents
+  sharing one browser each see only downloads from their own tabs. Browsers
+  you started yourself are left alone.
+
+### Changed
+
+- Browsers started by browser-control now always save downloads into the
+  staging folder with "Ask where to save" turned off, overriding whatever was
+  set by hand in that profile (Firefox re-applies this from `user.js` on
+  every start). A browser that was already running picks this up after a
+  restart. CLI-only use gets silent downloads too, but no command reports
+  the path yet; look in the staging folder.
+- `browser_press_key` refuses Cmd/Ctrl+S and Cmd/Ctrl+P, including
+  Ctrl+Shift+P (for example the VS Code command palette in a web editor),
+  because the browser answers them with a native Save/Print dialog that
+  blocks the tab. Pass `allow_native_dialog: true` when the page handles the
+  shortcut itself. The CLI `key` command is unchanged.
+- The Windows uninstaller's `-Purge` also removes the staging folder and any
+  downloads still in it.
+- Browser selection when none is named (`browser_start` without `browser`,
+  and commands with no `--browser`): the persisted default
+  (`browser-control set default`) now wins, then the most recent live
+  registered browser, then an installed browser that is already running,
+  then the first installed Chromium-family browser. Previously any running
+  browser could override a pinned default.
+
+### Fixed
+
+- Firefox failed to start on macOS 27 ("Could not find profile folder."):
+  Firefox before 158 reads `~/Library/Application Support/Firefox` even with
+  `-profile`, and macOS 27 privacy protection denies that folder to apps
+  launched from a terminal or agent host. When that folder is unreadable,
+  browser-control now launches Firefox with `CFFIXED_USER_HOME` pointing at
+  a folder next to its profile (`profiles/firefox/default-home`); Firefox
+  158 and later, and machines where the folder is readable, launch
+  unchanged. Inside that Firefox, file pickers start in the empty folder and
+  native-messaging hosts (some password-manager extensions) are not found.
+  If Firefox still fails that way, headless or windowed, the error says to
+  update Firefox or grant the host app Full Disk Access. macOS also protects
+  the folder Firefox creates there, so deleting that profile later needs
+  Finder or a terminal with Full Disk Access.
+- In browsers started by browser-control, downloads made while the
+  Playwright sidecar was connected went to a temporary folder under GUID
+  names and were deleted when the sidecar disconnected.
+
 ## 1.3.0 — 2026-09-05
 
 ### Added
