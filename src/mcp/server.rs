@@ -77,6 +77,14 @@ pub struct ServerState {
     /// Passive console/network capture for every tab a tool call has
     /// touched (see [`crate::session::capture`]). Reset on `browser_select`.
     pub capture: Arc<crate::session::capture::CaptureHub>,
+    /// Download management (ADR-005): silent downloads into the staging
+    /// folder for browser-control-launched browsers, plus the records
+    /// `browser_downloads` reads. Reset on `browser_select`.
+    pub downloads: Arc<crate::session::downloads::DownloadHub>,
+    /// Default destination for `browser_downloads` `wait` / `save`
+    /// (`--download-dir` or `BROWSER_CONTROL_DOWNLOAD_DIR`). `None` keeps
+    /// files in the staging folder.
+    pub download_dir: Option<std::path::PathBuf>,
     /// Operation barrier. Non-exclusive tool calls acquire a **read**
     /// guard so they can run concurrently; `switch_browser` acquires a
     /// **write** guard which waits for all in-flight tool operations to
@@ -122,6 +130,8 @@ impl ServerState {
             sidecar_config,
             refs: Arc::new(Mutex::new(HashMap::new())),
             capture: Arc::new(crate::session::capture::CaptureHub::new()),
+            downloads: Arc::new(crate::session::downloads::DownloadHub::new()),
+            download_dir: None,
             op_barrier: Arc::new(RwLock::new(())),
         }
     }
@@ -176,6 +186,14 @@ impl ServerState {
         let sc = crate::sidecar::Sidecar::start(self.sidecar_config.clone()).await?;
         sc.connect(&resolved.endpoint).await?;
         *guard = Some(sc.clone());
+        drop(guard);
+        // Playwright's connectOverCDP replaces the download behavior with
+        // its own temp dir (GUID names, deleted on disconnect); put ours
+        // back immediately.
+        let backend = self.backend.lock().await.clone();
+        if let Some(b) = backend {
+            self.ensure_downloads(&b, true).await;
+        }
         Ok(sc)
     }
 
@@ -195,6 +213,9 @@ impl ServerState {
     pub async fn reset_sidecar(&self) {
         let mut sidecar = self.sidecar.lock().await;
         let _ = sidecar.take();
+        // The sidecar's connection set a download behavior; Chromium may
+        // reset it to the profile default when that connection closes.
+        self.downloads.invalidate();
     }
 
     /// Snapshot the current resolved browser (cheap clone of a small struct).
@@ -242,14 +263,75 @@ impl ServerState {
     pub async fn ensure_backend(&self) -> Result<TabBackend> {
         self.ensure_active_browser_alive().await?;
         self.ensure_bidi_lock().await?;
-        let mut guard = self.backend.lock().await;
-        if let Some(b) = guard.as_ref() {
-            return Ok(b.clone());
-        }
-        let resolved = self.browser_snapshot().await;
-        let b = crate::session::backend::open_backend(&resolved.endpoint, resolved.engine).await?;
-        *guard = Some(b.clone());
+        let b = {
+            let mut guard = self.backend.lock().await;
+            match guard.as_ref() {
+                Some(b) => b.clone(),
+                None => {
+                    let resolved = self.browser_snapshot().await;
+                    let b =
+                        crate::session::backend::open_backend(&resolved.endpoint, resolved.engine)
+                            .await?;
+                    *guard = Some(b.clone());
+                    b
+                }
+            }
+        };
+        self.ensure_downloads(&b, false).await;
         Ok(b)
+    }
+
+    /// Mark a tab as used by this server: start passive capture and
+    /// attribute its downloads to this server (ADR-005).
+    pub fn touch_tab(&self, backend: &TabBackend, target_id: &str) {
+        self.downloads.touch(target_id);
+        self.capture.touch(backend, target_id);
+    }
+
+    /// Resolve the download mode for `backend` once, then (re)send the
+    /// runtime download override (debounced unless `force`). Re-sending
+    /// on every tool call is what heals the reset Chromium performs when
+    /// another connection that set the behavior detaches (ADR-005).
+    /// Never errors.
+    pub async fn ensure_downloads(&self, backend: &TabBackend, force: bool) {
+        use crate::cli::env_resolver::Source;
+        use crate::session::downloads::{Mode, UNMANAGED_ATTACHED};
+        if self.downloads.mode_for(backend).is_none() {
+            let resolved = self.browser_snapshot().await;
+            let mode = match resolved.source {
+                Source::External => Mode::Unmanaged {
+                    reason: UNMANAGED_ATTACHED,
+                },
+                Source::Registered { name } => match sync_registry_op(move |reg| {
+                    let Some(row) = reg.get_by_name(&name)? else {
+                        return Ok(Mode::Unmanaged {
+                            reason: UNMANAGED_ATTACHED,
+                        });
+                    };
+                    if !crate::paths::is_owned_profile(&row.profile_dir) {
+                        return Ok(Mode::Unmanaged {
+                            reason: UNMANAGED_ATTACHED,
+                        });
+                    }
+                    Ok(Mode::Managed {
+                        staging: crate::paths::downloads_staging_dir(row.kind)?,
+                    })
+                })
+                .await
+                {
+                    Ok(mode) => mode,
+                    Err(e) => {
+                        // Transient (e.g. SQLite busy): leave the mode unset
+                        // so the next call retries instead of caching
+                        // "unmanaged" for the backend's lifetime.
+                        tracing::debug!(error = %e, "resolving download mode failed");
+                        return;
+                    }
+                },
+            };
+            self.downloads.set_mode(backend, mode);
+        }
+        self.downloads.apply(backend, force).await;
     }
 
     /// Check that the active registered browser is still usable before a tool
@@ -329,14 +411,14 @@ impl ServerState {
         if let Some(tid) = pointer.as_ref() {
             let live = backend.live_target_ids().await?;
             if live.contains(tid) {
-                self.capture.touch(&backend, tid);
+                self.touch_tab(&backend, tid);
                 return Ok((backend, tid.clone()));
             }
             // Dead — fall through to recreate.
         }
         let new_tid = backend.create_tab("about:blank").await?;
         *pointer = Some(new_tid.clone());
-        self.capture.touch(&backend, &new_tid);
+        self.touch_tab(&backend, &new_tid);
         Ok((backend, new_tid))
     }
 
@@ -360,7 +442,7 @@ impl ServerState {
 
         if let Some(cached) = origin_targets.get(&origin_root) {
             if live_ids.contains(cached.as_str()) {
-                self.capture.touch(&backend, cached);
+                self.touch_tab(&backend, cached);
                 return Ok((backend, cached.clone()));
             }
             origin_targets.remove(&origin_root);
@@ -372,13 +454,13 @@ impl ServerState {
                 .unwrap_or(false)
         }) {
             origin_targets.insert(origin_root, existing.id.clone());
-            self.capture.touch(&backend, &existing.id);
+            self.touch_tab(&backend, &existing.id);
             return Ok((backend, existing.id.clone()));
         }
 
         let new_tid = backend.create_tab(&origin_root).await?;
         origin_targets.insert(origin_root, new_tid.clone());
-        self.capture.touch(&backend, &new_tid);
+        self.touch_tab(&backend, &new_tid);
         Ok((backend, new_tid))
     }
 
@@ -433,13 +515,13 @@ impl ServerState {
                 let bn = browser_name.clone();
                 let n = name.clone();
                 sync_registry_op(move |reg| reg.tab_touch(&bn, &n)).await?;
-                self.capture.touch(&backend, &row.target_id);
+                self.touch_tab(&backend, &row.target_id);
                 Ok((backend, row.target_id))
             }
             (None, Some(regex)) => {
                 let backend = self.ensure_backend().await?;
                 let target_id = resolve_target_by_regex(&backend, &regex).await?;
-                self.capture.touch(&backend, &target_id);
+                self.touch_tab(&backend, &target_id);
                 Ok((backend, target_id))
             }
             (None, None) => self.current_tab().await,
@@ -475,6 +557,11 @@ impl ServerState {
         // Capture state belongs to the old browser's sessions; dropping the
         // backend below closes the socket, so no detach RPCs are needed.
         self.capture.reset();
+        // Records survive a re-select of the same browser (agents call
+        // `browser_start` defensively); the new backend re-arms routing.
+        if self.browser_snapshot().await.endpoint != new_browser.endpoint {
+            self.downloads.reset();
+        }
         // Close the cached BiDi session if any (best-effort).
         {
             let mut bidi = self.bidi.lock().await;
@@ -920,15 +1007,72 @@ fn handle_tools_call(
                     }
                 } else {
                     let _guard = barrier.read().await;
-                    match h(state, args).await {
-                        Ok(v) => result_frame(id, v),
-                        Err(e) => tool_error_frame(id, &e),
+                    let mark = is_download_action(&name).then(|| state.downloads.begin_action());
+                    let downloads = state.downloads.clone();
+                    let outcome = h(state, args).await;
+                    if mark.is_some() {
+                        downloads.end_action();
+                    }
+                    match outcome {
+                        Ok(v) => result_frame(id, annotate_downloads(v, mark, &downloads)),
+                        Err(e) => {
+                            // A download can start even when the action then
+                            // fails (e.g. a navigation that became a download).
+                            // Appended to the rendered message: typed errors
+                            // render without their context chain.
+                            let note = mark.and_then(|m| {
+                                crate::session::downloads::action_note(&downloads.since(m))
+                            });
+                            match note {
+                                Some(n) => tool_error_text_frame(
+                                    id,
+                                    format!("{}\n{n}", tool_error_message(&e)),
+                                ),
+                                None => tool_error_frame(id, &e),
+                            }
+                        }
                     }
                 }
             }
         };
         let _ = tx.send(frame);
     });
+}
+
+/// Tools that can start a download. Their results report downloads that
+/// began during the call, and the download override is re-sent for them
+/// without debounce.
+fn is_download_action(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_click"
+            | "browser_type"
+            | "browser_press_key"
+            | "browser_navigate"
+            | "browser_eval"
+            | "browser_drag"
+            | "browser_hover"
+            | "browser_tab_new"
+            | "browser_select_element"
+    )
+}
+
+/// Append a "download started" note to an action tool's text result.
+fn annotate_downloads(
+    mut v: Value,
+    mark: Option<u64>,
+    downloads: &crate::session::downloads::DownloadHub,
+) -> Value {
+    let Some(mark) = mark else {
+        return v;
+    };
+    let Some(note) = crate::session::downloads::action_note(&downloads.since(mark)) else {
+        return v;
+    };
+    if let Some(content) = v.get_mut("content").and_then(Value::as_array_mut) {
+        content.push(json!({ "type": "text", "text": note }));
+    }
+    v
 }
 
 /// Serialize a JSON-RPC success response to a newline-terminated frame.
@@ -945,7 +1089,10 @@ fn result_frame(id: Value, result: Value) -> Vec<u8> {
 /// content message carries their structure (e.g. the recover-once hint, or the
 /// BiDi lock holder PID) instead of an opaque flattened string.
 fn tool_error_frame(id: Value, err: &anyhow::Error) -> Vec<u8> {
-    let message = tool_error_message(err);
+    tool_error_text_frame(id, tool_error_message(err))
+}
+
+fn tool_error_text_frame(id: Value, message: String) -> Vec<u8> {
     result_frame(
         id,
         json!({

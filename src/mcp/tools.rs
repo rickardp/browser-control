@@ -80,6 +80,8 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(make_console_messages());
     registry.register(make_network_requests());
     registry.register(make_network_body());
+    // Downloads (ADR-005).
+    registry.register(make_downloads());
     // Diagnostic enumeration (kept).
     registry.register(make_list_targets());
     // New tab-management tools.
@@ -226,6 +228,7 @@ fn make_navigate() -> RegisteredTool {
                 // Make sure capture is live before the load starts so the
                 // document request and load-time console output land in
                 // the buffers. Bounded by `TOUCH_WAIT`; usually milliseconds.
+                state.downloads.touch(&target_id);
                 state.capture.touch_and_wait(&backend, &target_id).await;
                 backend.navigate(&target_id, &url).await?;
                 Ok(text_content(format!("Navigated to {url}")))
@@ -1096,7 +1099,7 @@ fn make_tab_new() -> RegisteredTool {
                 let backend = state.ensure_backend().await?;
                 let tid = backend.create_tab(&url).await?;
                 *state.active_target_id.lock().await = Some(tid.clone());
-                state.capture.touch(&backend, &tid);
+                state.touch_tab(&backend, &tid);
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": tid,
                     "url": url,
@@ -1138,7 +1141,7 @@ async fn open_or_create_named_tab(
                 crate::mcp::server::sync_registry_op(move |reg| reg.tab_touch(&bn, &n)).await?;
             }
             *state.active_target_id.lock().await = Some(row.target_id.clone());
-            state.capture.touch(&backend, &row.target_id);
+            state.touch_tab(&backend, &row.target_id);
             return Ok(json!({
                 "name": name,
                 "target_id": row.target_id,
@@ -1184,7 +1187,7 @@ async fn open_or_create_named_tab(
     crate::mcp::server::sync_registry_op(move |reg| reg.tab_upsert(&bn, &n, &tid, &u, true))
         .await?;
     *state.active_target_id.lock().await = Some(target_id.clone());
-    state.capture.touch(&backend, &target_id);
+    state.touch_tab(&backend, &target_id);
     Ok(json!({
         "name": name,
         "target_id": target_id,
@@ -1248,7 +1251,7 @@ fn make_tab_select() -> RegisteredTool {
                     .into());
                 }
                 *state.active_target_id.lock().await = Some(tid.clone());
-                state.capture.touch(&backend, &tid);
+                state.touch_tab(&backend, &tid);
                 Ok(text_content(serde_json::to_string_pretty(&json!({
                     "target_id": tid,
                     "active": true,
@@ -1409,7 +1412,7 @@ fn make_browser_start() -> RegisteredTool {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "browser": { "type": "string", "description": "Optional browser kind (chrome, edge, chromium, brave, firefox). Defaults to an already-running installed browser if any, otherwise the first installed Chromium-family browser." },
+                "browser": { "type": "string", "description": "Optional browser kind (chrome, edge, chromium, brave, firefox). Omitted, it follows the persisted default (`browser-control set default ...`), then the most recent live registered browser, then an installed browser that is already running, then the first installed Chromium-family browser." },
                 "headless": { "type": "boolean", "default": false },
                 "wait_timeout_seconds": { "type": "integer", "default": 30 }
             },
@@ -1808,6 +1811,158 @@ fn capture_common_schema() -> Value {
             "description": "Output format. Default text (one line per entry)."
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// browser_downloads (ADR-005)
+// ---------------------------------------------------------------------------
+
+fn make_downloads() -> RegisteredTool {
+    use crate::session::downloads::{
+        format_record, Mode, DEFAULT_BEGIN_TIMEOUT, DEFAULT_COMPLETE_TIMEOUT, DOWNLOAD_DIR_ENV,
+        MAX_WAIT,
+    };
+    RegisteredTool {
+        name: "browser_downloads".into(),
+        description: format!(
+            "List, wait for, or move files the browser downloaded. In a browser started by \
+             browser-control, downloads never open a Save dialog: they are saved silently into \
+             a staging folder and this tool reports the absolute path. Action results \
+             (browser_click, browser_navigate, browser_press_key, …) mention downloads that \
+             began during the call. `wait` (no `id`) takes the oldest download from this \
+             server's tabs that no earlier `wait` returned, waiting up to `begin_timeout_ms` \
+             for one to begin, then up to `timeout_ms` for it to finish (call it once per \
+             file after a multi-file download); an unfinished download is returned as in_progress (call `wait` \
+             again with its `id`). To put a file in a specific folder pass `save_to` (absolute \
+             directory, created if missing) to `wait` or `save`; the server-wide default is \
+             `browser-control mcp --download-dir <dir>` or ${DOWNLOAD_DIR_ENV}. Files are never \
+             overwritten: a clash becomes `name (1).ext`. For a known URL, browser_curl with \
+             `-o` is simpler."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "wait", "save"],
+                    "description": "Default `list`."
+                },
+                "id": { "type": "string", "description": "Download id from an action result or `list`. Required for `save`." },
+                "save_to": { "type": "string", "description": "Absolute directory to move the finished file into (wait/save)." },
+                "begin_timeout_ms": { "type": "integer", "description": "wait: how long to wait for a download to begin. Default 5000." },
+                "timeout_ms": { "type": "integer", "description": "wait: how long to wait for completion. Default 30000; begin + completion are capped at 120000 together." }
+            }
+        }),
+        handler: handler(|state, args| {
+            Box::pin(async move {
+                let action = args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("list")
+                    .to_string();
+                let id = args.get("id").and_then(Value::as_str).map(String::from);
+                let save_to = match args.get("save_to").and_then(Value::as_str) {
+                    Some(s) => Some(std::path::PathBuf::from(s)),
+                    None => state.download_dir.clone(),
+                };
+                if let Some(dir) = &save_to {
+                    if !dir.is_absolute() {
+                        return Err(anyhow!(
+                            "`save_to` must be an absolute directory path (got {})",
+                            dir.display()
+                        ));
+                    }
+                }
+                // Opens the backend if needed, which also arms the download
+                // override and event routing.
+                let backend = state.ensure_backend().await?;
+                let mode = state.downloads.mode_for(&backend);
+                let header = match &mode {
+                    Some(Mode::Managed { staging }) => {
+                        format!("staging folder: {}", staging.display())
+                    }
+                    Some(Mode::Unmanaged { reason }) => {
+                        if action != "list" {
+                            return Err(anyhow!("downloads are not managed: {reason}"));
+                        }
+                        return Ok(text_content(format!("downloads are not managed: {reason}")));
+                    }
+                    None => {
+                        return Err(anyhow!(
+                            "download tracking is not active yet: could not determine whether browser-control launched this browser (registry busy?); retry the call"
+                        ))
+                    }
+                };
+                let cap = |d: Duration| d.min(MAX_WAIT);
+                match action.as_str() {
+                    "list" => {
+                        let recs = state.downloads.list();
+                        let mut out = header;
+                        if recs.is_empty() {
+                            out.push_str("\nno downloads observed by this MCP server");
+                        }
+                        for r in recs.iter().rev() {
+                            out.push('\n');
+                            out.push_str(&format_record(r));
+                        }
+                        Ok(text_content(out))
+                    }
+                    "wait" => {
+                        let begin = cap(timeout_ms_arg(
+                            &args,
+                            "begin_timeout_ms",
+                            DEFAULT_BEGIN_TIMEOUT,
+                        )?);
+                        // begin + complete together stay within MAX_WAIT.
+                        let done = timeout_ms_arg(&args, "timeout_ms", DEFAULT_COMPLETE_TIMEOUT)?
+                            .min(MAX_WAIT.saturating_sub(begin));
+                        let Some(mut r) = state.downloads.wait(id.as_deref(), begin, done).await?
+                        else {
+                            let mut msg = format!(
+                                "no new download (none that an earlier wait has not already returned) began within {} ms",
+                                begin.as_millis()
+                            );
+                            if !state.downloads.events_available() {
+                                msg.push_str("; this Firefox does not report download events (needs 145+), check the staging folder directly");
+                            }
+                            return Ok(text_content(format!("{header}\n{msg}")));
+                        };
+                        if let (Some(dir), crate::session::downloads::DlState::Completed) =
+                            (&save_to, r.state)
+                        {
+                            if r.path.is_some() {
+                                // A failed move must not hide the finished
+                                // download: report it with the reason.
+                                match state.downloads.save_to(&r.id, dir).await {
+                                    Ok(moved) => r = moved,
+                                    Err(e) => {
+                                        r.note =
+                                            Some(format!("not moved to {}: {e:#}", dir.display()))
+                                    }
+                                }
+                            } else {
+                                r.note.get_or_insert_with(|| {
+                                    format!("no file path yet, so not moved to {}", dir.display())
+                                });
+                            }
+                        }
+                        Ok(text_content(format!("{header}\n{}", format_record(&r))))
+                    }
+                    "save" => {
+                        let id = id.ok_or_else(|| anyhow!("`save` needs `id`"))?;
+                        let dir = save_to.ok_or_else(|| {
+                            anyhow!(
+                                "`save` needs `save_to` (or --download-dir / {DOWNLOAD_DIR_ENV})"
+                            )
+                        })?;
+                        let r = state.downloads.save_to(&id, &dir).await?;
+                        Ok(text_content(format_record(&r)))
+                    }
+                    other => Err(anyhow!("unknown action `{other}`; use list, wait or save")),
+                }
+            })
+        }),
+    }
 }
 
 fn make_console_messages() -> RegisteredTool {
@@ -2372,6 +2527,31 @@ fn route_mode(args: &Value, ref_pairs: &[(&str, &str)], has_native: bool) -> Res
     })
 }
 
+/// Refuse chords that open a native browser dialog (Save Page As, Print).
+/// The dialog is invisible to the protocol and leaves the tab unusable for
+/// input, and after a download override Chromium's Save As silently does
+/// nothing at all (ADR-005).
+fn refuse_native_dialog_chord(spec: &str, chord: &crate::session::keys::Chord) -> Result<()> {
+    use crate::session::keys::Modifier;
+    let primary = chord
+        .modifiers
+        .iter()
+        .any(|m| matches!(m, Modifier::Control | Modifier::Meta));
+    let alt = chord.modifiers.contains(&Modifier::Alt);
+    let key = chord.key.key.to_ascii_lowercase();
+    if primary && !alt && (key == "s" || key == "p") {
+        let hint = if key == "s" {
+            "use browser_get_html or browser_get_page_text for the page content, browser_pdf_save for a PDF, or browser_curl with -o to download a URL"
+        } else {
+            "use browser_pdf_save (Chromium) to render the page to PDF, or browser_take_screenshot"
+        };
+        return Err(anyhow!(
+            "refusing `{spec}`: unless the page handles it, it opens a native browser dialog that blocks the tab; {hint}. If the page itself binds this shortcut (an in-app editor's save), pass allow_native_dialog: true"
+        ));
+    }
+    Ok(())
+}
+
 /// Execute an interaction tool through native CDP input.
 async fn run_native(
     state: &ServerState,
@@ -2395,6 +2575,13 @@ async fn run_native(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("missing 'key'"))?;
             let chord = crate::session::keys::parse_chord(spec)?;
+            if !args
+                .get("allow_native_dialog")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                refuse_native_dialog_chord(spec, &chord)?;
+            }
             backend
                 .press_key_on_tab(&target_id, &chord, timeout)
                 .await?;
@@ -2746,11 +2933,18 @@ fn make_press_key() -> RegisteredTool {
                       Alt/Option and Meta/Cmd, joined with '+'. Native on Chromium and Firefox, \
                       no Node needed.",
         method: "press_key",
-        params: vec![SidecarParam {
-            name: "key",
-            schema: json!({"type": "string"}),
-            required: true,
-        }],
+        params: vec![
+            SidecarParam {
+                name: "key",
+                schema: json!({"type": "string"}),
+                required: true,
+            },
+            SidecarParam {
+                name: "allow_native_dialog",
+                schema: json!({"type": "boolean", "description": "Allow Control/Meta+S and Control/Meta+P, which are refused by default because the browser answers them with a native Save/Print dialog. Set only when the page itself handles the shortcut."}),
+                required: false,
+            },
+        ],
         success: "pressed",
         native: Some(NativeAction::PressKey),
         ref_pairs: &[],
@@ -2845,6 +3039,7 @@ mod tests {
         "browser_console_messages",
         "browser_network_requests",
         "browser_network_body",
+        "browser_downloads",
         "list_targets",
         "browser_tab_list",
         "browser_tab_new",
@@ -2969,6 +3164,20 @@ mod tests {
         ScreenshotMock {
             endpoint: format!("ws://{addr}"),
             capture_params,
+        }
+    }
+
+    #[test]
+    fn save_and_print_chords_are_refused() {
+        use crate::session::keys::parse_chord;
+        for spec in ["Meta+S", "Control+s", "Control+Shift+S", "Cmd+P"] {
+            let chord = parse_chord(spec).unwrap();
+            let err = refuse_native_dialog_chord(spec, &chord).unwrap_err();
+            assert!(err.to_string().contains("allow_native_dialog"), "{spec}");
+        }
+        for spec in ["s", "Shift+S", "Control+A", "Alt+Meta+S", "Enter"] {
+            let chord = parse_chord(spec).unwrap();
+            assert!(refuse_native_dialog_chord(spec, &chord).is_ok(), "{spec}");
         }
     }
 

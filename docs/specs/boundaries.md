@@ -5,7 +5,8 @@ the current Rust CLI. The original TypeScript implementation is preserved on
 the `legacy-ts` branch (tag `v0-final-ts`); its boundaries are archived in
 `docs/adrs/archive/`. The authoritative design records are ADR-001 (Rust CLI
 rewrite), ADR-002 (CLI lifecycle), ADR-003 (native CDP observation and
-ref-based interaction), and ADR-004 (foreground emulation).
+ref-based interaction), ADR-004 (foreground emulation), and ADR-005
+(silent downloads).
 
 ## Code Style
 
@@ -35,7 +36,11 @@ ref-based interaction), and ADR-004 (foreground emulation).
   invocation is the foreground holder (ADR-004, `tab foreground-hold`): it
   exists only while a user or agent asked for foreground emulation on one
   tab, blocks on CDP events and a termination signal, and has a hard expiry
-  (default 1 h).
+  (default 1 h). The MCP server's download hub (ADR-005,
+  `src/session/downloads.rs`) is a second push-only listener: it routes
+  `Browser.download*` / `browsingContext.download*` events and re-sends the
+  download override during tool calls (debounced to 250 ms, always for
+  action tools), never on a timer.
 - **Always proceed.** Agent-facing tab/session ops must not surface
   `TabHung` / `TabCrashed` / `Closed` to the caller. Detect, recreate, retry
   once, and only then escalate with a typed error. The recover-once wrappers

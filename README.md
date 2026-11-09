@@ -46,7 +46,7 @@ To uninstall:
 irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/uninstall.ps1 | iex
 ```
 
-By default the user data directory (`%APPDATA%\browser-control`, containing the browser registry and config) is preserved. Pass `-Purge` to remove it as well:
+By default the user data directory (`%APPDATA%\browser-control`, containing the browser registry, config, and the download staging folder) is preserved. Pass `-Purge` to remove it as well:
 
 ```powershell
 $script = irm https://raw.githubusercontent.com/rickardp/browser-control/main/scripts/uninstall.ps1
@@ -163,7 +163,7 @@ browser-control show --json
 activates the browser app when possible and brings a live page target to the
 front, creating an `about:blank` target if none exists.
 
-### `mcp [--browser BROWSER] [--playwright-version <X.Y.Z>]`
+### `mcp [--browser BROWSER] [--playwright-version <X.Y.Z>] [--download-dir <DIR>]`
 
 Start an MCP server on stdio that targets a running browser.
 
@@ -171,13 +171,21 @@ Start an MCP server on stdio that targets a running browser.
 browser-control mcp                             # use persisted default browser
 browser-control mcp -b firefox                   # target a specific kind
 browser-control mcp --playwright-version 1.55    # pin a custom playwright-core
+browser-control mcp --download-dir ~/work/inbox  # where browser_downloads puts files
 ```
 
 Browser resolution order:
 
 1. The `--browser` / `-b` flag (or `BROWSER_CONTROL` env, merged by clap; the flag wins when both are present)
 2. The persisted default from `browser-control set default <value>`
-3. Otherwise, exit with an error
+3. The most recent live registered browser
+4. Otherwise, start one (see `browser_start` below)
+
+`browser_start` with no `browser` argument follows the same order, and only
+then looks at the machine: an installed browser that already has a live
+process, and finally the first installed Chromium-family browser. So a pinned
+`set default brave` is never overruled by some other browser happening to be
+open.
 
 The server exposes three groups of tools:
 
@@ -209,6 +217,50 @@ lifecycle), see [docs/engine-parity.md](docs/engine-parity.md).
   spawned (prefers `bun`, falls back to `node`+`npm`) against the active
   browser's CDP endpoint. The `--playwright-version` flag overrides the pinned
   `playwright-core` version.
+
+#### Downloads
+
+In a browser browser-control started, downloads never open a Save dialog.
+They are saved silently into a staging folder,
+`<data dir>/downloads/<kind>/` (macOS: `~/Library/Application
+Support/browser-control/downloads/<kind>/`), and files are never overwritten:
+a name clash becomes `name (1).ext`. The tool that triggered the download
+(`browser_click`, `browser_navigate`, …) says "download started", and
+`browser_downloads` reports the absolute path:
+
+```jsonc
+{ "action": "wait" }                              // next download from this agent's tabs
+{ "action": "wait", "save_to": "/abs/target/dir" } // ...and moves it there
+{ "action": "save", "id": "<id>", "save_to": "/abs/dir" }
+{ "action": "list" }
+```
+
+`wait` without an `id` hands out downloads one at a time, oldest first, so
+after a multi-file download call it once per file. Several agents can share
+one browser: each download is attributed to the tab it came from (or the tab
+that opened its popup), and an agent's `wait` and "download started" notes
+only cover its own tabs.
+
+To put downloads in a specific folder by default, start the server with
+`--download-dir <absolute dir>` or set `BROWSER_CONTROL_DOWNLOAD_DIR` in the
+MCP host env; `browser_downloads wait` / `save` then move files there. A
+leading `~` is expanded; a relative path is ignored with a warning. A
+per-call `save_to` (absolute) wins over the default. The folder is created if
+missing.
+
+The staging folder is shared by every agent using that browser, so it is never
+the agent's working directory. Downloads in it are never deleted
+automatically. Browsers you started yourself are not changed: their downloads
+follow your own browser settings, except that while the Playwright sidecar is
+connected (CSS-selector tools, `browser_wait_for`, `browser_pdf_save`) it
+sends them to its own temporary folder. A managed browser that was already
+running when you upgraded picks up the launch-time settings after a restart.
+`browser_press_key` refuses Cmd/Ctrl+S and Cmd/Ctrl+P (including Ctrl+Shift+P)
+because they open native dialogs; pass `allow_native_dialog: true` when the
+page handles the shortcut itself, such as an in-app editor. The CLI `key`
+command does not refuse them. Firefox applies the staging folder at runtime
+from version 149 and reports download paths from 145; older versions rely on
+profile prefs. Design: ADR-005.
 
 #### Foreground emulation
 

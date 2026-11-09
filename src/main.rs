@@ -61,6 +61,12 @@ enum Command {
         /// API change without waiting for a browser-control release.
         #[arg(long)]
         playwright_version: Option<String>,
+        /// Default folder that `browser_downloads` `wait` / `save` move
+        /// finished downloads into (absolute; created if missing). Without
+        /// it, downloads stay in the staging folder and their absolute
+        /// path is reported.
+        #[arg(long, env = "BROWSER_CONTROL_DOWNLOAD_DIR")]
+        download_dir: Option<std::path::PathBuf>,
     },
     /// List page targets in the active browser.
     Targets {
@@ -322,7 +328,8 @@ async fn run() -> Result<()> {
         Command::Mcp {
             browser,
             playwright_version,
-        } => browser_control::cli::mcp::run_cli(browser, playwright_version).await,
+            download_dir,
+        } => browser_control::cli::mcp::run_cli(browser, playwright_version, download_dir).await,
         Command::Set { key, value, json } => set::run_set(key, value, json),
         Command::Get { key, json } => set::run_get(key, json),
         Command::Unset { key, json } => set::run_unset(key, json),

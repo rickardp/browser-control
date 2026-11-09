@@ -22,6 +22,14 @@ pub async fn launch(installed: &Installed, opts: LaunchOpts) -> Result<LaunchedH
     std::fs::create_dir_all(&opts.profile_dir)
         .with_context(|| format!("creating profile dir {}", opts.profile_dir.display()))?;
 
+    if let Some(dir) = &opts.download_dir {
+        // Best-effort: a failed write must not block the launch; the MCP
+        // server's runtime override still applies.
+        if let Err(e) = super::download_prefs::apply_chromium(&opts.profile_dir, dir) {
+            tracing::warn!(error = %e, "writing Chromium download prefs failed");
+        }
+    }
+
     let log_path = opts.profile_dir.join("browser.log");
     let log_file =
         File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;

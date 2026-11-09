@@ -11,15 +11,48 @@ use crate::registry::{BrowserRow, Registry};
 pub async fn run_cli(
     browser_arg: Option<String>,
     playwright_version: Option<String>,
+    download_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    let download_dir = download_dir.and_then(normalize_download_dir);
     let resolved = resolve_browser(browser_arg).await?;
     let sidecar_config = crate::sidecar::SidecarConfig {
         version: playwright_version,
     };
-    let state = ServerState::with_sidecar_config(resolved, sidecar_config);
+    let mut state = ServerState::with_sidecar_config(resolved, sidecar_config);
+    state.download_dir = download_dir;
     let tools = ToolRegistry::new();
     crate::mcp::tools::register_all(&tools);
     run(state, tools).await
+}
+
+/// Expand a leading `~` (MCP host configs are not shell-expanded) and drop
+/// a value that is still not absolute. An optional setting must not stop
+/// the server from starting, so a bad value is logged and ignored: files
+/// then stay in the staging folder.
+fn normalize_download_dir(dir: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let s = dir.to_string_lossy();
+    let expanded = match (s.strip_prefix('~'), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            std::path::PathBuf::from(home).join(rest.trim_start_matches('/'))
+        }
+        _ => dir.clone(),
+    };
+    if expanded.is_absolute() {
+        Some(expanded)
+    } else {
+        tracing::warn!(
+            dir = %dir.display(),
+            "ignoring --download-dir / BROWSER_CONTROL_DOWNLOAD_DIR: not an absolute path"
+        );
+        eprintln!(
+            "browser-control: ignoring download dir {} (not an absolute path); downloads stay in the staging folder",
+            dir.display()
+        );
+        None
+    }
 }
 
 /// Resolution order: positional arg / `BROWSER_CONTROL` env (arg wins, env is
@@ -160,7 +193,7 @@ fn stale_default_kind(name: &str, registry: &Registry) -> Result<Option<Kind>> {
     Ok(kind_from_generated_name(name))
 }
 
-fn kind_from_generated_name(name: &str) -> Option<Kind> {
+pub(crate) fn kind_from_generated_name(name: &str) -> Option<Kind> {
     let (prefix, _) = name.split_once('-')?;
     Kind::parse(prefix)
 }
@@ -198,6 +231,30 @@ pub fn acquire_bidi_lock_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_dir_expands_tilde_and_ignores_relative() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/u");
+        assert_eq!(
+            normalize_download_dir("~/dl".into()),
+            Some(std::path::PathBuf::from("/home/u/dl"))
+        );
+        assert_eq!(
+            normalize_download_dir("/abs".into()),
+            Some(std::path::PathBuf::from("/abs"))
+        );
+        assert_eq!(normalize_download_dir("rel/dir".into()), None);
+        assert_eq!(normalize_download_dir("~other/x".into()), None);
+        assert_eq!(normalize_download_dir("".into()), None);
+        match home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
     use crate::config::{self, Config};
     use crate::detect::{Engine, Kind};
     use crate::registry::{BrowserRow, Registry};

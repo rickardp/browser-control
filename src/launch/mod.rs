@@ -8,12 +8,17 @@ use anyhow::Result;
 use crate::detect::{Engine, Installed};
 
 pub mod chromium;
+pub mod download_prefs;
 pub mod firefox;
 
 #[derive(Debug, Clone)]
 pub struct LaunchOpts {
     pub headless: bool,
     pub profile_dir: PathBuf,
+    /// Download staging directory written into the profile's prefs before
+    /// launch (ADR-005). `None` leaves the profile's download settings
+    /// untouched.
+    pub download_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -249,6 +254,7 @@ mod tests {
         let opts = LaunchOpts {
             headless: true,
             profile_dir: tmp.path().join("profile"),
+            download_dir: None,
         };
         let h = launch(&installed, opts).await.expect("launch chromium");
         assert!(h.endpoint.starts_with("ws://"), "endpoint: {}", h.endpoint);
@@ -270,6 +276,7 @@ mod tests {
         let opts = LaunchOpts {
             headless: true,
             profile_dir: tmp.path().join("profile"),
+            download_dir: None,
         };
         let h = launch(&installed, opts).await.expect("launch firefox");
         assert!(h.endpoint.starts_with("ws://"), "endpoint: {}", h.endpoint);
@@ -294,6 +301,7 @@ mod tests {
             let opts = LaunchOpts {
                 headless: true,
                 profile_dir: tmp.path().join("profile"),
+                download_dir: None,
             };
             let err = launch(&installed, opts).await.unwrap_err();
             let msg = format!("{err:#}");

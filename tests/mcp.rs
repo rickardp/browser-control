@@ -123,6 +123,7 @@ async fn registered_tools_list_contains_full_playwright_shaped_set() {
         "browser_console_messages",
         "browser_network_requests",
         "browser_network_body",
+        "browser_downloads",
         "browser_get_page_text",
     ] {
         assert!(names.contains(expected), "missing {expected} in {names:?}");

@@ -79,6 +79,7 @@ fn mcp_tools_list_returns_full_set() {
         "browser_console_messages",
         "browser_network_requests",
         "browser_network_body",
+        "browser_downloads",
         // Cheap reads.
         "browser_get_page_text",
     ] {

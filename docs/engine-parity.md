@@ -27,6 +27,7 @@ on Firefox.
 | `browser_take_screenshot` | yes | yes | differs: `max_width` is ignored on Firefox; see *Screenshots* |
 | `browser_console_messages`, `browser_network_requests` | yes | yes (network needs Firefox 124+) | differs: see *Console and network capture* |
 | `browser_network_body` | yes | no | Chromium-only: BiDi exposes bodies only through browser-side data collectors, which are deliberately not enabled |
+| `browser_downloads`, silent downloads (ADR-005) | yes | differs | Firefox 149+ applies the staging folder at runtime (BiDi `browser.setDownloadBehavior`) and reports paths from Firefox 145+; older Firefox relies on `user.js` prefs, so types `handlers.json` marks "always ask" can still prompt and no download events are reported. Chromium renames `<guid>` files itself; Firefox names files |
 | `browser_tab_foreground`, `browser-control tab foreground` | yes | no | Chromium-only: `Emulation.setFocusEmulationEnabled` has no BiDi equivalent; on Firefox a background tab stays hidden to the page (ADR-004) |
 
 ## Session and lifecycle

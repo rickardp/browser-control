@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::cli::env_resolver::BrowserSelector;
 use crate::cli::output::print_json;
 use crate::detect::{self, Engine, Installed, Kind};
 use crate::launch::{self, LaunchOpts};
@@ -41,11 +42,11 @@ pub async fn run(
 /// most recent live registry row for the selected kind, otherwise launches a
 /// new browser with the same default profile semantics as the CLI command.
 ///
-/// When no kind is requested, an installed browser the user already has
-/// running (even one browser-control never launched or registered) is
-/// preferred over the hardcoded detection order — so a manually-opened
-/// browser wins over blindly starting whichever kind is first on the
-/// platform's candidate list.
+/// When no kind is requested, selection follows the same order the MCP
+/// server uses at startup (see [`crate::cli::mcp::resolve_browser`]):
+/// the persisted default (`browser-control set default ...`) > the most
+/// recent live registered browser > an installed kind that already has a
+/// live process > the hardcoded chromium-first detection order.
 pub async fn ensure_started(
     browser: Option<String>,
     headless: bool,
@@ -57,8 +58,10 @@ pub async fn ensure_started(
         anyhow::bail!("no supported browsers installed; run `browser-control list-installed`");
     }
 
+    let registry = Registry::open()?;
+
     let resolved_kind: Kind = match browser.as_deref() {
-        None => resolve_kind_when_unspecified(&installed)
+        None => resolve_kind_when_unspecified(&installed, &registry)
             .ok_or_else(|| anyhow!("no chromium-based browser installed"))?,
         Some(s) => Kind::parse(s).ok_or_else(|| {
             anyhow!("unknown browser kind `{s}`; valid: chrome, edge, chromium, brave, firefox")
@@ -76,7 +79,6 @@ pub async fn ensure_started(
             )
         })?;
 
-    let registry = Registry::open()?;
     if let Some(row) = registry.first_alive_by_kind(resolved_kind)? {
         if !no_wait {
             crate::cli::wait::wait_until_ready(
@@ -92,9 +94,17 @@ pub async fn ensure_started(
     let name = registry::naming::generate_default(resolved_kind, &registry)?;
     let profile_dir = paths::default_profile_dir(resolved_kind)?;
     std::fs::create_dir_all(&profile_dir).context("creating profile directory")?;
+    let download_dir = match paths::downloads_staging_dir(resolved_kind) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::warn!(error = %e, "no download staging dir; leaving profile download prefs");
+            None
+        }
+    };
     let opts = LaunchOpts {
         headless,
         profile_dir: profile_dir.clone(),
+        download_dir,
     };
     let handle = launch::launch(&installed_match, opts)
         .await
@@ -135,16 +145,64 @@ pub(crate) fn first_chromium_or_first(installed: &[Installed]) -> Option<Kind> {
         .or_else(|| installed.first().map(|i| i.kind))
 }
 
-/// Selection used by [`ensure_started`] when no `--browser` kind is given:
-/// prefer an installed kind that already has a live process over the
-/// hardcoded chromium-first fallback order.
-pub(crate) fn resolve_kind_when_unspecified(installed: &[Installed]) -> Option<Kind> {
+/// Selection used by [`ensure_started`] when no `--browser` kind is given.
+///
+/// Order, strongest first:
+/// 1. the persisted default (`browser-control set default <kind|name>`),
+/// 2. the kind of the most recent live registered browser,
+/// 3. an installed kind that already has a live OS process (a browser the
+///    user opened by hand, which browser-control never registered),
+/// 4. the hardcoded chromium-first detection order.
+///
+/// Steps 1–3 only yield a kind that is actually installed, so a stale
+/// default or registry row falls through instead of failing the start.
+pub(crate) fn resolve_kind_when_unspecified(
+    installed: &[Installed],
+    registry: &Registry,
+) -> Option<Kind> {
+    if let Some(kind) = kind_from_default_setting(installed, registry) {
+        return Some(kind);
+    }
+    if let Some(kind) = registry
+        .most_recent_alive()
+        .ok()
+        .flatten()
+        .map(|row| row.kind)
+        .filter(|kind| is_installed(installed, *kind))
+    {
+        return Some(kind);
+    }
     let running = detect::list_running_kinds(installed);
     installed
         .iter()
         .find(|i| running.contains(&i.kind))
         .map(|i| i.kind)
         .or_else(|| first_chromium_or_first(installed))
+}
+
+fn is_installed(installed: &[Installed], kind: Kind) -> bool {
+    installed.iter().any(|i| i.kind == kind)
+}
+
+/// Kind named by the persisted `default` setting, if it points at an
+/// installed browser. A name selector (`brave-jungle`) resolves through the
+/// registry first, then through the generated-name prefix, so a default that
+/// outlived its browser still selects the right kind.
+fn kind_from_default_setting(installed: &[Installed], registry: &Registry) -> Option<Kind> {
+    let value = crate::config::load().ok()?.default?;
+    let kind = match crate::cli::env_resolver::parse(&value).ok()? {
+        BrowserSelector::Kind(kind) => Some(kind),
+        BrowserSelector::Name(name) => registry
+            .get_by_name(&name)
+            .ok()
+            .flatten()
+            .map(|row| row.kind)
+            .or_else(|| crate::cli::mcp::kind_from_generated_name(&name)),
+        // A URL or an executable path names an endpoint, not a startable
+        // kind; those are handled by the MCP/CLI resolver, not here.
+        BrowserSelector::Url(_) | BrowserSelector::ExecutablePath(_) => None,
+    }?;
+    is_installed(installed, kind).then_some(kind)
 }
 
 fn to_result(row: &BrowserRow, reused: bool) -> StartResult {
@@ -179,6 +237,58 @@ fn emit(res: &StartResult, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{self, Config};
+
+    struct EnvGuard;
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("BROWSER_CONTROL_DATA_DIR");
+            std::env::remove_var("BROWSER_CONTROL_CONFIG_DIR");
+        }
+    }
+
+    /// Point the config and registry at throwaway dirs: selection now reads
+    /// the persisted default and the registry, and must not see the machine's.
+    fn with_tmp_env<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = tempfile::TempDir::new().unwrap();
+        let cfg = tempfile::TempDir::new().unwrap();
+        std::env::set_var("BROWSER_CONTROL_DATA_DIR", data.path());
+        std::env::set_var("BROWSER_CONTROL_CONFIG_DIR", cfg.path());
+        let _guard = EnvGuard;
+        f()
+    }
+
+    fn empty_registry() -> Registry {
+        Registry::open_in_memory().unwrap()
+    }
+
+    /// A bound-but-unaccepted local port: `registry::liveness` only TCP
+    /// connects, so this is enough to make a row read as alive.
+    fn alive_listener() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    fn registered_row(name: &str, kind: Kind, port: u16, started_at: &str) -> BrowserRow {
+        BrowserRow {
+            name: name.to_string(),
+            kind,
+            engine: kind.engine(),
+            // This process: alive, so the row counts as live.
+            pid: std::process::id(),
+            endpoint: format!("ws://127.0.0.1:{port}/devtools/browser/{name}"),
+            port,
+            profile_dir: PathBuf::from("/tmp/profile"),
+            executable: PathBuf::from("/usr/bin/example"),
+            headless: false,
+            started_at: started_at.to_string(),
+        }
+    }
 
     // Stands in for a "browser" that's actually running: we only care that a
     // live process's exe path matches `Installed.executable`, not that it's
@@ -218,7 +328,8 @@ mod tests {
             installed(Kind::Firefox, exe),
         ];
 
-        let resolved = resolve_kind_when_unspecified(&candidates);
+        let resolved =
+            with_tmp_env(|| resolve_kind_when_unspecified(&candidates, &empty_registry()));
 
         let _ = child.kill();
         let _ = child.wait();
@@ -235,18 +346,127 @@ mod tests {
             ),
             installed(Kind::Chrome, PathBuf::from("/definitely/not/a/real/chrome")),
         ];
-        assert_eq!(
-            resolve_kind_when_unspecified(&candidates),
-            first_chromium_or_first(&candidates)
-        );
-        assert_eq!(
-            resolve_kind_when_unspecified(&candidates),
-            Some(Kind::Chrome)
-        );
+        with_tmp_env(|| {
+            let registry = empty_registry();
+            assert_eq!(
+                resolve_kind_when_unspecified(&candidates, &registry),
+                first_chromium_or_first(&candidates)
+            );
+            assert_eq!(
+                resolve_kind_when_unspecified(&candidates, &registry),
+                Some(Kind::Chrome)
+            );
+        });
     }
 
     #[test]
     fn resolve_kind_when_unspecified_none_when_nothing_installed() {
-        assert_eq!(resolve_kind_when_unspecified(&[]), None);
+        with_tmp_env(|| {
+            assert_eq!(resolve_kind_when_unspecified(&[], &empty_registry()), None);
+        });
+    }
+
+    #[test]
+    fn persisted_default_kind_wins_over_another_running_browser() {
+        let (mut child, exe) = spawn_stand_in_process();
+
+        // Edge is "running" (its exe matches the live process) and is listed
+        // first, but the user pinned `default = brave`. The pin wins: this is
+        // the case where `browser_start` used to launch Edge next to an open
+        // Brave.
+        let candidates = vec![
+            installed(Kind::Edge, exe),
+            installed(Kind::Brave, PathBuf::from("/definitely/not/a/real/brave")),
+        ];
+
+        let resolved = with_tmp_env(|| {
+            config::save(&Config {
+                default: Some("brave".into()),
+            })
+            .unwrap();
+            resolve_kind_when_unspecified(&candidates, &empty_registry())
+        });
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(resolved, Some(Kind::Brave));
+    }
+
+    #[test]
+    fn persisted_default_name_resolves_through_the_registry() {
+        let candidates = vec![
+            installed(Kind::Edge, PathBuf::from("/definitely/not/a/real/edge")),
+            installed(Kind::Brave, PathBuf::from("/definitely/not/a/real/brave")),
+        ];
+
+        let resolved = with_tmp_env(|| {
+            let registry = empty_registry();
+            registry
+                .insert(&registered_row(
+                    "brave-jungle",
+                    Kind::Brave,
+                    1,
+                    "2024-01-01T00:00:00Z",
+                ))
+                .unwrap();
+            config::save(&Config {
+                default: Some("brave-jungle".into()),
+            })
+            .unwrap();
+            resolve_kind_when_unspecified(&candidates, &registry)
+        });
+
+        assert_eq!(resolved, Some(Kind::Brave));
+    }
+
+    #[test]
+    fn default_naming_an_uninstalled_kind_falls_through() {
+        let candidates = vec![installed(
+            Kind::Edge,
+            PathBuf::from("/definitely/not/a/real/edge"),
+        )];
+
+        let resolved = with_tmp_env(|| {
+            config::save(&Config {
+                default: Some("chrome".into()),
+            })
+            .unwrap();
+            resolve_kind_when_unspecified(&candidates, &empty_registry())
+        });
+
+        assert_eq!(resolved, Some(Kind::Edge));
+    }
+
+    #[test]
+    fn live_registered_browser_wins_over_another_running_kind() {
+        let (mut child, exe) = spawn_stand_in_process();
+
+        // No default pinned, Edge running unregistered, but browser-control
+        // already has a live Brave it started: reuse that rather than
+        // launching a second browser.
+        let candidates = vec![
+            installed(Kind::Edge, exe),
+            installed(Kind::Brave, PathBuf::from("/definitely/not/a/real/brave")),
+        ];
+
+        let (_listener, port) = alive_listener();
+        let resolved = with_tmp_env(|| {
+            let registry = empty_registry();
+            registry
+                .insert(&registered_row(
+                    "brave-jungle",
+                    Kind::Brave,
+                    port,
+                    "2024-01-01T00:00:00Z",
+                ))
+                .unwrap();
+            resolve_kind_when_unspecified(&candidates, &registry)
+        });
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(resolved, Some(Kind::Brave));
     }
 }

@@ -113,6 +113,30 @@ pub fn default_profile_dir(kind: Kind) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Staging directory for downloads from browsers browser-control launched
+/// (ADR-005): `<data_dir>/downloads/<kind>/`. Launch-time profile prefs and
+/// the MCP server's runtime download override both point here, so every
+/// download from a managed browser lands in one predictable place no matter
+/// which agent or CLI invocation triggered it. Created on demand.
+pub fn downloads_staging_dir(kind: Kind) -> Result<PathBuf> {
+    let dir = data_dir()?.join("downloads").join(kind.as_str());
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating downloads dir {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Whether `profile_dir` is a profile browser-control owns (under
+/// `<config_dir>/profiles`). Only owned profiles get download prefs written
+/// and the runtime download override (ADR-005); a user's own browser is
+/// never redirected.
+pub fn is_owned_profile(profile_dir: &std::path::Path) -> bool {
+    let Ok(root) = config_dir().map(|d| d.join("profiles")) else {
+        return false;
+    };
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(profile_dir).starts_with(canon(&root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
